@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Build artifacts
+target/
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

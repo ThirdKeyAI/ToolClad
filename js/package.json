@@ -1,0 +1,19 @@
+{
+  "name": "toolclad",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Reference implementation of the ToolClad declarative tool manifest executor",
+  "main": "src/index.js",
+  "bin": {
+    "toolclad": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": ["toolclad", "cli", "manifest", "executor"],
+  "license": "MIT",
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "commander": "^12.1.0"
+  }
+}

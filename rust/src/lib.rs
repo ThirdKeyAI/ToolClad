@@ -1,0 +1,313 @@
+//! ToolClad: Declarative CLI tool interface executor.
+//!
+//! ToolClad reads `.clad.toml` manifests that define typed parameter contracts,
+//! command templates, and output schemas for CLI tools. The executor validates
+//! arguments, constructs commands from templates, and wraps output in evidence
+//! envelopes.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use toolclad::load_manifest;
+//! use std::collections::HashMap;
+//!
+//! let manifest = load_manifest("tools/whois_lookup.clad.toml").unwrap();
+//! let mut args = HashMap::new();
+//! args.insert("target".to_string(), "example.com".to_string());
+//! let envelope = toolclad::executor::execute(&manifest, &args).unwrap();
+//! println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+//! ```
+
+pub mod executor;
+pub mod types;
+pub mod validator;
+
+use std::path::Path;
+use types::{Manifest, ToolCladError};
+
+/// Load and parse a `.clad.toml` manifest from the given path.
+pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, ToolCladError> {
+    let path = path.as_ref();
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        ToolCladError::ManifestError(format!("failed to read '{}': {e}", path.display()))
+    })?;
+    parse_manifest(&content)
+}
+
+/// Parse a manifest from a TOML string.
+pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
+    let manifest: Manifest = toml::from_str(toml_str)
+        .map_err(|e| ToolCladError::ManifestError(format!("TOML parse error: {e}")))?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+/// Validate internal consistency of a parsed manifest.
+fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
+    // Must have either a template or an executor.
+    if manifest.command.template.is_none() && manifest.command.executor.is_none() {
+        return Err(ToolCladError::ManifestError(
+            "[command] must have either 'template' or 'executor'".to_string(),
+        ));
+    }
+
+    // Validate that enum args have an allowed list.
+    for (name, def) in &manifest.args {
+        if def.type_name == "enum" && def.allowed.is_none() {
+            return Err(ToolCladError::ManifestError(format!(
+                "argument '{name}' is type 'enum' but has no 'allowed' list"
+            )));
+        }
+    }
+
+    // Validate that mapping keys reference existing args.
+    if let Some(ref mappings) = manifest.command.mappings {
+        for arg_name in mappings.keys() {
+            if !manifest.args.contains_key(arg_name) {
+                return Err(ToolCladError::ManifestError(format!(
+                    "mapping references unknown argument '{arg_name}'"
+                )));
+            }
+        }
+    }
+
+    // Validate risk_tier values.
+    let valid_tiers = ["low", "medium", "high", "critical"];
+    if !valid_tiers.contains(&manifest.tool.risk_tier.as_str()) {
+        return Err(ToolCladError::ManifestError(format!(
+            "invalid risk_tier '{}', must be one of: {}",
+            manifest.tool.risk_tier,
+            valid_tiers.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+/// Generate an MCP-compatible JSON schema from a manifest.
+pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+
+    // Sort args by position for consistent output.
+    let mut args: Vec<_> = manifest.args.iter().collect();
+    args.sort_by_key(|(_, def)| def.position);
+
+    for (name, def) in &args {
+        let mut prop = serde_json::Map::new();
+
+        // Map ToolClad types to JSON Schema types.
+        let json_type = match def.type_name.as_str() {
+            "integer" | "port" => "integer",
+            "boolean" => "boolean",
+            _ => "string",
+        };
+        prop.insert("type".to_string(), serde_json::json!(json_type));
+
+        if !def.description.is_empty() {
+            prop.insert(
+                "description".to_string(),
+                serde_json::json!(def.description),
+            );
+        }
+
+        if let Some(ref allowed) = def.allowed {
+            prop.insert("enum".to_string(), serde_json::json!(allowed));
+        }
+
+        if let Some(ref default_val) = def.default {
+            let dv = match default_val {
+                toml::Value::String(s) => serde_json::json!(s),
+                toml::Value::Integer(n) => serde_json::json!(n),
+                toml::Value::Float(f) => serde_json::json!(f),
+                toml::Value::Boolean(b) => serde_json::json!(b),
+                _ => serde_json::json!(default_val.to_string()),
+            };
+            prop.insert("default".to_string(), dv);
+        }
+
+        if let Some(ref pattern) = def.pattern {
+            prop.insert("pattern".to_string(), serde_json::json!(pattern));
+        }
+
+        if let Some(min) = def.min {
+            prop.insert("minimum".to_string(), serde_json::json!(min));
+        }
+        if let Some(max) = def.max {
+            prop.insert("maximum".to_string(), serde_json::json!(max));
+        }
+
+        properties.insert((*name).clone(), serde_json::Value::Object(prop));
+
+        if def.required {
+            required.push(serde_json::json!(name));
+        }
+    }
+
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    });
+
+    // Build the envelope output schema wrapping the declared results schema.
+    let output_schema = if manifest.output.envelope {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "string", "enum": ["success", "error"] },
+                "scan_id": { "type": "string" },
+                "tool": { "type": "string" },
+                "command": { "type": "string" },
+                "duration_ms": { "type": "integer" },
+                "timestamp": { "type": "string", "format": "date-time" },
+                "output_file": { "type": "string" },
+                "output_hash": { "type": "string" },
+                "results": manifest.output.schema,
+            }
+        })
+    } else {
+        manifest.output.schema.clone()
+    };
+
+    serde_json::json!({
+        "name": manifest.tool.name,
+        "description": manifest.tool.description,
+        "inputSchema": input_schema,
+        "outputSchema": output_schema,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WHOIS_MANIFEST: &str = r#"
+[tool]
+name = "whois_lookup"
+version = "1.0.0"
+binary = "whois"
+description = "WHOIS domain/IP registration lookup"
+timeout_seconds = 30
+risk_tier = "low"
+
+[tool.cedar]
+resource = "PenTest::ScanTarget"
+action = "execute_tool"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+description = "Domain name or IP address to query"
+
+[command]
+template = "whois {target}"
+
+[output]
+format = "text"
+envelope = true
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.raw_output]
+type = "string"
+description = "Raw WHOIS registration data"
+"#;
+
+    #[test]
+    fn test_parse_whois_manifest() {
+        let m = parse_manifest(WHOIS_MANIFEST).unwrap();
+        assert_eq!(m.tool.name, "whois_lookup");
+        assert_eq!(m.tool.binary, "whois");
+        assert_eq!(m.tool.timeout_seconds, 30);
+        assert!(m.args.contains_key("target"));
+        assert!(m.args["target"].required);
+        assert_eq!(m.args["target"].type_name, "scope_target");
+    }
+
+    #[test]
+    fn test_parse_nmap_manifest() {
+        let toml_str = r#"
+[tool]
+name = "nmap_scan"
+version = "1.0.0"
+binary = "nmap"
+description = "Network port scanning"
+timeout_seconds = 600
+risk_tier = "low"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+description = "Target"
+
+[args.scan_type]
+position = 2
+required = true
+type = "enum"
+allowed = ["ping", "service"]
+description = "Scan type"
+
+[args.extra_flags]
+position = 3
+required = false
+type = "string"
+sanitize = ["injection"]
+default = ""
+description = "Extra flags"
+
+[command]
+template = "nmap {_scan_type_flags} {extra_flags} {target}"
+
+[command.mappings.scan_type]
+ping = "-sn -PE"
+service = "-sT -sV"
+
+[output]
+format = "text"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert_eq!(m.tool.name, "nmap_scan");
+        assert!(m.command.mappings.is_some());
+        let mappings = m.command.mappings.as_ref().unwrap();
+        assert_eq!(mappings["scan_type"]["ping"], "-sn -PE");
+    }
+
+    #[test]
+    fn test_manifest_missing_command() {
+        let toml_str = r#"
+[tool]
+name = "bad"
+version = "1.0.0"
+binary = "bad"
+description = "bad"
+risk_tier = "low"
+
+[command]
+
+[output]
+format = "text"
+
+[output.schema]
+type = "object"
+"#;
+        let result = parse_manifest(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_mcp_schema() {
+        let m = parse_manifest(WHOIS_MANIFEST).unwrap();
+        let schema = generate_mcp_schema(&m);
+        assert_eq!(schema["name"], "whois_lookup");
+        assert!(schema["inputSchema"]["properties"]["target"].is_object());
+        assert!(schema["outputSchema"]["properties"]["results"].is_object());
+    }
+}
