@@ -2,8 +2,14 @@
 name = "toolclad"
 version = "0.1.0"
 edition = "2021"
-description = "Reference implementation of the ToolClad declarative CLI tool interface executor"
+authors = ["Jascha Wanger / ThirdKey.ai"]
+description = "Declarative CLI tool interface contracts for agentic runtimes — manifest parser, argument validator, command executor"
 license = "MIT"
+repository = "https://github.com/ThirdKeyAI/ToolClad"
+homepage = "https://github.com/ThirdKeyAI/ToolClad"
+readme = "../README.md"
+keywords = ["ai", "agents", "tools", "security", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "toolclad"
