@@ -1,22 +1,92 @@
-//! ToolClad: Declarative CLI tool interface executor.
+//! # ToolClad
 //!
-//! ToolClad reads `.clad.toml` manifests that define typed parameter contracts,
-//! command templates, and output schemas for CLI tools. The executor validates
-//! arguments, constructs commands from templates, and wraps output in evidence
-//! envelopes.
+//! Declarative CLI tool interface contracts for agentic runtimes.
 //!
-//! # Usage
+//! ToolClad reads `.clad.toml` manifests that define the complete behavioral
+//! contract for a CLI tool: typed parameters, validation rules, command
+//! construction templates, output parsing, and policy metadata. A single
+//! manifest replaces wrapper scripts, MCP tool schemas, and execution wiring.
+//!
+//! ## Security Model
+//!
+//! ToolClad inverts the sandbox approach. Instead of letting an LLM generate
+//! arbitrary shell commands and intercepting dangerous ones (deny-list),
+//! ToolClad constrains the LLM to fill typed parameters that are validated
+//! against a manifest (allow-list). The dangerous action cannot be expressed
+//! because the interface doesn't permit it.
+//!
+//! All string-based types reject shell metacharacters (`;|&$\`(){}[]<>!`)
+//! by default.
+//!
+//! ## Core Types
+//!
+//! | Type | Validates |
+//! |------|-----------|
+//! | `string` | Non-empty, injection-safe, optional regex pattern |
+//! | `integer` | Numeric with optional min/max and clamping |
+//! | `port` | 1-65535 |
+//! | `boolean` | Exactly `"true"` or `"false"` |
+//! | `enum` | Value in declared `allowed` list |
+//! | `scope_target` | Injection-safe, no wildcards, valid IP/CIDR/hostname |
+//! | `url` | Valid URL with optional scheme restriction |
+//! | `path` | No traversal (`../`) |
+//! | `ip_address` | Valid IPv4 or IPv6 |
+//! | `cidr` | Valid CIDR notation |
+//!
+//! ## Loading a Manifest
 //!
 //! ```no_run
-//! use toolclad::load_manifest;
+//! let manifest = toolclad::load_manifest("tools/whois_lookup.clad.toml").unwrap();
+//! println!("Tool: {} ({})", manifest.tool.name, manifest.tool.binary);
+//! ```
+//!
+//! ## Validating Arguments
+//!
+//! ```
+//! use toolclad::types::ArgDef;
+//!
+//! let def = ArgDef {
+//!     type_name: "enum".to_string(),
+//!     allowed: Some(vec!["ping".into(), "service".into()]),
+//!     required: true,
+//!     position: 1,
+//!     default: None,
+//!     pattern: None,
+//!     sanitize: None,
+//!     description: String::new(),
+//!     min: None,
+//!     max: None,
+//!     clamp: false,
+//! };
+//!
+//! assert!(toolclad::validator::validate_arg("scan_type", &def, "ping").is_ok());
+//! assert!(toolclad::validator::validate_arg("scan_type", &def, "exploit").is_err());
+//! ```
+//!
+//! ## Generating MCP Schema
+//!
+//! ```no_run
+//! let manifest = toolclad::load_manifest("tools/nmap_scan.clad.toml").unwrap();
+//! let schema = toolclad::generate_mcp_schema(&manifest);
+//! println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+//! ```
+//!
+//! ## Executing a Tool
+//!
+//! ```no_run
 //! use std::collections::HashMap;
 //!
-//! let manifest = load_manifest("tools/whois_lookup.clad.toml").unwrap();
+//! let manifest = toolclad::load_manifest("tools/whois_lookup.clad.toml").unwrap();
 //! let mut args = HashMap::new();
 //! args.insert("target".to_string(), "example.com".to_string());
 //! let envelope = toolclad::executor::execute(&manifest, &args).unwrap();
 //! println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
 //! ```
+//!
+//! ## Manifest Format
+//!
+//! See the [ToolClad Design Spec](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md)
+//! for the full `.clad.toml` format specification.
 
 pub mod executor;
 pub mod types;

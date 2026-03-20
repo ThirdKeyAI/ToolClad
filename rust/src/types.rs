@@ -62,7 +62,10 @@ fn default_hash() -> String {
 }
 
 /// Argument definition `[args.<name>]`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// Each argument has a typed validator, optional constraints (min/max, pattern,
+/// allowed list), and injection sanitization by default.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ArgDef {
     #[serde(default)]
     pub position: u32,
