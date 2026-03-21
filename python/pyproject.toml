@@ -4,17 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toolclad"
-version = "0.4.0"
-description = "Reference implementation of the ToolClad declarative tool interface executor"
+version = "0.4.1"
+description = "Declarative tool interface contracts for agentic runtimes — typed parameters, command templates, evidence envelopes, session and browser modes"
+readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
+keywords = ["ai", "agents", "tools", "security", "mcp", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+]
 authors = [
-    {name = "ThirdKey AI"},
+    {name = "Jascha Wanger / ThirdKey AI"},
 ]
 dependencies = [
     "tomli>=1.1.0; python_version < '3.11'",
     "click>=8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ThirdKeyAI/ToolClad"
+Repository = "https://github.com/ThirdKeyAI/ToolClad"
+Documentation = "https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md"
 
 [project.optional-dependencies]
 dev = [

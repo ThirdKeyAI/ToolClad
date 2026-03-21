@@ -1,8 +1,8 @@
 {
   "name": "toolclad",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "type": "module",
-  "description": "Reference implementation of the ToolClad declarative tool manifest executor",
+  "description": "Declarative tool interface contracts for agentic runtimes — typed parameters, command templates, evidence envelopes, session and browser modes",
   "main": "src/index.js",
   "bin": {
     "toolclad": "./src/cli.js"
@@ -10,8 +10,14 @@
   "scripts": {
     "test": "node --test"
   },
-  "keywords": ["toolclad", "cli", "manifest", "executor"],
+  "keywords": ["ai", "agents", "tools", "security", "mcp", "cli", "toolclad"],
+  "author": "Jascha Wanger / ThirdKey AI",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThirdKeyAI/ToolClad"
+  },
+  "homepage": "https://github.com/ThirdKeyAI/ToolClad",
   "dependencies": {
     "@iarna/toml": "^2.2.5",
     "commander": "^12.1.0"
