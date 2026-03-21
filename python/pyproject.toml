@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toolclad"
-version = "0.1.0"
+version = "0.4.0"
 description = "Reference implementation of the ToolClad declarative tool interface executor"
 requires-python = ">=3.9"
 license = {text = "MIT"}

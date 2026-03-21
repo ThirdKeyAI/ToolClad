@@ -1,8 +1,8 @@
 ---
 name: toolclad
 title: ToolClad
-description: Declarative CLI tool interface contracts for agentic runtimes — manifest parser, argument validator, command executor with evidence envelopes
-version: 0.1.1
+description: Declarative tool interface contracts for agentic runtimes — oneshot CLI, interactive session (PTY), and browser (CDP/Playwright) modes with typed parameters, per-interaction Cedar gating, evidence envelopes
+version: 0.4.0
 ---
 
 # ToolClad Development Skills Guide
@@ -13,11 +13,17 @@ version: 0.1.1
 
 ## What ToolClad Does
 
-ToolClad is a declarative manifest format (`.clad.toml`) that defines the complete behavioral contract for a CLI tool. It replaces wrapper scripts, MCP tool schemas, and execution wiring with a single file.
+ToolClad is a declarative manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool. It supports three execution modes sharing a common governance layer:
 
-- **Typed Parameters**: 10 built-in types with injection sanitization (string, integer, port, boolean, enum, scope_target, url, path, ip_address, cidr)
-- **Command Templates**: Agents fill typed fields; the executor constructs commands from templates. The LLM never generates shell commands.
-- **Evidence Envelopes**: Every execution wrapped in JSON with scan_id, timestamps, SHA-256 hash, and structured results
+- **Oneshot** (default): Execute a single CLI command, return results. Replaces wrapper scripts.
+- **Session**: Maintain a running CLI process (PTY) where each interaction is independently validated and policy-gated. For interactive tools like msfconsole, psql, redis-cli.
+- **Browser**: Maintain a governed headless browser session where navigation, clicks, form submission, and JS execution are typed, scoped, and policy-gated via CDP/Playwright.
+
+All three modes share:
+- **Typed Parameters**: 10 built-in types with injection sanitization
+- **Per-Interaction Cedar Gating**: Every command/action evaluated against policies
+- **Evidence Envelopes**: Every execution wrapped in JSON with scan_id, timestamps, SHA-256 hash
+- **Scope Enforcement**: URL/target scope checking against allow-lists
 - **MCP Schema Generation**: Auto-generate `inputSchema`/`outputSchema` from manifests for LLM tool use
 - **Cedar Integration**: Declare policy resource/action in the manifest for authorization gating
 

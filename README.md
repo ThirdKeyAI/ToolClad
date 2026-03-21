@@ -2,7 +2,11 @@
 
 Declarative tool interface contracts for agentic runtimes.
 
-ToolClad is a manifest format (`.clad.toml`) that defines the complete behavioral contract for a CLI tool: typed parameters, validation rules, command construction, output parsing, and policy metadata. A single manifest replaces wrapper scripts, MCP tool schemas, and execution wiring.
+ToolClad is a manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool: typed parameters, validation rules, invocation mechanism, output parsing, and policy metadata. Three execution modes share a common governance layer:
+
+- **Oneshot** (default): Single CLI command execution
+- **Session**: Interactive CLI tools via PTY (msfconsole, psql, redis-cli) with per-interaction Cedar gating
+- **Browser**: Governed headless browser via CDP/Playwright with URL scope enforcement and page state policies
 
 ## The Problem
 
