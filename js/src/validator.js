@@ -149,6 +149,9 @@ function validateUrl(argDef, value) {
 function validatePath(argDef, value) {
   const str = String(value);
   checkInjection(str);
+  if (str.startsWith("/") || (str.length >= 2 && str[1] === ":")) {
+    throw new Error(`Path must be relative, not absolute: ${str}`);
+  }
   if (str.includes("../") || str.includes("..\\")) {
     throw new Error(`Path traversal not allowed: ${str}`);
   }

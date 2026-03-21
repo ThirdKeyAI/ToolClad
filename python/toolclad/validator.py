@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from toolclad.manifest import ArgDef
 
 # Shell metacharacters that indicate injection attempts.
-SHELL_METACHARACTERS = set(";|&$`(){}[]<>!")
+SHELL_METACHARACTERS = set(";|&$`(){}[]<>!\n\r")
 
 # Regex for a valid hostname label.
 _HOSTNAME_RE = re.compile(
@@ -66,8 +66,8 @@ def _validate_port(arg_def: ArgDef, value: str) -> str:
         port = int(value)
     except (ValueError, TypeError):
         raise ValidationError(f"Expected port number, got: {value!r}")
-    if port < 0 or port > 65535:
-        raise ValidationError(f"Port {port} out of range 0-65535")
+    if port < 1 or port > 65535:
+        raise ValidationError(f"Port {port} out of range 1-65535")
     return str(port)
 
 
@@ -140,6 +140,9 @@ def _validate_url(arg_def: ArgDef, value: str) -> str:
 
 def _validate_path(arg_def: ArgDef, value: str) -> str:
     _check_injection(value)
+    # Block absolute paths
+    if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
+        raise ValidationError(f"Path must be relative, not absolute: {value}")
     if ".." in value.split("/") or ".." in value.split("\\"):
         raise ValidationError(f"Path traversal detected in: {value!r}")
     return value

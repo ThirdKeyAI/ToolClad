@@ -13,7 +13,7 @@ import (
 )
 
 // shellMetacharacters contains characters that indicate injection attempts.
-const shellMetacharacters = ";|&$`(){}[]<>!"
+const shellMetacharacters = ";|&$`(){}[]<>!\n\r"
 
 var hostnameRe = regexp.MustCompile(
 	`^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.)*(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.?$`,
@@ -145,8 +145,8 @@ func validatePort(def *manifest.ArgDef, value string) (string, error) {
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected port number, got: %q", value))
 	}
-	if port < 0 || port > 65535 {
-		return "", newErr(def.Name, fmt.Sprintf("port %d out of range 0-65535", port))
+	if port < 1 || port > 65535 {
+		return "", newErr(def.Name, fmt.Sprintf("port %d out of range 1-65535", port))
 	}
 	return strconv.Itoa(port), nil
 }
@@ -226,6 +226,10 @@ func validateURL(def *manifest.ArgDef, value string) (string, error) {
 func validatePath(def *manifest.ArgDef, value string) (string, error) {
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
+	}
+	// Block absolute paths
+	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
+		return "", newErr(def.Name, "path must be relative, not absolute")
 	}
 	for _, part := range strings.Split(value, "/") {
 		if part == ".." {

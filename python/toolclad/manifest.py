@@ -31,14 +31,6 @@ class EvidenceDef:
 
 
 @dataclass
-class SchemaPinDef:
-    """SchemaPin integration metadata."""
-
-    public_key_url: str = ""
-    schema_hash_algorithm: str = "sha256"
-
-
-@dataclass
 class ToolMeta:
     """Top-level [tool] section metadata."""
 
@@ -51,7 +43,6 @@ class ToolMeta:
     human_approval: bool = False
     cedar: CedarDef = field(default_factory=CedarDef)
     evidence: EvidenceDef = field(default_factory=EvidenceDef)
-    schemapin: Optional[SchemaPinDef] = None
 
 
 @dataclass
@@ -140,13 +131,6 @@ def _parse_evidence(data: Dict[str, Any]) -> EvidenceDef:
     )
 
 
-def _parse_schemapin(data: Dict[str, Any]) -> SchemaPinDef:
-    return SchemaPinDef(
-        public_key_url=data.get("public_key_url", ""),
-        schema_hash_algorithm=data.get("schema_hash_algorithm", "sha256"),
-    )
-
-
 def _parse_tool(data: Dict[str, Any]) -> ToolMeta:
     meta = ToolMeta(
         name=data.get("name", ""),
@@ -161,8 +145,6 @@ def _parse_tool(data: Dict[str, Any]) -> ToolMeta:
         meta.cedar = _parse_cedar(data["cedar"])
     if "evidence" in data:
         meta.evidence = _parse_evidence(data["evidence"])
-    if "schemapin" in data:
-        meta.schemapin = _parse_schemapin(data["schemapin"])
     return meta
 
 

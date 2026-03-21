@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 /// Shell metacharacters that are rejected by injection sanitization.
 const SHELL_METACHARACTERS: &[char] = &[
+    '\n', '\r',
     ';', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
 ];
 
@@ -191,6 +192,12 @@ fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
     if val.contains("../") || val.contains("..\\") {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' path must not contain traversal sequences (../)"
+        )));
+    }
+    // Block absolute paths to prevent access to system files
+    if val.starts_with('/') || (val.len() >= 2 && val.as_bytes()[1] == b':') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must be a relative path, not absolute"
         )));
     }
     Ok(val.to_string())

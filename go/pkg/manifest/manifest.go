@@ -22,24 +22,17 @@ type EvidenceDef struct {
 	Hash      string `toml:"hash"`
 }
 
-// SchemaPinDef holds SchemaPin integration metadata.
-type SchemaPinDef struct {
-	PublicKeyURL        string `toml:"public_key_url"`
-	SchemaHashAlgorithm string `toml:"schema_hash_algorithm"`
-}
-
 // ToolMeta holds the top-level [tool] section metadata.
 type ToolMeta struct {
-	Name           string        `toml:"name"`
-	Version        string        `toml:"version"`
-	Binary         string        `toml:"binary"`
-	Description    string        `toml:"description"`
-	TimeoutSeconds int           `toml:"timeout_seconds"`
-	RiskTier       string        `toml:"risk_tier"`
-	HumanApproval  bool          `toml:"human_approval"`
-	Cedar          *CedarDef     `toml:"cedar"`
-	Evidence       *EvidenceDef  `toml:"evidence"`
-	SchemaPin      *SchemaPinDef `toml:"schemapin"`
+	Name           string       `toml:"name"`
+	Version        string       `toml:"version"`
+	Binary         string       `toml:"binary"`
+	Description    string       `toml:"description"`
+	TimeoutSeconds int          `toml:"timeout_seconds"`
+	RiskTier       string       `toml:"risk_tier"`
+	HumanApproval  bool         `toml:"human_approval"`
+	Cedar          *CedarDef    `toml:"cedar"`
+	Evidence       *EvidenceDef `toml:"evidence"`
 }
 
 // ArgDef defines a single tool argument from [args.*].
