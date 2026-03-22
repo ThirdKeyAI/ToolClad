@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shlex
+import signal
 import subprocess
 import time
 import uuid
@@ -29,6 +31,9 @@ def _evaluate_condition(when: str, resolved: Dict[str, str]) -> bool:
         - ``name != ''``  /  ``name == ''``
         - ``name != 0``   /  ``name == 0``
         - Compound with ``and`` / ``or``
+
+    SECURITY: This evaluator uses a closed-vocabulary parser.
+    Never use eval() or equivalent dynamic code execution for conditions.
     """
     # Split on ` and ` / ` or ` (single level, no nesting).
     if " and " in when:
@@ -221,49 +226,71 @@ def execute(
     output_file = os.path.join(out_dir, f"scan.{ext}")
     envelope["output_file"] = output_file
 
-    # Execute.
+    # Execute using array-based invocation to avoid shell interpretation.
+    args_list = shlex.split(command)
     start = time.monotonic()
+    proc = None
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
+        proc = subprocess.Popen(
+            args_list,
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=effective_timeout,
+            preexec_fn=os.setpgrp,
         )
+        stdout, stderr = proc.communicate(timeout=effective_timeout)
         elapsed_ms = int((time.monotonic() - start) * 1000)
         envelope["duration_ms"] = elapsed_ms
+        envelope["exit_code"] = proc.returncode
+        envelope["stderr"] = stderr
 
         # Write captured stdout to evidence file.
         with open(output_file, "w") as f:
-            f.write(result.stdout)
+            f.write(stdout)
 
         if manifest.tool.evidence.capture:
             envelope["output_hash"] = _hash_file(
                 output_file, manifest.tool.evidence.hash
             )
 
-        if result.returncode != 0:
+        if proc.returncode != 0:
             envelope["status"] = "error"
             envelope["results"] = {
-                "returncode": result.returncode,
-                "stderr": result.stderr,
-                "raw_output": result.stdout,
+                "returncode": proc.returncode,
+                "stderr": stderr,
+                "raw_output": stdout,
             }
         else:
-            envelope["results"] = {"raw_output": result.stdout}
+            envelope["results"] = {"raw_output": stdout}
 
     except subprocess.TimeoutExpired:
+        # Kill the entire process group to reap child processes.
+        if proc is not None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait()
         elapsed_ms = int((time.monotonic() - start) * 1000)
         envelope["duration_ms"] = elapsed_ms
         envelope["status"] = "timeout"
+        envelope["exit_code"] = -1
+        envelope["stderr"] = ""
         envelope["results"] = {
             "error": f"Command timed out after {effective_timeout}s"
         }
     except Exception as exc:
+        if proc is not None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
         elapsed_ms = int((time.monotonic() - start) * 1000)
         envelope["duration_ms"] = elapsed_ms
         envelope["status"] = "error"
+        envelope["exit_code"] = -1
+        envelope["stderr"] = str(exc)
         envelope["results"] = {"error": str(exc)}
 
     return envelope

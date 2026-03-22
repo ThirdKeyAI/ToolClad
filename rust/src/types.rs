@@ -140,6 +140,8 @@ pub struct EvidenceEnvelope {
     pub output_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_hash: Option<String>,
+    pub exit_code: i32,
+    pub stderr: String,
     pub results: serde_json::Value,
 }
 

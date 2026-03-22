@@ -394,8 +394,10 @@ mod tests {
     #[test]
     fn test_path_no_traversal() {
         let def = make_arg("path");
-        assert!(validate_arg("p", &def, "/etc/config.toml").is_ok());
+        assert!(validate_arg("p", &def, "config/settings.toml").is_ok());
         assert!(validate_arg("p", &def, "../../../etc/passwd").is_err());
+        assert!(validate_arg("p", &def, "/etc/shadow").is_err()); // absolute paths blocked
+        assert!(validate_arg("p", &def, "C:\\Windows\\system32").is_err()); // Windows absolute blocked
     }
 
     #[test]

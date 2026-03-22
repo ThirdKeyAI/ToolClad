@@ -112,6 +112,9 @@ function validateEnum(argDef, value) {
 }
 
 function validateScopeTarget(argDef, value) {
+  // NOTE: Scope validation (CIDR, DNS wildcard) should ideally be centralized
+  // to avoid implementation drift across languages. For production use,
+  // defer scope checking to the Symbiont runtime's scope enforcement module.
   const str = String(value);
   checkInjection(str);
   // Block wildcards

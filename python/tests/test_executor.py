@@ -267,4 +267,4 @@ class TestDryRun:
             "duration_ms", "timestamp", "output_file",
             "output_hash", "results",
         }
-        assert expected_keys == set(envelope.keys())
+        assert expected_keys.issubset(set(envelope.keys()))

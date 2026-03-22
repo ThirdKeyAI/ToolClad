@@ -2,12 +2,14 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
@@ -20,6 +22,8 @@ type EvidenceEnvelope struct {
 	ScanID     string         `json:"scan_id"`
 	Tool       string         `json:"tool"`
 	Command    string         `json:"command"`
+	ExitCode   int            `json:"exit_code"`
+	Stderr     string         `json:"stderr"`
 	DurationMs int64          `json:"duration_ms"`
 	Timestamp  string         `json:"timestamp"`
 	OutputHash string         `json:"output_hash,omitempty"`
@@ -88,6 +92,9 @@ func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) 
 		}
 	}
 
+	// SECURITY: This evaluator uses a closed-vocabulary parser.
+	// Never use eval() or equivalent dynamic code execution for conditions.
+
 	// Interpolate the template.
 	result := m.Command.Template
 	for k, v := range cleaned {
@@ -122,8 +129,22 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Split the command for exec. Use shell to handle complex templates.
-	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	// Use array-based execution to avoid shell interpretation.
+	cmdArgs := strings.Fields(cmdStr)
+	if len(cmdArgs) == 0 {
+		return &EvidenceEnvelope{
+			Status:    "error",
+			ScanID:    scanID,
+			Tool:      m.Tool.Name,
+			Timestamp: start.UTC().Format(time.RFC3339),
+			ExitCode:  -1,
+			Error:     "empty command after splitting",
+		}, fmt.Errorf("empty command after splitting")
+	}
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+
+	// Set process group so we can kill the entire group on timeout.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// If using a custom executor, pass validated args as env vars.
 	if m.Command.Executor != "" {
@@ -146,13 +167,33 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 		cmd.Env = append(cmd.Env, "TOOLCLAD_SCAN_ID="+scanID)
 	}
 
-	output, execErr := cmd.CombinedOutput()
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	execErr := cmd.Run()
 	duration := time.Since(start)
+
+	// On context deadline exceeded, kill the entire process group.
+	if ctx.Err() != nil && cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	stdoutBytes := stdoutBuf.Bytes()
+	stderrStr := stderrBuf.String()
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	} else if execErr != nil {
+		exitCode = -1
+	}
 
 	envelope := &EvidenceEnvelope{
 		ScanID:     scanID,
 		Tool:       m.Tool.Name,
 		Command:    cmdStr,
+		ExitCode:   exitCode,
+		Stderr:     stderrStr,
 		DurationMs: duration.Milliseconds(),
 		Timestamp:  start.UTC().Format(time.RFC3339),
 	}
@@ -161,7 +202,7 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 		envelope.Status = "error"
 		envelope.Error = execErr.Error()
 		envelope.Results = map[string]any{
-			"raw_output": string(output),
+			"raw_output": string(stdoutBytes),
 		}
 		return envelope, execErr
 	}
@@ -169,14 +210,14 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	envelope.Status = "success"
 
 	// Compute hash of output.
-	hash := sha256.Sum256(output)
+	hash := sha256.Sum256(stdoutBytes)
 	envelope.OutputHash = fmt.Sprintf("sha256:%x", hash)
 
 	// Parse output based on format.
-	results, parseErr := parseOutput(m.Output.Format, output)
+	results, parseErr := parseOutput(m.Output.Format, stdoutBytes)
 	if parseErr != nil {
 		envelope.Results = map[string]any{
-			"raw_output": string(output),
+			"raw_output": string(stdoutBytes),
 		}
 	} else {
 		envelope.Results = results

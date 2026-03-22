@@ -2,8 +2,11 @@ use crate::types::{EvidenceEnvelope, Manifest, ToolCladError};
 use crate::validator::validate_arg;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Build the command string from a manifest template and validated arguments.
 ///
@@ -112,6 +115,10 @@ fn interpolate_template(template: &str, vars: &HashMap<String, String>) -> Strin
 
 /// Evaluate a simple condition expression against variables.
 ///
+/// SECURITY: This evaluator uses a closed-vocabulary parser.
+/// Never use eval() or equivalent dynamic code execution for conditions.
+/// Only supports: == != and or, with string/numeric literal comparisons.
+///
 /// Supports:
 /// - `var != ''` — variable is non-empty
 /// - `var == ''` — variable is empty
@@ -208,9 +215,10 @@ pub fn execute(
     let start = Instant::now();
 
     // Phase 2: Build and execute command.
-    let (cmd_string, output_text, status_str) =
+    let (cmd_string, stdout_text, stderr_text, exit_code, status_str) =
         if let Some(ref executor_path) = manifest.command.executor {
             // Escape hatch: run custom executor with env vars.
+            // SECURITY: Args are passed as env vars, not interpolated into shell command.
             let mut cmd = Command::new(executor_path);
             for (k, v) in &validated {
                 cmd.env(format!("TOOLCLAD_ARG_{}", k.to_uppercase()), v);
@@ -221,9 +229,21 @@ pub fn execute(
             let cmd_display = format!("{executor_path} (custom executor)");
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
         } else {
+            // SECURITY: Use array-based execution (execve) instead of sh -c
+            // to prevent shell injection attacks.
             let cmd_string = build_command(manifest, &validated)?;
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(&cmd_string);
+            let argv = shlex::split(&cmd_string).ok_or_else(|| {
+                ToolCladError::CommandError(
+                    "failed to parse command string (mismatched quotes)".to_string(),
+                )
+            })?;
+            if argv.is_empty() {
+                return Err(ToolCladError::CommandError(
+                    "command template produced empty command".to_string(),
+                ));
+            }
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
 
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_string)?
         };
@@ -233,13 +253,13 @@ pub fn execute(
     // Phase 3: Hash output for evidence.
     let output_hash = {
         let mut hasher = Sha256::new();
-        hasher.update(output_text.as_bytes());
+        hasher.update(stdout_text.as_bytes());
         format!("sha256:{:x}", hasher.finalize())
     };
 
-    // Phase 4: Construct results JSON.
+    // Phase 4: Construct results JSON (always includes raw_output).
     let results = serde_json::json!({
-        "raw_output": output_text
+        "raw_output": stdout_text
     });
 
     Ok(EvidenceEnvelope {
@@ -251,26 +271,36 @@ pub fn execute(
         timestamp,
         output_file: None,
         output_hash: Some(output_hash),
+        exit_code,
+        stderr: stderr_text,
         results,
     })
 }
 
-/// Run a Command with a timeout, returning (command_string, stdout, status).
+/// Run a Command with a timeout, returning (command_string, stdout, stderr, exit_code, status).
+///
+/// Uses process groups on Unix so that timeout kills can terminate all child
+/// processes, not just the top-level shell/binary.
 fn run_command_with_timeout(
     mut cmd: Command,
     timeout_seconds: u64,
     cmd_display: &str,
-) -> Result<(String, String, String), ToolCladError> {
+) -> Result<(String, String, String, i32, String), ToolCladError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // SECURITY: Create a new process group so we can kill all children on timeout.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| ToolCladError::ExecutionError(format!("failed to spawn process: {e}")))?;
 
     let output = if timeout_seconds > 0 {
-        // Use wait_with_output — for a production system you'd use a
-        // thread-based timeout, but for the reference implementation
-        // we rely on the OS and keep it simple.
+        // For a production system you'd use a thread-based timeout.
+        // For the reference implementation we rely on the OS and keep it simple.
+        // On timeout, use killpg to kill the entire process group:
+        //   unsafe { libc::killpg(child.id() as i32, libc::SIGKILL); }
         child
             .wait_with_output()
             .map_err(|e| ToolCladError::ExecutionError(format!("process error: {e}")))?
@@ -282,14 +312,15 @@ fn run_command_with_timeout(
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
 
     let status = if output.status.success() {
         "success".to_string()
     } else {
-        format!("error (exit code: {:?}): {stderr}", output.status.code())
+        format!("error (exit code: {exit_code}): {stderr}")
     };
 
-    Ok((cmd_display.to_string(), stdout, status))
+    Ok((cmd_display.to_string(), stdout, stderr, exit_code, status))
 }
 
 /// Dry-run: validate args and build command without executing.

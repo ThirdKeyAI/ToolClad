@@ -3,6 +3,38 @@ import { randomBytes, createHash } from "node:crypto";
 import { validateArg } from "./validator.js";
 
 /**
+ * Split a command string into an array of arguments, respecting quoted strings.
+ * This avoids shell interpretation when passing to spawnSync.
+ * @param {string} cmd - The command string to split
+ * @returns {string[]} Array of arguments
+ */
+function splitCommand(cmd) {
+  const args = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (c === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (c === '"' && !inSingle) {
+      inDouble = !inDouble;
+    } else if (c === " " && !inSingle && !inDouble) {
+      if (current.length > 0) {
+        args.push(current);
+        current = "";
+      }
+    } else {
+      current += c;
+    }
+  }
+  if (current.length > 0) {
+    args.push(current);
+  }
+  return args;
+}
+
+/**
  * Resolve all argument values: apply defaults, validate types, resolve mappings.
  *
  * @param {object} manifest - Parsed manifest
@@ -114,6 +146,9 @@ function interpolate(template, context) {
 /**
  * Evaluate a simple condition expression against the context.
  * Supports: "key != value", "key == value", "key != '' and other_key == ''"
+ *
+ * SECURITY: This evaluator uses a closed-vocabulary parser.
+ * Never use eval() or equivalent dynamic code execution for conditions.
  */
 function evaluateCondition(expr, context) {
   // Split on " and " for compound conditions
@@ -173,20 +208,35 @@ export function execute(manifest, args, options = {}) {
     env.TOOLCLAD_EVIDENCE_DIR =
       process.env.TOOLCLAD_EVIDENCE_DIR || "/tmp/toolclad-evidence";
 
-    result = spawnSync(command, {
-      shell: true,
+    // Use array-based execution to avoid shell interpretation.
+    const cmdParts = splitCommand(command);
+    result = spawnSync(cmdParts[0], cmdParts.slice(1), {
+      shell: false,
       timeout: timeoutMs,
+      detached: true,
       env,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
     });
   } else {
-    result = spawnSync(command, {
-      shell: true,
+    // Use array-based execution to avoid shell interpretation.
+    const cmdParts = splitCommand(command);
+    result = spawnSync(cmdParts[0], cmdParts.slice(1), {
+      shell: false,
       timeout: timeoutMs,
+      detached: true,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
     });
+  }
+
+  // On timeout, kill the entire process group.
+  if (result.signal === "SIGTERM" && result.pid) {
+    try {
+      process.kill(-result.pid, "SIGKILL");
+    } catch {
+      // Process group may already be gone.
+    }
   }
 
   const durationMs = Date.now() - startTime;
@@ -197,12 +247,14 @@ export function execute(manifest, args, options = {}) {
   const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
   const outputHash = createHash("sha256").update(stdout).digest("hex");
 
-  // Build evidence envelope
+  // Build evidence envelope with exit_code and stderr on all paths.
   const envelope = {
     status: exitCode === 0 ? "success" : "error",
     scan_id: scanId,
     tool: manifest.tool.name,
     command,
+    exit_code: exitCode ?? -1,
+    stderr,
     duration_ms: durationMs,
     timestamp: new Date(startTime).toISOString(),
     output_hash: `sha256:${outputHash}`,
