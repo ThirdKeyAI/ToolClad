@@ -1,0 +1,55 @@
+[project]
+site_name = "ToolClad Documentation"
+copyright = "Copyright &copy; 2025–2026 Tarnover, LLC / ThirdKey.ai. All rights reserved."
+site_url = "https://docs.toolclad.org/"
+site_description = "Declarative tool interface contracts for agentic runtimes — typed parameters, command templates, evidence envelopes"
+repo_url = "https://github.com/ThirdKeyAI/ToolClad"
+repo_name = "ThirdKeyAI/ToolClad"
+nav = [
+  {"Home" = "index.md"},
+  {"Getting Started" = "getting-started.md"},
+  {"Manifest Format" = "manifest-format.md"},
+  {"Type System" = "type-system.md"},
+  {"Command Construction" = "command-construction.md"},
+  {"HTTP & MCP Backends" = "http-mcp-backends.md"},
+  {"Session Mode" = "session-mode.md"},
+  {"Browser Mode" = "browser-mode.md"},
+  {"Output & Evidence" = "output-evidence.md"},
+  {"Security Model" = "security-model.md"},
+  {"Symbiont Integration" = "symbiont-integration.md"},
+  {"CLI Reference" = "cli-reference.md"},
+  {"API Reference" = "api-reference.md"},
+  {"toolclad.org" = "https://github.com/ThirdKeyAI/ToolClad"},
+]
+
+[project.theme]
+language = "en"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "teal"
+accent = "teal"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "teal"
+accent = "teal"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to dark mode"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/ThirdKeyAI/ToolClad"
+name = "ToolClad on GitHub"
+
+[[project.extra.social]]
+icon = "fontawesome/solid/globe"
+link = "https://symbiont.dev"
+name = "symbiont.dev"
+
+[[project.extra.social]]
+icon = "fontawesome/solid/shield-halved"
+link = "https://thirdkey.ai"
+name = "ThirdKey"
