@@ -114,10 +114,15 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 
 /// Validate internal consistency of a parsed manifest.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
-    // Must have either a template or an executor.
-    if manifest.command.template.is_none() && manifest.command.executor.is_none() {
+    // Must have either a template, an executor, an HTTP backend, or an MCP proxy.
+    if manifest.command.template.is_none()
+        && manifest.command.executor.is_none()
+        && manifest.http.is_none()
+        && manifest.mcp.is_none()
+    {
         return Err(ToolCladError::ManifestError(
-            "[command] must have either 'template' or 'executor'".to_string(),
+            "[command] must have either 'template' or 'executor', or an [http] or [mcp] backend"
+                .to_string(),
         ));
     }
 
@@ -379,5 +384,208 @@ type = "object"
         assert_eq!(schema["name"], "whois_lookup");
         assert!(schema["inputSchema"]["properties"]["target"].is_object());
         assert!(schema["outputSchema"]["properties"]["results"].is_object());
+    }
+
+    #[test]
+    fn test_parse_http_manifest() {
+        let toml_str = r#"
+[tool]
+name = "api_check"
+version = "1.0.0"
+binary = "curl"
+description = "HTTP API health check"
+timeout_seconds = 30
+risk_tier = "low"
+
+[args.endpoint]
+position = 1
+required = true
+type = "string"
+description = "API endpoint path"
+
+[command]
+template = "curl {endpoint}"
+
+[http]
+method = "GET"
+url = "https://api.example.com/{endpoint}"
+headers = { "Authorization" = "Bearer {_secret:api_key}", "Accept" = "application/json" }
+success_status = [200, 201]
+error_status = [500, 502, 503]
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert!(m.http.is_some());
+        let http = m.http.as_ref().unwrap();
+        assert_eq!(http.method, "GET");
+        assert_eq!(http.url, "https://api.example.com/{endpoint}");
+        assert_eq!(http.headers.len(), 2);
+        assert!(http.headers.contains_key("Authorization"));
+        assert_eq!(http.success_status, vec![200, 201]);
+        assert_eq!(http.error_status, vec![500, 502, 503]);
+        assert!(http.body_template.is_none());
+    }
+
+    #[test]
+    fn test_parse_http_manifest_with_body() {
+        let toml_str = r#"
+[tool]
+name = "webhook_post"
+version = "1.0.0"
+binary = "curl"
+description = "Post to webhook"
+timeout_seconds = 15
+risk_tier = "medium"
+
+[args.message]
+position = 1
+required = true
+type = "string"
+description = "Message to send"
+
+[command]
+template = "curl -X POST"
+
+[http]
+method = "POST"
+url = "https://hooks.example.com/notify"
+headers = { "Content-Type" = "application/json" }
+body_template = '{"text": "{message}"}'
+success_status = [200]
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        let http = m.http.as_ref().unwrap();
+        assert_eq!(http.method, "POST");
+        assert!(http.body_template.is_some());
+        assert!(http.body_template.as_ref().unwrap().contains("{message}"));
+    }
+
+    #[test]
+    fn test_parse_mcp_proxy_manifest() {
+        let toml_str = r#"
+[tool]
+name = "code_review"
+version = "1.0.0"
+binary = "mcp-proxy"
+description = "Delegate code review to MCP server"
+timeout_seconds = 120
+risk_tier = "low"
+
+[args.repo]
+position = 1
+required = true
+type = "string"
+description = "Repository name"
+
+[args.pr_number]
+position = 2
+required = true
+type = "integer"
+description = "Pull request number"
+min = 1
+
+[command]
+template = "mcp-proxy"
+
+[mcp]
+server = "code-review-server"
+tool = "analyze_pr"
+field_map = { "repo" = "repository", "pr_number" = "pull_request_id" }
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert!(m.mcp.is_some());
+        let mcp = m.mcp.as_ref().unwrap();
+        assert_eq!(mcp.server, "code-review-server");
+        assert_eq!(mcp.tool, "analyze_pr");
+        assert_eq!(mcp.field_map.len(), 2);
+        assert_eq!(mcp.field_map["repo"], "repository");
+        assert_eq!(mcp.field_map["pr_number"], "pull_request_id");
+    }
+
+    #[test]
+    fn test_parse_mcp_proxy_no_field_map() {
+        let toml_str = r#"
+[tool]
+name = "simple_proxy"
+version = "1.0.0"
+binary = "mcp-proxy"
+description = "Simple MCP proxy"
+timeout_seconds = 60
+risk_tier = "low"
+
+[args.query]
+position = 1
+required = true
+type = "string"
+description = "Search query"
+
+[command]
+template = "mcp-proxy"
+
+[mcp]
+server = "search-server"
+tool = "search"
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        let mcp = m.mcp.as_ref().unwrap();
+        assert_eq!(mcp.server, "search-server");
+        assert_eq!(mcp.tool, "search");
+        assert!(mcp.field_map.is_empty());
+    }
+
+    #[test]
+    fn test_http_backend_without_command_template() {
+        let toml_str = r#"
+[tool]
+name = "http_only"
+version = "1.0.0"
+binary = "none"
+description = "HTTP-only tool"
+timeout_seconds = 30
+risk_tier = "low"
+
+[command]
+
+[http]
+method = "GET"
+url = "https://example.com/health"
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert!(m.http.is_some());
+        assert!(m.command.template.is_none());
     }
 }

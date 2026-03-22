@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shlex
 import signal
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -169,6 +172,139 @@ def _hash_file(path: str, algorithm: str = "sha256") -> str:
         return ""
 
 
+def inject_template_vars(template: str) -> str:
+    """Replace {_secret:name} with TOOLCLAD_SECRET_{NAME} env var."""
+
+    def replacer(match: re.Match) -> str:  # type: ignore[type-arg]
+        name = match.group(1)
+        env_key = f"TOOLCLAD_SECRET_{name.upper()}"
+        val = os.environ.get(env_key)
+        if val is None:
+            raise RuntimeError(f"Secret '{name}' not found (set {env_key})")
+        return val
+
+    return re.sub(r"\{_secret:([a-zA-Z0-9_]+)\}", replacer, template)
+
+
+def _interpolate_http(template: str, args: Dict[str, str]) -> str:
+    """Interpolate arg placeholders then resolve secret references."""
+    result = _interpolate(template, args)
+    return inject_template_vars(result)
+
+
+def _execute_http(
+    manifest: Manifest,
+    args: Dict[str, str],
+    *,
+    dry_run: bool = False,
+    timeout: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Execute an HTTP-based manifest using urllib.request (no extra deps)."""
+    http = manifest.http
+    assert http is not None
+
+    scan_id = _generate_scan_id()
+    effective_timeout = timeout or manifest.tool.timeout_seconds
+
+    # Interpolate URL, headers, and body with args + secrets.
+    url = _interpolate_http(http.url, args)
+    headers = {k: _interpolate_http(v, args) for k, v in http.headers.items()}
+    body: Optional[bytes] = None
+    if http.body_template is not None:
+        body = _interpolate_http(http.body_template, args).encode("utf-8")
+
+    envelope: Dict[str, Any] = {
+        "status": "success",
+        "scan_id": scan_id,
+        "tool": manifest.tool.name,
+        "command": f"{http.method} {url}",
+        "duration_ms": 0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "output_file": "",
+        "output_hash": "",
+        "http_status": 0,
+        "results": {},
+    }
+
+    if dry_run:
+        envelope["status"] = "dry_run"
+        return envelope
+
+    start = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            url, data=body, headers=headers, method=http.method
+        )
+        resp = urllib.request.urlopen(req, timeout=effective_timeout)
+        status_code = resp.status
+        resp_body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        resp_body = exc.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        envelope["duration_ms"] = elapsed_ms
+        envelope["status"] = "error"
+        envelope["results"] = {"error": str(exc)}
+        return envelope
+
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    envelope["duration_ms"] = elapsed_ms
+    envelope["http_status"] = status_code
+
+    if http.error_status and status_code in http.error_status:
+        envelope["status"] = "error"
+    elif http.success_status and status_code not in http.success_status:
+        envelope["status"] = "error"
+
+    envelope["results"] = {"raw_output": resp_body}
+    return envelope
+
+
+def _execute_mcp_proxy(
+    manifest: Manifest,
+    args: Dict[str, str],
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Build a delegation envelope for an MCP proxy manifest."""
+    mcp = manifest.mcp
+    assert mcp is not None
+
+    scan_id = _generate_scan_id()
+
+    # Map args through field_map.
+    mapped_args: Dict[str, str] = {}
+    for src, dst in mcp.field_map.items():
+        if src in args:
+            mapped_args[dst] = args[src]
+
+    # Pass through any args not in the field_map.
+    for k, v in args.items():
+        if k not in mcp.field_map:
+            mapped_args[k] = v
+
+    envelope: Dict[str, Any] = {
+        "status": "delegated",
+        "scan_id": scan_id,
+        "tool": manifest.tool.name,
+        "command": f"mcp://{mcp.server}/{mcp.tool}",
+        "duration_ms": 0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "output_file": "",
+        "output_hash": "",
+        "mcp_server": mcp.server,
+        "mcp_tool": mcp.tool,
+        "mcp_args": mapped_args,
+        "results": {},
+    }
+
+    if dry_run:
+        envelope["status"] = "dry_run"
+
+    return envelope
+
+
 def execute(
     manifest: Manifest,
     args: Dict[str, str],
@@ -188,6 +324,12 @@ def execute(
         An evidence envelope dict with status, scan_id, tool, command,
         duration_ms, timestamp, output_file, output_hash, and results.
     """
+    # Dispatch to HTTP or MCP execution if applicable.
+    if manifest.http is not None:
+        return _execute_http(manifest, args, dry_run=dry_run, timeout=timeout)
+    if manifest.mcp is not None:
+        return _execute_mcp_proxy(manifest, args, dry_run=dry_run)
+
     scan_id = _generate_scan_id()
     tool_name = manifest.tool.name
     effective_timeout = timeout or manifest.tool.timeout_seconds

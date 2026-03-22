@@ -84,12 +84,31 @@ func (o *OutputDef) EnvelopeEnabled() bool {
 	return *o.Envelope
 }
 
+// HttpDef holds the [http] section for HTTP-based tool execution.
+type HttpDef struct {
+	Method        string            `toml:"method"`
+	URL           string            `toml:"url"`
+	Headers       map[string]string `toml:"headers"`
+	BodyTemplate  string            `toml:"body_template"`
+	SuccessStatus []int             `toml:"success_status"`
+	ErrorStatus   []int             `toml:"error_status"`
+}
+
+// McpProxyDef holds the [mcp] section for MCP proxy delegation.
+type McpProxyDef struct {
+	Server   string            `toml:"server"`
+	Tool     string            `toml:"tool"`
+	FieldMap map[string]string `toml:"field_map"`
+}
+
 // Manifest is a fully parsed .clad.toml file.
 type Manifest struct {
 	Tool       ToolMeta           `toml:"tool"`
 	Args       map[string]*ArgDef `toml:"args"`
 	Command    CommandDef         `toml:"command"`
 	Output     OutputDef          `toml:"output"`
+	Http       *HttpDef           `toml:"http"`
+	Mcp        *McpProxyDef       `toml:"mcp"`
 	SourcePath string             `toml:"-"`
 }
 

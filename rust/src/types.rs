@@ -9,6 +9,8 @@ pub struct Manifest {
     pub args: HashMap<String, ArgDef>,
     pub command: CommandDef,
     pub output: OutputDef,
+    pub http: Option<HttpDef>,
+    pub mcp: Option<McpProxyDef>,
 }
 
 /// Tool metadata section `[tool]`.
@@ -125,6 +127,29 @@ pub struct OutputDef {
 
 fn default_schema() -> serde_json::Value {
     serde_json::json!({"type": "object"})
+}
+
+/// HTTP backend configuration `[http]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpDef {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub body_template: Option<String>,
+    #[serde(default)]
+    pub success_status: Vec<u16>,
+    #[serde(default)]
+    pub error_status: Vec<u16>,
+}
+
+/// MCP proxy backend configuration `[mcp]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpProxyDef {
+    pub server: String,
+    pub tool: String,
+    #[serde(default)]
+    pub field_map: HashMap<String, String>,
 }
 
 /// Evidence envelope wrapping tool execution results.

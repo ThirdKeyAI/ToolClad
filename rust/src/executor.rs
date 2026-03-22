@@ -1,5 +1,6 @@
 use crate::types::{EvidenceEnvelope, Manifest, ToolCladError};
 use crate::validator::validate_arg;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
@@ -7,6 +8,182 @@ use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+/// Replace `{_secret:name}` with `TOOLCLAD_SECRET_{NAME}` env var.
+fn inject_template_vars(template: &str) -> Result<String, ToolCladError> {
+    let re = Regex::new(r"\{_secret:([a-zA-Z0-9_]+)\}").unwrap();
+    let mut result = template.to_string();
+    for cap in re.captures_iter(template) {
+        let name = &cap[1];
+        let env_key = format!("TOOLCLAD_SECRET_{}", name.to_uppercase());
+        let val = std::env::var(&env_key).map_err(|_| {
+            ToolCladError::ExecutionError(format!("Secret '{}' not found (set {})", name, env_key))
+        })?;
+        result = result.replace(&cap[0], &val);
+    }
+    Ok(result)
+}
+
+/// Execute an HTTP backend tool, returning an evidence envelope.
+fn execute_http(
+    manifest: &Manifest,
+    validated: &HashMap<String, String>,
+) -> Result<EvidenceEnvelope, ToolCladError> {
+    let http = manifest.http.as_ref().unwrap();
+    let scan_id = format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp(),
+        &uuid::Uuid::new_v4().to_string()[..5]
+    );
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let start = Instant::now();
+
+    // Interpolate URL with args and secrets.
+    let mut url = http.url.clone();
+    for (k, v) in validated {
+        url = url.replace(&format!("{{{k}}}"), v);
+    }
+    url = inject_template_vars(&url)?;
+
+    // Build headers with interpolation.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (hk, hv) in &http.headers {
+        let mut val = hv.clone();
+        for (k, v) in validated {
+            val = val.replace(&format!("{{{k}}}"), v);
+        }
+        val = inject_template_vars(&val)?;
+        headers.push((hk.clone(), val));
+    }
+
+    // Build body from template if present.
+    let body = if let Some(ref body_tmpl) = http.body_template {
+        let mut b = body_tmpl.clone();
+        for (k, v) in validated {
+            b = b.replace(&format!("{{{k}}}"), v);
+        }
+        Some(inject_template_vars(&b)?)
+    } else {
+        None
+    };
+
+    // Execute the HTTP request.
+    let client = reqwest::blocking::Client::new();
+    let method_upper = http.method.to_uppercase();
+    let mut req = match method_upper.as_str() {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "DELETE" => client.delete(&url),
+        "PATCH" => client.patch(&url),
+        "HEAD" => client.head(&url),
+        other => {
+            return Err(ToolCladError::ExecutionError(format!(
+                "unsupported HTTP method: {other}"
+            )))
+        }
+    };
+
+    for (hk, hv) in &headers {
+        req = req.header(hk, hv);
+    }
+    if let Some(ref b) = body {
+        req = req.body(b.clone());
+    }
+
+    let resp = req
+        .send()
+        .map_err(|e| ToolCladError::ExecutionError(format!("HTTP request failed: {e}")))?;
+
+    let status_code = resp.status().as_u16();
+    let resp_body = resp
+        .text()
+        .map_err(|e| ToolCladError::ExecutionError(format!("failed to read response: {e}")))?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Determine success/error based on configured status codes.
+    let is_success = if !http.success_status.is_empty() {
+        http.success_status.contains(&status_code)
+    } else if !http.error_status.is_empty() {
+        !http.error_status.contains(&status_code)
+    } else {
+        (200..300).contains(&status_code)
+    };
+
+    let status_str = if is_success {
+        "success".to_string()
+    } else {
+        format!("error (HTTP {})", status_code)
+    };
+
+    let output_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(resp_body.as_bytes());
+        format!("sha256:{:x}", hasher.finalize())
+    };
+
+    let results = serde_json::json!({
+        "raw_output": resp_body,
+        "http_status": status_code,
+        "http_method": method_upper,
+    });
+
+    Ok(EvidenceEnvelope {
+        status: status_str,
+        scan_id,
+        tool: manifest.tool.name.clone(),
+        command: format!("{} {}", method_upper, url),
+        duration_ms,
+        timestamp,
+        output_file: None,
+        output_hash: Some(output_hash),
+        exit_code: if is_success { 0 } else { 1 },
+        stderr: String::new(),
+        results,
+    })
+}
+
+/// Execute an MCP proxy backend tool, returning a delegated evidence envelope.
+fn execute_mcp_proxy(
+    manifest: &Manifest,
+    validated: &HashMap<String, String>,
+) -> Result<EvidenceEnvelope, ToolCladError> {
+    let mcp = manifest.mcp.as_ref().unwrap();
+    let scan_id = format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp(),
+        &uuid::Uuid::new_v4().to_string()[..5]
+    );
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    // Map arguments through field_map.
+    let mut mapped_args = serde_json::Map::new();
+    for (k, v) in validated {
+        let target_key = mcp.field_map.get(k).unwrap_or(k);
+        mapped_args.insert(target_key.clone(), serde_json::json!(v));
+    }
+
+    let results = serde_json::json!({
+        "mcp_server": mcp.server,
+        "mcp_tool": mcp.tool,
+        "mcp_arguments": mapped_args,
+    });
+
+    Ok(EvidenceEnvelope {
+        status: "delegated".to_string(),
+        scan_id,
+        tool: manifest.tool.name.clone(),
+        command: format!("mcp://{}:{}", mcp.server, mcp.tool),
+        duration_ms: 0,
+        timestamp,
+        output_file: None,
+        output_hash: None,
+        exit_code: 0,
+        stderr: String::new(),
+        results,
+    })
+}
 
 /// Build the command string from a manifest template and validated arguments.
 ///
@@ -204,6 +381,14 @@ pub fn execute(
         } else if let Some(ref default_val) = def.default {
             validated.insert(name.clone(), toml_value_to_string(default_val));
         }
+    }
+
+    // Route to HTTP or MCP backend if configured.
+    if manifest.http.is_some() {
+        return execute_http(manifest, &validated);
+    }
+    if manifest.mcp.is_some() {
+        return execute_mcp_proxy(manifest, &validated);
     }
 
     let scan_id = format!(
@@ -435,6 +620,8 @@ mod tests {
                 envelope: true,
                 schema: serde_json::json!({"type": "object"}),
             },
+            http: None,
+            mcp: None,
         }
     }
 
@@ -532,5 +719,54 @@ mod tests {
         args.insert("target".to_string(), "10.0.1.1".to_string());
         let result = dry_run(&m, &args).unwrap();
         assert!(result.command.contains("10.0.1.1"));
+    }
+
+    #[test]
+    fn test_inject_template_vars_with_env() {
+        std::env::set_var("TOOLCLAD_SECRET_API_KEY", "test-key-123");
+        let result = inject_template_vars("Bearer {_secret:api_key}").unwrap();
+        assert_eq!(result, "Bearer test-key-123");
+        std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
+    }
+
+    #[test]
+    fn test_inject_template_vars_missing_secret() {
+        std::env::remove_var("TOOLCLAD_SECRET_MISSING");
+        let result = inject_template_vars("token={_secret:missing}");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TOOLCLAD_SECRET_MISSING"));
+    }
+
+    #[test]
+    fn test_inject_template_vars_no_secrets() {
+        let result = inject_template_vars("plain text with {normal} placeholders").unwrap();
+        assert_eq!(result, "plain text with {normal} placeholders");
+    }
+
+    #[test]
+    fn test_mcp_proxy_envelope() {
+        use crate::types::McpProxyDef;
+
+        let mut m = minimal_manifest();
+        m.mcp = Some(McpProxyDef {
+            server: "code-review-server".to_string(),
+            tool: "analyze_pr".to_string(),
+            field_map: HashMap::from([
+                ("target".to_string(), "repository".to_string()),
+            ]),
+        });
+
+        let mut args = HashMap::new();
+        args.insert("target".to_string(), "example.com".to_string());
+
+        let envelope = execute(&m, &args).unwrap();
+        assert_eq!(envelope.status, "delegated");
+        assert_eq!(envelope.results["mcp_server"], "code-review-server");
+        assert_eq!(envelope.results["mcp_tool"], "analyze_pr");
+        assert_eq!(
+            envelope.results["mcp_arguments"]["repository"],
+            "example.com"
+        );
     }
 }

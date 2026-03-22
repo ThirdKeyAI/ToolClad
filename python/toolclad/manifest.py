@@ -96,6 +96,27 @@ class OutputDef:
 
 
 @dataclass
+class HttpDef:
+    """HTTP execution definition from [http] section."""
+
+    method: str = "GET"
+    url: str = ""
+    headers: Dict[str, str] = field(default_factory=dict)
+    body_template: Optional[str] = None
+    success_status: List[int] = field(default_factory=list)
+    error_status: List[int] = field(default_factory=list)
+
+
+@dataclass
+class McpProxyDef:
+    """MCP proxy delegation definition from [mcp] section."""
+
+    server: str = ""
+    tool: str = ""
+    field_map: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class Manifest:
     """Complete parsed .clad.toml manifest."""
 
@@ -103,6 +124,8 @@ class Manifest:
     args: Dict[str, ArgDef] = field(default_factory=dict)
     command: CommandDef = field(default_factory=CommandDef)
     output: OutputDef = field(default_factory=OutputDef)
+    http: Optional[HttpDef] = None
+    mcp: Optional[McpProxyDef] = None
     source_path: str = ""
 
     @property
@@ -193,6 +216,25 @@ def _parse_output(data: Dict[str, Any]) -> OutputDef:
     )
 
 
+def _parse_http(data: Dict[str, Any]) -> HttpDef:
+    return HttpDef(
+        method=data.get("method", "GET"),
+        url=data.get("url", ""),
+        headers=data.get("headers", {}),
+        body_template=data.get("body_template"),
+        success_status=data.get("success_status", []),
+        error_status=data.get("error_status", []),
+    )
+
+
+def _parse_mcp(data: Dict[str, Any]) -> McpProxyDef:
+    return McpProxyDef(
+        server=data.get("server", ""),
+        tool=data.get("tool", ""),
+        field_map=data.get("field_map", {}),
+    )
+
+
 def load_manifest(path: str) -> Manifest:
     """Parse a .clad.toml file and return a Manifest.
 
@@ -230,5 +272,11 @@ def load_manifest(path: str) -> Manifest:
 
     if "output" in data:
         manifest.output = _parse_output(data["output"])
+
+    if "http" in data:
+        manifest.http = _parse_http(data["http"])
+
+    if "mcp" in data:
+        manifest.mcp = _parse_mcp(data["mcp"])
 
     return manifest

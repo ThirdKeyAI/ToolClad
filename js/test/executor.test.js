@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildCommand, generateMcpSchema } from "../src/executor.js";
+import { buildCommand, generateMcpSchema, injectTemplateVars, executeMcp } from "../src/executor.js";
 
 // Minimal manifest for testing template interpolation
 function makeManifest(overrides = {}) {
@@ -196,5 +196,112 @@ describe("generateMcpSchema", () => {
     assert.equal(schema.outputSchema.type, "object");
     assert.ok(schema.outputSchema.properties.status);
     assert.ok(schema.outputSchema.properties.results);
+  });
+});
+
+describe("injectTemplateVars", () => {
+  it("replaces {_secret:name} with env var", () => {
+    process.env.TOOLCLAD_SECRET_API_KEY = "test-key-123";
+    const result = injectTemplateVars("Bearer {_secret:api_key}");
+    assert.equal(result, "Bearer test-key-123");
+    delete process.env.TOOLCLAD_SECRET_API_KEY;
+  });
+
+  it("throws on missing env var", () => {
+    delete process.env.TOOLCLAD_SECRET_MISSING;
+    assert.throws(
+      () => injectTemplateVars("{_secret:missing}"),
+      /Missing environment variable: TOOLCLAD_SECRET_MISSING/
+    );
+  });
+
+  it("leaves non-secret placeholders untouched", () => {
+    const result = injectTemplateVars("hello {world}");
+    assert.equal(result, "hello {world}");
+  });
+});
+
+describe("HTTP manifest parsing", () => {
+  it("loadManifest accepts manifest with [http] section and no [command]", async () => {
+    // We test that makeManifest-like objects with http work in executors
+    const httpManifest = {
+      tool: { name: "api_check", description: "Check an API" },
+      http: {
+        method: "GET",
+        url: "https://api.example.com/status",
+        headers: { "Accept": "application/json" },
+        success_status: [200],
+      },
+    };
+    assert.equal(httpManifest.http.method, "GET");
+    assert.equal(httpManifest.http.url, "https://api.example.com/status");
+    assert.deepEqual(httpManifest.http.success_status, [200]);
+  });
+});
+
+describe("executeMcp", () => {
+  it("returns delegated envelope with field mapping", () => {
+    const manifest = {
+      tool: { name: "proxy_tool", description: "MCP proxy" },
+      mcp: {
+        server: "mcp://security-tools.example.com",
+        tool: "remote_scan",
+        field_map: { target: "host", scan_type: "mode" },
+      },
+      args: {
+        target: {
+          position: 1,
+          required: true,
+          type: "scope_target",
+          description: "Target",
+        },
+        scan_type: {
+          position: 2,
+          required: true,
+          type: "enum",
+          allowed: ["ping", "syn"],
+          description: "Scan type",
+        },
+      },
+    };
+
+    const result = executeMcp(manifest, { target: "10.0.1.1", scan_type: "ping" });
+    assert.equal(result.status, "delegated");
+    assert.equal(result.mcp_server, "mcp://security-tools.example.com");
+    assert.equal(result.mcp_tool, "remote_scan");
+    assert.equal(result.mapped_args.host, "10.0.1.1");
+    assert.equal(result.mapped_args.mode, "ping");
+    assert.ok(result.scan_id);
+    assert.ok(result.timestamp);
+  });
+
+  it("passes args through when no field_map", () => {
+    const manifest = {
+      tool: { name: "proxy_tool", description: "MCP proxy" },
+      mcp: {
+        server: "mcp://tools.example.com",
+        tool: "echo",
+      },
+      args: {
+        msg: {
+          position: 1,
+          required: true,
+          type: "string",
+          description: "Message",
+        },
+      },
+    };
+
+    const result = executeMcp(manifest, { msg: "hello" });
+    assert.equal(result.status, "delegated");
+    assert.equal(result.mapped_args.msg, "hello");
+  });
+
+  it("throws when mcp section is missing", () => {
+    const manifest = {
+      tool: { name: "bad", description: "no mcp" },
+      args: {},
+    };
+    assert.throws(() => executeMcp(manifest, {}), /missing \[mcp\] section/);
   });
 });

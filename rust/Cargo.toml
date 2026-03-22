@@ -1,6 +1,6 @@
 [package]
 name = "toolclad"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 authors = ["Jascha Wanger / ThirdKey.ai"]
 description = "Declarative CLI tool interface contracts for agentic runtimes — manifest parser, argument validator, command executor"
@@ -30,3 +30,4 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 shlex = "1"
 libc = "0.2"
+reqwest = { version = "0.12", features = ["blocking"] }

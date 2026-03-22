@@ -2,6 +2,9 @@ package executor
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -292,5 +295,209 @@ func TestExecuteEcho(t *testing.T) {
 	}
 	if !strings.HasPrefix(env.OutputHash, "sha256:") {
 		t.Errorf("expected hash prefix 'sha256:', got %q", env.OutputHash)
+	}
+}
+
+func TestInjectTemplateVars(t *testing.T) {
+	os.Setenv("TOOLCLAD_SECRET_API_KEY", "test-key-123")
+	defer os.Unsetenv("TOOLCLAD_SECRET_API_KEY")
+
+	result, err := injectTemplateVars("Bearer {_secret:api_key}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Bearer test-key-123" {
+		t.Errorf("got %q, want %q", result, "Bearer test-key-123")
+	}
+}
+
+func TestInjectTemplateVarsMissing(t *testing.T) {
+	os.Unsetenv("TOOLCLAD_SECRET_MISSING")
+	_, err := injectTemplateVars("{_secret:missing}")
+	if err == nil {
+		t.Error("expected error for missing env var, got nil")
+	}
+	if !strings.Contains(err.Error(), "TOOLCLAD_SECRET_MISSING") {
+		t.Errorf("error should mention TOOLCLAD_SECRET_MISSING, got: %v", err)
+	}
+}
+
+func TestInjectTemplateVarsNoSecrets(t *testing.T) {
+	result, err := injectTemplateVars("hello {world}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "hello {world}" {
+		t.Errorf("got %q, want %q", result, "hello {world}")
+	}
+}
+
+func TestExecuteHTTP(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.Header.Get("Accept") != "application/json" {
+			t.Errorf("expected Accept header, got %q", r.Header.Get("Accept"))
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{
+			Name:           "http_test",
+			TimeoutSeconds: 5,
+		},
+		Args: map[string]*manifest.ArgDef{},
+		Http: &manifest.HttpDef{
+			Method:        "GET",
+			URL:           ts.URL + "/status",
+			Headers:       map[string]string{"Accept": "application/json"},
+			SuccessStatus: []int{200},
+		},
+	}
+
+	env, err := ExecuteHTTP(m, map[string]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if env.Status != "success" {
+		t.Errorf("expected status 'success', got %q (error: %s)", env.Status, env.Error)
+	}
+	if env.ExitCode != 200 {
+		t.Errorf("expected exit_code 200, got %d", env.ExitCode)
+	}
+	raw, ok := env.Results["raw_output"].(string)
+	if !ok || !strings.Contains(raw, "ok") {
+		t.Errorf("expected raw_output containing 'ok', got %v", env.Results)
+	}
+}
+
+func TestExecuteHTTPError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		w.Write([]byte("not found"))
+	}))
+	defer ts.Close()
+
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{
+			Name:           "http_err_test",
+			TimeoutSeconds: 5,
+		},
+		Args: map[string]*manifest.ArgDef{},
+		Http: &manifest.HttpDef{
+			Method:        "GET",
+			URL:           ts.URL + "/missing",
+			SuccessStatus: []int{200},
+		},
+	}
+
+	env, err := ExecuteHTTP(m, map[string]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if env.Status != "error" {
+		t.Errorf("expected status 'error', got %q", env.Status)
+	}
+	if !strings.Contains(env.Error, "404") {
+		t.Errorf("expected error to mention 404, got %q", env.Error)
+	}
+}
+
+func TestExecuteMCP(t *testing.T) {
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "mcp_test"},
+		Args: map[string]*manifest.ArgDef{
+			"target": {
+				Name:     "target",
+				Position: 1,
+				Required: true,
+				Type:     "scope_target",
+			},
+			"scan_type": {
+				Name:     "scan_type",
+				Position: 2,
+				Required: true,
+				Type:     "enum",
+				Allowed:  []string{"ping", "syn"},
+			},
+		},
+		Mcp: &manifest.McpProxyDef{
+			Server:   "mcp://security-tools.example.com",
+			Tool:     "remote_scan",
+			FieldMap: map[string]string{"target": "host", "scan_type": "mode"},
+		},
+	}
+
+	env, err := ExecuteMCP(m, map[string]string{"target": "10.0.1.1", "scan_type": "ping"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if env.Status != "delegated" {
+		t.Errorf("expected status 'delegated', got %q", env.Status)
+	}
+	if env.Results["mcp_server"] != "mcp://security-tools.example.com" {
+		t.Errorf("unexpected mcp_server: %v", env.Results["mcp_server"])
+	}
+	if env.Results["mcp_tool"] != "remote_scan" {
+		t.Errorf("unexpected mcp_tool: %v", env.Results["mcp_tool"])
+	}
+	mappedArgs, ok := env.Results["mapped_args"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mapped_args map, got %T", env.Results["mapped_args"])
+	}
+	if mappedArgs["host"] != "10.0.1.1" {
+		t.Errorf("expected mapped host=10.0.1.1, got %v", mappedArgs["host"])
+	}
+	if mappedArgs["mode"] != "ping" {
+		t.Errorf("expected mapped mode=ping, got %v", mappedArgs["mode"])
+	}
+}
+
+func TestExecuteMCPNoFieldMap(t *testing.T) {
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "mcp_passthrough"},
+		Args: map[string]*manifest.ArgDef{
+			"msg": {
+				Name:     "msg",
+				Position: 1,
+				Required: true,
+				Type:     "string",
+			},
+		},
+		Mcp: &manifest.McpProxyDef{
+			Server: "mcp://tools.example.com",
+			Tool:   "echo",
+		},
+	}
+
+	env, err := ExecuteMCP(m, map[string]string{"msg": "hello"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if env.Status != "delegated" {
+		t.Errorf("expected status 'delegated', got %q", env.Status)
+	}
+	mappedArgs, ok := env.Results["mapped_args"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mapped_args map, got %T", env.Results["mapped_args"])
+	}
+	if mappedArgs["msg"] != "hello" {
+		t.Errorf("expected msg=hello, got %v", mappedArgs["msg"])
+	}
+}
+
+func TestExecuteMCPMissingSection(t *testing.T) {
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "no_mcp"},
+		Args: map[string]*manifest.ArgDef{},
+	}
+
+	_, err := ExecuteMCP(m, map[string]string{})
+	if err == nil {
+		t.Error("expected error for missing mcp section")
 	}
 }

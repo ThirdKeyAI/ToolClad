@@ -7,7 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -245,6 +249,232 @@ func parseOutput(format string, data []byte) (map[string]any, error) {
 			"raw_output": string(data),
 		}, nil
 	}
+}
+
+// secretPattern matches {_secret:name} placeholders in templates.
+var secretPattern = regexp.MustCompile(`\{_secret:(\w+)\}`)
+
+// injectTemplateVars replaces {_secret:name} with TOOLCLAD_SECRET_<NAME> env vars.
+func injectTemplateVars(template string) (string, error) {
+	var missingErr error
+	result := secretPattern.ReplaceAllStringFunc(template, func(match string) string {
+		sub := secretPattern.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		envKey := "TOOLCLAD_SECRET_" + strings.ToUpper(sub[1])
+		val := os.Getenv(envKey)
+		if val == "" {
+			missingErr = fmt.Errorf("missing environment variable: %s", envKey)
+			return match
+		}
+		return val
+	})
+	if missingErr != nil {
+		return "", missingErr
+	}
+	return result, nil
+}
+
+// interpolateString replaces {key} placeholders with values from the context map.
+func interpolateString(template string, ctx map[string]string) string {
+	result := template
+	for k, v := range ctx {
+		result = strings.ReplaceAll(result, "{"+k+"}", v)
+	}
+	return result
+}
+
+// ExecuteHTTP performs an HTTP request based on the manifest's [http] section.
+func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	if m.Http == nil || m.Http.URL == "" {
+		return nil, fmt.Errorf("manifest %q has no [http] section or http.url", m.Tool.Name)
+	}
+
+	start := time.Now()
+	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+
+	// Validate args
+	cleaned := make(map[string]string)
+	for name, argDef := range m.Args {
+		val, provided := args[name]
+		if !provided {
+			if argDef.Required {
+				return nil, fmt.Errorf("missing required argument: %q", name)
+			}
+			if argDef.Default != nil {
+				val = fmt.Sprintf("%v", argDef.Default)
+			} else {
+				continue
+			}
+		}
+		validated, err := validator.ValidateArg(argDef, val)
+		if err != nil {
+			return nil, fmt.Errorf("argument %q: %w", name, err)
+		}
+		cleaned[name] = validated
+	}
+
+	// Interpolate URL
+	url := interpolateString(m.Http.URL, cleaned)
+	url, err := injectTemplateVars(url)
+	if err != nil {
+		return nil, err
+	}
+
+	// Interpolate headers
+	headers := make(map[string]string)
+	for k, v := range m.Http.Headers {
+		hv := interpolateString(v, cleaned)
+		hv, err := injectTemplateVars(hv)
+		if err != nil {
+			return nil, err
+		}
+		headers[k] = hv
+	}
+
+	// Interpolate body
+	method := strings.ToUpper(m.Http.Method)
+	if method == "" {
+		method = "GET"
+	}
+	var bodyReader io.Reader
+	if m.Http.BodyTemplate != "" && method != "GET" && method != "HEAD" {
+		body := interpolateString(m.Http.BodyTemplate, cleaned)
+		body, err = injectTemplateVars(body)
+		if err != nil {
+			return nil, err
+		}
+		bodyReader = strings.NewReader(body)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("building HTTP request: %w", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	timeout := time.Duration(m.Tool.TimeoutSeconds) * time.Second
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return &EvidenceEnvelope{
+			Status:    "error",
+			ScanID:    scanID,
+			Tool:      m.Tool.Name,
+			Timestamp: start.UTC().Format(time.RFC3339),
+			Error:     err.Error(),
+		}, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	duration := time.Since(start)
+	hash := sha256.Sum256(respBody)
+
+	successStatus := m.Http.SuccessStatus
+	if len(successStatus) == 0 {
+		successStatus = []int{200, 201, 202, 204}
+	}
+	isSuccess := false
+	for _, s := range successStatus {
+		if resp.StatusCode == s {
+			isSuccess = true
+			break
+		}
+	}
+
+	envelope := &EvidenceEnvelope{
+		ScanID:     scanID,
+		Tool:       m.Tool.Name,
+		DurationMs: duration.Milliseconds(),
+		Timestamp:  start.UTC().Format(time.RFC3339),
+		OutputHash: fmt.Sprintf("sha256:%x", hash),
+		ExitCode:   resp.StatusCode,
+		Results: map[string]any{
+			"raw_output": string(respBody),
+		},
+	}
+
+	if isSuccess {
+		envelope.Status = "success"
+	} else {
+		envelope.Status = "error"
+		body := string(respBody)
+		if len(body) > 500 {
+			body = body[:500]
+		}
+		envelope.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	return envelope, nil
+}
+
+// ExecuteMCP performs field mapping and returns a delegated envelope for MCP proxy.
+func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	if m.Mcp == nil || m.Mcp.Server == "" || m.Mcp.Tool == "" {
+		return nil, fmt.Errorf("manifest %q has no [mcp] section or mcp.server/mcp.tool", m.Tool.Name)
+	}
+
+	start := time.Now()
+	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+
+	// Validate args
+	cleaned := make(map[string]string)
+	for name, argDef := range m.Args {
+		val, provided := args[name]
+		if !provided {
+			if argDef.Required {
+				return nil, fmt.Errorf("missing required argument: %q", name)
+			}
+			if argDef.Default != nil {
+				val = fmt.Sprintf("%v", argDef.Default)
+			} else {
+				continue
+			}
+		}
+		validated, err := validator.ValidateArg(argDef, val)
+		if err != nil {
+			return nil, fmt.Errorf("argument %q: %w", name, err)
+		}
+		cleaned[name] = validated
+	}
+
+	// Apply field_map
+	mappedArgs := make(map[string]any)
+	if len(m.Mcp.FieldMap) > 0 {
+		for ourName, theirName := range m.Mcp.FieldMap {
+			if val, ok := cleaned[ourName]; ok {
+				mappedArgs[theirName] = val
+			}
+		}
+	} else {
+		for k, v := range cleaned {
+			mappedArgs[k] = v
+		}
+	}
+
+	return &EvidenceEnvelope{
+		Status:    "delegated",
+		ScanID:    scanID,
+		Tool:      m.Tool.Name,
+		Timestamp: start.UTC().Format(time.RFC3339),
+		Results: map[string]any{
+			"mcp_server":  m.Mcp.Server,
+			"mcp_tool":    m.Mcp.Tool,
+			"mapped_args": mappedArgs,
+		},
+	}, nil
 }
 
 // GenerateMCPSchema produces an MCP-compatible JSON schema from the manifest.

@@ -6,12 +6,19 @@ from typing import Dict, Optional
 
 import pytest
 
-from toolclad.executor import build_command, execute, _evaluate_condition
+from toolclad.executor import (
+    build_command,
+    execute,
+    inject_template_vars,
+    _evaluate_condition,
+)
 from toolclad.manifest import (
     ArgDef,
     CommandDef,
     ConditionalDef,
     EvidenceDef,
+    HttpDef,
+    McpProxyDef,
     Manifest,
     OutputDef,
     ToolMeta,
@@ -268,3 +275,183 @@ class TestDryRun:
             "output_hash", "results",
         }
         assert expected_keys.issubset(set(envelope.keys()))
+
+
+# ---------------------------------------------------------------------------
+# Template variable injection (secrets)
+# ---------------------------------------------------------------------------
+
+class TestInjectTemplateVars:
+    def test_secret_resolved_from_env(self, monkeypatch):
+        monkeypatch.setenv("TOOLCLAD_SECRET_API_KEY", "s3cret")
+        result = inject_template_vars("Bearer {_secret:api_key}")
+        assert result == "Bearer s3cret"
+
+    def test_missing_secret_raises(self, monkeypatch):
+        monkeypatch.delenv("TOOLCLAD_SECRET_MISSING", raising=False)
+        with pytest.raises(RuntimeError, match="Secret 'missing' not found"):
+            inject_template_vars("{_secret:missing}")
+
+    def test_no_secret_refs_passthrough(self):
+        result = inject_template_vars("just a plain string")
+        assert result == "just a plain string"
+
+
+# ---------------------------------------------------------------------------
+# HTTP manifest execution
+# ---------------------------------------------------------------------------
+
+class TestHttpExecution:
+    def _http_manifest(
+        self,
+        url: str = "https://api.example.com/scan",
+        method: str = "POST",
+        headers: Optional[Dict[str, str]] = None,
+        body_template: Optional[str] = None,
+        success_status: Optional[list] = None,
+    ) -> Manifest:
+        return Manifest(
+            tool=ToolMeta(name="http_tool", version="1.0.0", binary=""),
+            http=HttpDef(
+                method=method,
+                url=url,
+                headers=headers or {"Content-Type": "application/json"},
+                body_template=body_template,
+                success_status=success_status or [200],
+            ),
+        )
+
+    def test_http_dry_run_returns_envelope(self):
+        m = self._http_manifest()
+        envelope = execute(m, {}, dry_run=True)
+        assert envelope["status"] == "dry_run"
+        assert envelope["tool"] == "http_tool"
+        assert "http_status" in envelope
+        assert "POST" in envelope["command"]
+
+    def test_http_dry_run_interpolates_url(self):
+        m = self._http_manifest(url="https://api.example.com/{target}")
+        m.args = {
+            "target": ArgDef(name="target", position=1, required=True, type="string"),
+        }
+        envelope = execute(m, {"target": "scan123"}, dry_run=True)
+        assert "scan123" in envelope["command"]
+
+    def test_http_manifest_has_http_status_key(self):
+        m = self._http_manifest()
+        envelope = execute(m, {}, dry_run=True)
+        assert "http_status" in envelope
+        assert envelope["http_status"] == 0  # not executed in dry_run
+
+
+# ---------------------------------------------------------------------------
+# HTTP manifest parsing from TOML
+# ---------------------------------------------------------------------------
+
+class TestHttpManifestParsing:
+    def test_load_http_manifest(self, tmp_path):
+        toml_content = b"""
+[tool]
+name = "api-check"
+version = "1.0.0"
+binary = ""
+
+[http]
+method = "GET"
+url = "https://api.example.com/health"
+success_status = [200, 204]
+error_status = [500, 503]
+
+[http.headers]
+Authorization = "Bearer {_secret:token}"
+"""
+        p = tmp_path / "api.clad.toml"
+        p.write_bytes(toml_content)
+
+        from toolclad.manifest import load_manifest
+        m = load_manifest(str(p))
+        assert m.http is not None
+        assert m.http.method == "GET"
+        assert m.http.url == "https://api.example.com/health"
+        assert m.http.success_status == [200, 204]
+        assert m.http.error_status == [500, 503]
+        assert m.http.headers["Authorization"] == "Bearer {_secret:token}"
+
+
+# ---------------------------------------------------------------------------
+# MCP proxy execution
+# ---------------------------------------------------------------------------
+
+class TestMcpProxyExecution:
+    def _mcp_manifest(self) -> Manifest:
+        return Manifest(
+            tool=ToolMeta(name="mcp_tool", version="1.0.0", binary=""),
+            mcp=McpProxyDef(
+                server="security-scanner",
+                tool="run_scan",
+                field_map={"target": "host", "port": "port_number"},
+            ),
+        )
+
+    def test_mcp_envelope_status_delegated(self):
+        m = self._mcp_manifest()
+        envelope = execute(m, {"target": "10.0.1.1", "port": "443"})
+        assert envelope["status"] == "delegated"
+
+    def test_mcp_envelope_has_server_and_tool(self):
+        m = self._mcp_manifest()
+        envelope = execute(m, {"target": "10.0.1.1"})
+        assert envelope["mcp_server"] == "security-scanner"
+        assert envelope["mcp_tool"] == "run_scan"
+
+    def test_mcp_field_map_applied(self):
+        m = self._mcp_manifest()
+        envelope = execute(m, {"target": "10.0.1.1", "port": "443"})
+        assert envelope["mcp_args"]["host"] == "10.0.1.1"
+        assert envelope["mcp_args"]["port_number"] == "443"
+
+    def test_mcp_unmapped_args_passed_through(self):
+        m = self._mcp_manifest()
+        envelope = execute(m, {"target": "10.0.1.1", "extra": "val"})
+        assert envelope["mcp_args"]["extra"] == "val"
+
+    def test_mcp_dry_run(self):
+        m = self._mcp_manifest()
+        envelope = execute(m, {"target": "10.0.1.1"}, dry_run=True)
+        assert envelope["status"] == "dry_run"
+
+    def test_mcp_command_uri(self):
+        m = self._mcp_manifest()
+        envelope = execute(m, {})
+        assert envelope["command"] == "mcp://security-scanner/run_scan"
+
+
+# ---------------------------------------------------------------------------
+# MCP manifest parsing from TOML
+# ---------------------------------------------------------------------------
+
+class TestMcpManifestParsing:
+    def test_load_mcp_manifest(self, tmp_path):
+        toml_content = b"""
+[tool]
+name = "mcp-proxy"
+version = "1.0.0"
+binary = ""
+
+[mcp]
+server = "my-server"
+tool = "my-tool"
+
+[mcp.field_map]
+source = "input"
+dest = "output"
+"""
+        p = tmp_path / "mcp.clad.toml"
+        p.write_bytes(toml_content)
+
+        from toolclad.manifest import load_manifest
+        m = load_manifest(str(p))
+        assert m.mcp is not None
+        assert m.mcp.server == "my-server"
+        assert m.mcp.tool == "my-tool"
+        assert m.mcp.field_map == {"source": "input", "dest": "output"}

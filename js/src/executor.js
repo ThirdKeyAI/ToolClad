@@ -3,6 +3,22 @@ import { randomBytes, createHash } from "node:crypto";
 import { validateArg } from "./validator.js";
 
 /**
+ * Replace {_secret:name} placeholders with TOOLCLAD_SECRET_<NAME> env vars.
+ * @param {string} template - Template string with optional {_secret:name} vars
+ * @returns {string} Template with secrets injected from environment
+ */
+export function injectTemplateVars(template) {
+  return template.replace(/\{_secret:(\w+)\}/g, (_match, name) => {
+    const envKey = `TOOLCLAD_SECRET_${name.toUpperCase()}`;
+    const val = process.env[envKey];
+    if (val === undefined) {
+      throw new Error(`Missing environment variable: ${envKey}`);
+    }
+    return val;
+  });
+}
+
+/**
  * Split a command string into an array of arguments, respecting quoted strings.
  * This avoids shell interpretation when passing to spawnSync.
  * @param {string} cmd - The command string to split
@@ -268,6 +284,136 @@ export function execute(manifest, args, options = {}) {
   }
 
   return envelope;
+}
+
+/**
+ * Execute a tool via HTTP when the manifest has an [http] section.
+ * Uses Node 18+ built-in fetch.
+ *
+ * @param {object} manifest - Parsed manifest with http section
+ * @param {object} args - User-supplied arguments (key=value)
+ * @param {object} [options] - Execution options
+ * @param {boolean} [options.dryRun=false] - If true, build request but don't execute
+ * @returns {Promise<object>} Evidence envelope with http_status
+ */
+export async function executeHttp(manifest, args, options = {}) {
+  const httpDef = manifest.http;
+  if (!httpDef || !httpDef.url) {
+    throw new Error("Manifest missing [http] section or http.url");
+  }
+
+  const resolvedArgs = resolveArgs(manifest, args);
+  const context = { ...resolvedArgs };
+
+  // Interpolate URL with args and template vars
+  let url = interpolate(httpDef.url, context);
+  url = injectTemplateVars(url);
+
+  // Interpolate headers
+  const headers = {};
+  if (httpDef.headers) {
+    for (const [key, val] of Object.entries(httpDef.headers)) {
+      headers[key] = injectTemplateVars(interpolate(val, context));
+    }
+  }
+
+  // Interpolate body
+  let body = undefined;
+  if (httpDef.body_template) {
+    body = injectTemplateVars(interpolate(httpDef.body_template, context));
+  }
+
+  const method = (httpDef.method || "GET").toUpperCase();
+
+  if (options.dryRun) {
+    return {
+      status: "dry_run",
+      tool: manifest.tool.name,
+      http_method: method,
+      http_url: url,
+      http_headers: headers,
+      http_body: body,
+      resolvedArgs,
+    };
+  }
+
+  const startTime = Date.now();
+  const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
+
+  const fetchOptions = { method, headers };
+  if (body && method !== "GET" && method !== "HEAD") {
+    fetchOptions.body = body;
+  }
+
+  const response = await fetch(url, fetchOptions);
+  const responseBody = await response.text();
+  const durationMs = Date.now() - startTime;
+  const outputHash = createHash("sha256").update(responseBody).digest("hex");
+
+  const successStatus = httpDef.success_status || [200, 201, 202, 204];
+  const isSuccess = successStatus.includes(response.status);
+
+  const envelope = {
+    status: isSuccess ? "success" : "error",
+    scan_id: scanId,
+    tool: manifest.tool.name,
+    http_status: response.status,
+    duration_ms: durationMs,
+    timestamp: new Date(startTime).toISOString(),
+    output_hash: `sha256:${outputHash}`,
+  };
+
+  if (isSuccess) {
+    envelope.results = { raw_output: responseBody };
+  } else {
+    envelope.error = `HTTP ${response.status}: ${responseBody.slice(0, 500)}`;
+    envelope.results = { raw_output: responseBody };
+  }
+
+  return envelope;
+}
+
+/**
+ * Proxy a tool invocation to an MCP server when the manifest has an [mcp] section.
+ * Performs field mapping and returns a delegated envelope.
+ *
+ * @param {object} manifest - Parsed manifest with mcp section
+ * @param {object} args - User-supplied arguments (key=value)
+ * @returns {object} Evidence envelope with status "delegated"
+ */
+export function executeMcp(manifest, args) {
+  const mcpDef = manifest.mcp;
+  if (!mcpDef || !mcpDef.server || !mcpDef.tool) {
+    throw new Error("Manifest missing [mcp] section or mcp.server/mcp.tool");
+  }
+
+  const resolvedArgs = resolveArgs(manifest, args);
+
+  // Apply field_map: translate our arg names to the MCP tool's expected names
+  const mappedArgs = {};
+  if (mcpDef.field_map) {
+    for (const [ourName, theirName] of Object.entries(mcpDef.field_map)) {
+      if (resolvedArgs[ourName] !== undefined) {
+        mappedArgs[theirName] = resolvedArgs[ourName];
+      }
+    }
+  } else {
+    // No field_map: pass args through as-is
+    Object.assign(mappedArgs, resolvedArgs);
+  }
+
+  const startTime = Date.now();
+  const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
+
+  return {
+    status: "delegated",
+    scan_id: scanId,
+    tool: manifest.tool.name,
+    mcp_server: mcpDef.server,
+    mcp_tool: mcpDef.tool,
+    mapped_args: mappedArgs,
+    timestamp: new Date(startTime).toISOString(),
+  };
 }
 
 /**

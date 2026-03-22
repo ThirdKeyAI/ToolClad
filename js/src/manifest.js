@@ -13,21 +13,28 @@ export function loadManifest(path) {
   if (!manifest.tool || !manifest.tool.name) {
     throw new Error(`Invalid manifest: missing [tool] section or tool.name`);
   }
-  if (!manifest.tool.binary && !(manifest.command && manifest.command.executor)) {
-    throw new Error(
-      `Invalid manifest: must specify tool.binary or command.executor`
-    );
-  }
-  if (!manifest.command) {
-    throw new Error(`Invalid manifest: missing [command] section`);
-  }
-  if (!manifest.command.template && !manifest.command.executor) {
-    throw new Error(
-      `Invalid manifest: [command] must have template or executor`
-    );
-  }
-  if (!manifest.output) {
-    throw new Error(`Invalid manifest: missing [output] section`);
+
+  // v0.5.0: http and mcp modes do not require binary or command sections
+  const hasHttp = !!manifest.http;
+  const hasMcp = !!manifest.mcp;
+
+  if (!hasHttp && !hasMcp) {
+    if (!manifest.tool.binary && !(manifest.command && manifest.command.executor)) {
+      throw new Error(
+        `Invalid manifest: must specify tool.binary, command.executor, [http], or [mcp]`
+      );
+    }
+    if (!manifest.command) {
+      throw new Error(`Invalid manifest: missing [command] section`);
+    }
+    if (!manifest.command.template && !manifest.command.executor) {
+      throw new Error(
+        `Invalid manifest: [command] must have template or executor`
+      );
+    }
+    if (!manifest.output) {
+      throw new Error(`Invalid manifest: missing [output] section`);
+    }
   }
 
   return manifest;
