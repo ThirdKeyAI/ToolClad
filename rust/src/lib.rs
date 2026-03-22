@@ -114,14 +114,17 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 
 /// Validate internal consistency of a parsed manifest.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
-    // Must have either a template, an executor, an HTTP backend, or an MCP proxy.
+    // Must have either a template, an executor, an HTTP backend, an MCP proxy,
+    // a session mode, or a browser mode.
     if manifest.command.template.is_none()
         && manifest.command.executor.is_none()
         && manifest.http.is_none()
         && manifest.mcp.is_none()
+        && manifest.session.is_none()
+        && manifest.browser.is_none()
     {
         return Err(ToolCladError::ManifestError(
-            "[command] must have either 'template' or 'executor', or an [http] or [mcp] backend"
+            "[command] must have either 'template' or 'executor', or an [http], [mcp], [session], or [browser] backend"
                 .to_string(),
         ));
     }
@@ -558,6 +561,180 @@ type = "object"
         assert_eq!(mcp.server, "search-server");
         assert_eq!(mcp.tool, "search");
         assert!(mcp.field_map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_session_manifest() {
+        let toml_str = r#"
+[tool]
+name = "psql_session"
+version = "1.0.0"
+binary = "psql"
+description = "Interactive PostgreSQL session"
+timeout_seconds = 300
+risk_tier = "medium"
+
+[command]
+
+[session]
+startup_command = "psql -h localhost -U analyst analytics_db"
+ready_pattern = "analytics_db=>"
+startup_timeout_seconds = 15
+idle_timeout_seconds = 600
+session_timeout_seconds = 3600
+max_interactions = 200
+
+[session.interaction]
+input_sanitize = ["injection"]
+output_max_bytes = 2097152
+output_wait_ms = 3000
+
+[session.commands.select]
+pattern = "^SELECT\\b"
+description = "Run a SELECT query"
+risk_tier = "low"
+
+[session.commands.select.args.query]
+position = 1
+required = true
+type = "string"
+description = "SQL SELECT query"
+
+[output]
+format = "text"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert_eq!(m.tool.name, "psql_session");
+        assert!(m.session.is_some());
+        let session = m.session.as_ref().unwrap();
+        assert_eq!(session.startup_command, "psql -h localhost -U analyst analytics_db");
+        assert_eq!(session.ready_pattern, "analytics_db=>");
+        assert_eq!(session.startup_timeout_seconds, 15);
+        assert_eq!(session.idle_timeout_seconds, 600);
+        assert_eq!(session.session_timeout_seconds, 3600);
+        assert_eq!(session.max_interactions, 200);
+        let interaction = session.interaction.as_ref().unwrap();
+        assert_eq!(interaction.input_sanitize, vec!["injection"]);
+        assert_eq!(interaction.output_max_bytes, 2_097_152);
+        assert_eq!(interaction.output_wait_ms, 3000);
+        assert!(session.commands.contains_key("select"));
+        let select_cmd = &session.commands["select"];
+        assert_eq!(select_cmd.risk_tier, "low");
+        assert!(select_cmd.args.contains_key("query"));
+    }
+
+    #[test]
+    fn test_parse_browser_manifest() {
+        let toml_str = r#"
+[tool]
+name = "web_scraper"
+version = "1.0.0"
+binary = "chrome"
+description = "Browser-based web scraper"
+timeout_seconds = 120
+risk_tier = "medium"
+
+[command]
+
+[browser]
+engine = "cdp"
+headless = true
+connect = "live"
+extract_mode = "html"
+startup_timeout_seconds = 20
+session_timeout_seconds = 900
+idle_timeout_seconds = 120
+max_interactions = 50
+
+[browser.scope]
+allowed_domains = ["example.com", "docs.example.com"]
+blocked_domains = ["evil.com"]
+allow_external = false
+
+[browser.commands.navigate]
+description = "Navigate to a URL"
+risk_tier = "low"
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+description = "URL to navigate to"
+
+[browser.commands.click]
+description = "Click an element"
+risk_tier = "medium"
+human_approval = true
+
+[browser.state]
+fields = ["current_url", "page_title"]
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert_eq!(m.tool.name, "web_scraper");
+        assert!(m.browser.is_some());
+        let browser = m.browser.as_ref().unwrap();
+        assert_eq!(browser.engine, "cdp");
+        assert!(browser.headless);
+        assert_eq!(browser.connect, "live");
+        assert_eq!(browser.extract_mode, "html");
+        assert_eq!(browser.startup_timeout_seconds, 20);
+        assert_eq!(browser.session_timeout_seconds, 900);
+        assert_eq!(browser.idle_timeout_seconds, 120);
+        assert_eq!(browser.max_interactions, 50);
+        let scope = browser.scope.as_ref().unwrap();
+        assert_eq!(scope.allowed_domains, vec!["example.com", "docs.example.com"]);
+        assert_eq!(scope.blocked_domains, vec!["evil.com"]);
+        assert!(!scope.allow_external);
+        assert!(browser.commands.contains_key("navigate"));
+        assert!(browser.commands.contains_key("click"));
+        assert!(browser.commands["click"].human_approval);
+        let state = browser.state.as_ref().unwrap();
+        assert_eq!(state.fields, vec!["current_url", "page_title"]);
+    }
+
+    #[test]
+    fn test_browser_defaults() {
+        let toml_str = r#"
+[tool]
+name = "browser_defaults"
+version = "1.0.0"
+binary = "chrome"
+description = "Browser with defaults"
+timeout_seconds = 60
+risk_tier = "low"
+
+[command]
+
+[browser]
+
+[output]
+format = "json"
+envelope = true
+
+[output.schema]
+type = "object"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        let browser = m.browser.as_ref().unwrap();
+        assert_eq!(browser.engine, "cdp");
+        assert!(browser.headless);
+        assert_eq!(browser.connect, "launch");
+        assert_eq!(browser.extract_mode, "accessibility_tree");
+        assert_eq!(browser.startup_timeout_seconds, 60);
+        assert_eq!(browser.session_timeout_seconds, 1800);
+        assert_eq!(browser.idle_timeout_seconds, 300);
+        assert_eq!(browser.max_interactions, 100);
     }
 
     #[test]

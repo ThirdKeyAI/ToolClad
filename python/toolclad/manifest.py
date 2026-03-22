@@ -117,6 +117,84 @@ class McpProxyDef:
 
 
 @dataclass
+class SessionInteractionDef:
+    """Interaction constraints for session mode."""
+
+    input_sanitize: List[str] = field(default_factory=list)
+    output_max_bytes: int = 1_048_576
+    output_wait_ms: int = 2000
+
+
+@dataclass
+class SessionCommandDef:
+    """A command definition within a session."""
+
+    pattern: str = ""
+    description: str = ""
+    risk_tier: str = "low"
+    human_approval: bool = False
+    extract_target: bool = False
+    args: Dict[str, ArgDef] = field(default_factory=dict)
+
+
+@dataclass
+class SessionDef:
+    """Session mode definition from [session] section."""
+
+    startup_command: str = ""
+    ready_pattern: str = ""
+    startup_timeout_seconds: int = 30
+    idle_timeout_seconds: int = 300
+    session_timeout_seconds: int = 1800
+    max_interactions: int = 100
+    interaction: Optional[SessionInteractionDef] = None
+    commands: Dict[str, SessionCommandDef] = field(default_factory=dict)
+
+
+@dataclass
+class BrowserScopeDef:
+    """Domain scoping for browser mode."""
+
+    allowed_domains: List[str] = field(default_factory=list)
+    blocked_domains: List[str] = field(default_factory=list)
+    allow_external: bool = False
+
+
+@dataclass
+class BrowserCommandDef:
+    """A command definition within a browser session."""
+
+    description: str = ""
+    risk_tier: str = "low"
+    human_approval: bool = False
+    args: Dict[str, ArgDef] = field(default_factory=dict)
+
+
+@dataclass
+class BrowserStateDef:
+    """State tracking fields for browser mode."""
+
+    fields: List[str] = field(default_factory=list)
+
+
+@dataclass
+class BrowserDef:
+    """Browser mode definition from [browser] section."""
+
+    engine: str = "cdp"
+    headless: bool = True
+    connect: str = "launch"
+    extract_mode: str = "accessibility_tree"
+    startup_timeout_seconds: int = 10
+    session_timeout_seconds: int = 600
+    idle_timeout_seconds: int = 120
+    max_interactions: int = 200
+    scope: Optional[BrowserScopeDef] = None
+    commands: Dict[str, BrowserCommandDef] = field(default_factory=dict)
+    state: Optional[BrowserStateDef] = None
+
+
+@dataclass
 class Manifest:
     """Complete parsed .clad.toml manifest."""
 
@@ -126,6 +204,8 @@ class Manifest:
     output: OutputDef = field(default_factory=OutputDef)
     http: Optional[HttpDef] = None
     mcp: Optional[McpProxyDef] = None
+    session: Optional[SessionDef] = None
+    browser: Optional[BrowserDef] = None
     source_path: str = ""
 
     @property
@@ -235,6 +315,96 @@ def _parse_mcp(data: Dict[str, Any]) -> McpProxyDef:
     )
 
 
+def _parse_session_interaction(data: Dict[str, Any]) -> SessionInteractionDef:
+    return SessionInteractionDef(
+        input_sanitize=data.get("input_sanitize", []),
+        output_max_bytes=data.get("output_max_bytes", 1_048_576),
+        output_wait_ms=data.get("output_wait_ms", 2000),
+    )
+
+
+def _parse_session_command(data: Dict[str, Any]) -> SessionCommandDef:
+    args: Dict[str, ArgDef] = {}
+    for arg_name, arg_data in data.get("args", {}).items():
+        args[arg_name] = _parse_arg(arg_name, arg_data)
+    return SessionCommandDef(
+        pattern=data.get("pattern", ""),
+        description=data.get("description", ""),
+        risk_tier=data.get("risk_tier", "low"),
+        human_approval=data.get("human_approval", False),
+        extract_target=data.get("extract_target", False),
+        args=args,
+    )
+
+
+def _parse_session(data: Dict[str, Any]) -> SessionDef:
+    session = SessionDef(
+        startup_command=data.get("startup_command", ""),
+        ready_pattern=data.get("ready_pattern", ""),
+        startup_timeout_seconds=data.get("startup_timeout_seconds", 30),
+        idle_timeout_seconds=data.get("idle_timeout_seconds", 300),
+        session_timeout_seconds=data.get("session_timeout_seconds", 1800),
+        max_interactions=data.get("max_interactions", 100),
+    )
+    if "interaction" in data:
+        session.interaction = _parse_session_interaction(data["interaction"])
+    commands: Dict[str, SessionCommandDef] = {}
+    if "commands" in data:
+        for cmd_name, cmd_data in data["commands"].items():
+            commands[cmd_name] = _parse_session_command(cmd_data)
+    session.commands = commands
+    return session
+
+
+def _parse_browser_scope(data: Dict[str, Any]) -> BrowserScopeDef:
+    return BrowserScopeDef(
+        allowed_domains=data.get("allowed_domains", []),
+        blocked_domains=data.get("blocked_domains", []),
+        allow_external=data.get("allow_external", False),
+    )
+
+
+def _parse_browser_command(data: Dict[str, Any]) -> BrowserCommandDef:
+    args: Dict[str, ArgDef] = {}
+    for arg_name, arg_data in data.get("args", {}).items():
+        args[arg_name] = _parse_arg(arg_name, arg_data)
+    return BrowserCommandDef(
+        description=data.get("description", ""),
+        risk_tier=data.get("risk_tier", "low"),
+        human_approval=data.get("human_approval", False),
+        args=args,
+    )
+
+
+def _parse_browser_state(data: Dict[str, Any]) -> BrowserStateDef:
+    return BrowserStateDef(
+        fields=data.get("fields", []),
+    )
+
+
+def _parse_browser(data: Dict[str, Any]) -> BrowserDef:
+    browser = BrowserDef(
+        engine=data.get("engine", "cdp"),
+        headless=data.get("headless", True),
+        connect=data.get("connect", "launch"),
+        extract_mode=data.get("extract_mode", "accessibility_tree"),
+        startup_timeout_seconds=data.get("startup_timeout_seconds", 10),
+        session_timeout_seconds=data.get("session_timeout_seconds", 600),
+        idle_timeout_seconds=data.get("idle_timeout_seconds", 120),
+        max_interactions=data.get("max_interactions", 200),
+    )
+    if "scope" in data:
+        browser.scope = _parse_browser_scope(data["scope"])
+    commands: Dict[str, BrowserCommandDef] = {}
+    if "commands" in data:
+        for cmd_name, cmd_data in data["commands"].items():
+            commands[cmd_name] = _parse_browser_command(cmd_data)
+    browser.commands = commands
+    if "state" in data:
+        browser.state = _parse_browser_state(data["state"])
+    return browser
+
+
 def load_manifest(path: str) -> Manifest:
     """Parse a .clad.toml file and return a Manifest.
 
@@ -278,5 +448,11 @@ def load_manifest(path: str) -> Manifest:
 
     if "mcp" in data:
         manifest.mcp = _parse_mcp(data["mcp"])
+
+    if "session" in data:
+        manifest.session = _parse_session(data["session"])
+
+    if "browser" in data:
+        manifest.browser = _parse_browser(data["browser"])
 
     return manifest

@@ -101,6 +101,70 @@ type McpProxyDef struct {
 	FieldMap map[string]string `toml:"field_map"`
 }
 
+// SessionDef holds the [session] section for interactive session mode.
+type SessionDef struct {
+	StartupCommand     string                       `toml:"startup_command"`
+	ReadyPattern       string                       `toml:"ready_pattern"`
+	StartupTimeoutSecs int                          `toml:"startup_timeout_seconds"`
+	IdleTimeoutSecs    int                          `toml:"idle_timeout_seconds"`
+	SessionTimeoutSecs int                          `toml:"session_timeout_seconds"`
+	MaxInteractions    int                          `toml:"max_interactions"`
+	Interaction        *SessionInteractionDef       `toml:"interaction"`
+	Commands           map[string]SessionCommandDef `toml:"commands"`
+}
+
+// SessionInteractionDef holds session interaction constraints.
+type SessionInteractionDef struct {
+	InputSanitize  []string `toml:"input_sanitize"`
+	OutputMaxBytes int64    `toml:"output_max_bytes"`
+	OutputWaitMs   int64    `toml:"output_wait_ms"`
+}
+
+// SessionCommandDef defines a command within a session.
+type SessionCommandDef struct {
+	Pattern       string             `toml:"pattern"`
+	Description   string             `toml:"description"`
+	RiskTier      string             `toml:"risk_tier"`
+	HumanApproval bool               `toml:"human_approval"`
+	ExtractTarget bool               `toml:"extract_target"`
+	Args          map[string]*ArgDef `toml:"args"`
+}
+
+// BrowserDef holds the [browser] section for browser automation mode.
+type BrowserDef struct {
+	Engine             string                       `toml:"engine"`
+	Headless           bool                         `toml:"headless"`
+	Connect            string                       `toml:"connect"`
+	ExtractMode        string                       `toml:"extract_mode"`
+	StartupTimeoutSecs int                          `toml:"startup_timeout_seconds"`
+	SessionTimeoutSecs int                          `toml:"session_timeout_seconds"`
+	IdleTimeoutSecs    int                          `toml:"idle_timeout_seconds"`
+	MaxInteractions    int                          `toml:"max_interactions"`
+	Scope              *BrowserScopeDef             `toml:"scope"`
+	Commands           map[string]BrowserCommandDef `toml:"commands"`
+	State              *BrowserStateDef             `toml:"state"`
+}
+
+// BrowserScopeDef defines domain scope restrictions for browser mode.
+type BrowserScopeDef struct {
+	AllowedDomains []string `toml:"allowed_domains"`
+	BlockedDomains []string `toml:"blocked_domains"`
+	AllowExternal  bool     `toml:"allow_external"`
+}
+
+// BrowserCommandDef defines a command within browser mode.
+type BrowserCommandDef struct {
+	Description   string             `toml:"description"`
+	RiskTier      string             `toml:"risk_tier"`
+	HumanApproval bool               `toml:"human_approval"`
+	Args          map[string]*ArgDef `toml:"args"`
+}
+
+// BrowserStateDef defines observable state fields for browser mode.
+type BrowserStateDef struct {
+	Fields []string `toml:"fields"`
+}
+
 // Manifest is a fully parsed .clad.toml file.
 type Manifest struct {
 	Tool       ToolMeta           `toml:"tool"`
@@ -109,6 +173,8 @@ type Manifest struct {
 	Output     OutputDef          `toml:"output"`
 	Http       *HttpDef           `toml:"http"`
 	Mcp        *McpProxyDef       `toml:"mcp"`
+	Session    *SessionDef        `toml:"session"`
+	Browser    *BrowserDef        `toml:"browser"`
 	SourcePath string             `toml:"-"`
 }
 

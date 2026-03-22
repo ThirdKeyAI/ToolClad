@@ -1,10 +1,10 @@
 # ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes
 
-**Version**: 0.5.0
-**Status**: Release Candidate
-**Author**: Jascha Wanger / ThirdKey AI
-**Date**: 2026-03-21
-**License**: MIT (protocol specification), Apache 2.0 (Symbiont integration)
+**Version**: 0.5.1  
+**Status**: Release Candidate  
+**Author**: Jascha Wanger / ThirdKey AI  
+**Date**: 2026-03-21  
+**License**: MIT (protocol specification), Apache 2.0 (Symbiont integration)  
 
 ---
 
@@ -782,7 +782,7 @@ Beyond oneshot execution, ToolClad supports stateful sessions where a tool proce
 | `oneshot` | HTTP request (`[http]`) | N/A | Response received | REST/GraphQL APIs (Slack, GitHub, Stripe) |
 | `oneshot` | MCP proxy (`[mcp]`) | N/A | MCP response | Governed proxy over existing MCP tools |
 | `session` | PTY (pseudo-terminal) | Prompt regex parsing | Prompt pattern match | Interactive CLIs (msfconsole, psql, gdb) |
-| `browser` | CDP / Playwright API | URL + DOM inspection | Page load + network idle | Web interaction (testing, scraping, form filling) |
+| `browser` | CDP-direct WebSocket | URL + accessibility tree + DOM | Page load + network idle | Web interaction (headless or live browser) |
 
 All five backends share: typed parameters, argument validation, Cedar policy evaluation, scope enforcement, output schema validation, evidence capture, and audit trail. The manifest format is the same. The executor implementation differs.
 
@@ -1025,7 +1025,16 @@ Session mode applies to any interactive tool where governance matters:
 
 ### Browser Mode
 
-Browser mode manages headless browser sessions through CDP (Chrome DevTools Protocol) or Playwright. The governance model is identical to CLI session mode: typed commands, per-interaction Cedar gating, scope enforcement, state-aware policies, output schema validation, evidence capture. The transport is a browser engine instead of a PTY.
+Browser mode manages browser sessions through direct CDP (Chrome DevTools Protocol) WebSocket connections. The governance model is identical to CLI session mode: typed commands, per-interaction Cedar gating, scope enforcement, state-aware policies, output schema validation, evidence capture. The transport is a browser engine instead of a PTY.
+
+The BrowserExecutor connects directly to Chrome's remote debugging WebSocket with no intermediary framework. On first access to a tab, a lightweight background daemon holds the session open and auto-exits after idle timeout. This approach (inspired by [chrome-cdp](https://github.com/pasky/chrome-cdp-skill)) handles 100+ open tabs reliably where Puppeteer-based tools often time out during target enumeration.
+
+Two connection modes are supported:
+
+- **`connect = "launch"`**: Spawn a new headless browser instance. Used for automated testing, scraping, and sandboxed workflows. The executor owns the browser lifecycle.
+- **`connect = "live"`**: Attach to the user's running Chrome session via its debug port. Used for personal assistants and development workflows. The agent can interact with tabs the user already has open, including logged-in sessions. The executor does not own the browser lifecycle.
+
+Playwright is available as an optional convenience layer (`engine = "playwright"`) for teams that prefer its higher-level API, but CDP-direct is the recommended default for lower overhead and live browser support.
 
 #### Why Browser Agents Need Structural Governance
 
@@ -1044,7 +1053,7 @@ ToolClad browser mode makes navigation, interaction, and execution structurally 
 [tool]
 name = "browser_session"
 mode = "browser"
-description = "Governed headless browser session"
+description = "Governed browser session with CDP-direct connection"
 risk_tier = "medium"
 
 [tool.cedar]
@@ -1060,12 +1069,18 @@ screenshots = true
 # --- Browser Lifecycle ---
 
 [browser]
-engine = "playwright"
-headless = true
+engine = "cdp-direct"                      # direct CDP WebSocket, no Playwright overhead
+connect = "launch"                         # "launch" = spawn headless, "live" = attach to running Chrome
+headless = true                            # ignored when connect = "live"
 startup_timeout_seconds = 10
 session_timeout_seconds = 600
 idle_timeout_seconds = 120
 max_interactions = 200
+
+# Default extraction mode: accessibility tree is compact and semantic,
+# far better for LLM consumption than raw HTML
+[browser.defaults]
+extract_mode = "accessibility_tree"        # "accessibility_tree" | "html" | "text"
 
 # Scope enforcement on navigation
 [browser.scope]
@@ -1075,10 +1090,24 @@ allow_external = false
 
 # --- Browser Commands ---
 
+[browser.commands.list_tabs]
+description = "List open browser tabs with titles and URLs"
+risk_tier = "low"
+
 [browser.commands.navigate]
-description = "Navigate to a URL"
+description = "Navigate a tab to a URL"
 risk_tier = "medium"
 args.url = { type = "url", schemes = ["https"], scope_check = true }
+
+[browser.commands.snapshot]
+description = "Get accessibility tree snapshot of the current page (compact, semantic)"
+risk_tier = "low"
+args.selector = { type = "string", required = false, description = "Optional CSS selector to scope the snapshot" }
+
+[browser.commands.extract_html]
+description = "Get raw HTML scoped to a CSS selector"
+risk_tier = "low"
+args.selector = { type = "string", required = true }
 
 [browser.commands.click]
 description = "Click an element by CSS selector"
@@ -1086,9 +1115,8 @@ risk_tier = "low"
 args.selector = { type = "string", pattern = "^[a-zA-Z0-9_.#\\[\\]=\"' >:()-]+$" }
 
 [browser.commands.type_text]
-description = "Type text into an input field"
+description = "Type text into the focused element (works in cross-origin iframes)"
 risk_tier = "low"
-args.selector = { type = "string" }
 args.text = { type = "string", sanitize = ["injection"] }
 
 [browser.commands.submit_form]
@@ -1097,20 +1125,19 @@ risk_tier = "high"
 human_approval = true
 args.selector = { type = "string" }
 
-[browser.commands.extract]
-description = "Extract text content from elements"
-risk_tier = "low"
-args.selector = { type = "string" }
-
 [browser.commands.screenshot]
-description = "Capture page screenshot"
+description = "Capture page screenshot for evidence"
+risk_tier = "low"
+
+[browser.commands.network_timing]
+description = "Get network resource timing data for the current page"
 risk_tier = "low"
 
 [browser.commands.execute_js]
-description = "Execute JavaScript on the page"
+description = "Evaluate JavaScript in page context"
 risk_tier = "high"
 human_approval = true
-args.script = { type = "string" }
+args.expression = { type = "string" }
 
 [browser.commands.wait_for]
 description = "Wait for an element to appear"
@@ -1125,7 +1152,7 @@ risk_tier = "low"
 # --- State Inference ---
 
 [browser.state]
-fields = ["url", "title", "domain", "has_forms", "is_authenticated", "page_loaded"]
+fields = ["url", "title", "domain", "has_forms", "is_authenticated", "page_loaded", "tab_count"]
 
 # --- Output Schema ---
 
@@ -1146,7 +1173,7 @@ description = "Current page domain (for policy context)"
 
 [output.schema.properties.content]
 type = "string"
-description = "Extracted text or command result"
+description = "Accessibility tree snapshot, extracted HTML, or command result"
 
 [output.schema.properties.screenshot_path]
 type = "string"
@@ -1169,6 +1196,38 @@ type = "boolean"
 type = "integer"
 ```
 
+**Live browser manifest variant** for attaching to a running Chrome session:
+
+```toml
+# tools/chrome_live.clad.toml
+[tool]
+name = "chrome_live"
+mode = "browser"
+description = "Governed access to live Chrome session"
+risk_tier = "medium"
+
+[tool.cedar]
+resource = "Web::BrowserSession"
+action = "browse"
+
+[browser]
+engine = "cdp-direct"
+connect = "live"                           # attach to running Chrome, don't launch
+headless = false                           # this IS the user's live browser
+idle_timeout_seconds = 1200                # 20 min, matches chrome-cdp daemon behavior
+
+[browser.defaults]
+extract_mode = "accessibility_tree"
+
+[browser.scope]
+allowed_domains = ["github.com", "*.internal.corp.com"]
+blocked_domains = ["*.evil.com"]
+allow_external = false
+
+# Same commands as the headless variant, same governance
+# (commands section identical, omitted for brevity)
+```
+
 #### Per-Interaction ORGA Gating (Browser)
 
 The ORGA loop works identically to CLI session mode. The transport differs; the governance is the same:
@@ -1178,7 +1237,7 @@ Iteration 1:
   Observe:  {url: "https://app.example.com/login", title: "Login", has_forms: true}
   Reason:   LLM proposes browser_session.type_text(selector="#email", text="user@co.com")
   Gate:     Cedar: is type_text allowed? ToolClad: selector matches pattern, text is injection-safe
-  Act:      BrowserExecutor sends Playwright command, waits for page stable
+  Act:      BrowserExecutor sends CDP command, waits for page stable
 
 Iteration 2:
   Observe:  {url: "https://app.example.com/login", title: "Login"}
@@ -1195,10 +1254,10 @@ Iteration 3:
 
 #### BrowserExecutor Architecture
 
-The BrowserExecutor wraps Playwright (or CDP directly) and provides the same interface as the SessionExecutor:
+The BrowserExecutor connects directly to Chrome's remote debugging WebSocket. No Puppeteer, no intermediary framework. On first access to a tab, a lightweight daemon is spawned that holds the CDP session open. Chrome's "Allow debugging" modal fires once; subsequent commands reuse the daemon. Daemons auto-exit after idle timeout.
 
 ```
-Agent ORGA Loop              BrowserExecutor               Browser Engine (CDP)
+Agent ORGA Loop              BrowserExecutor               Chrome (CDP WebSocket)
      |                            |                              |
      |  propose command           |                              |
      |--------------------------->|                              |
@@ -1207,13 +1266,13 @@ Agent ORGA Loop              BrowserExecutor               Browser Engine (CDP)
      |                            |  Cedar policy evaluation     |
      |                            |                              |
      |                     [if allowed]                          |
-     |                            |  send CDP/Playwright action  |
+     |                            |  send CDP command via WS     |
      |                            |----------------------------->|
      |                            |                              |
      |                            |  wait: page load + idle      |
      |                            |<-----------------------------|
      |                            |                              |
-     |                            |  capture: URL, title, DOM    |
+     |                            |  capture: URL, title, a11y   |
      |                            |  infer page state            |
      |                            |  screenshot (if configured)  |
      |                            |  validate against schema     |
@@ -1228,12 +1287,14 @@ Agent ORGA Loop              BrowserExecutor               Browser Engine (CDP)
 
 The BrowserExecutor handles:
 
-- **Browser lifecycle**: Launch, page creation, navigation, cleanup
+- **CDP connection management**: Direct WebSocket to Chrome's debug port. Persistent daemon per tab that survives across interactions. No reconnection overhead per command.
+- **Live browser attachment**: When `connect = "live"`, discovers tabs via `http://localhost:9222/json` (Chrome's debug endpoint), attaches to existing tabs without disrupting the user's session.
 - **Ready detection**: Waits for page load event + network idle (configurable) instead of prompt regex matching
+- **Accessibility tree extraction**: Default content extraction uses Chrome's accessibility tree (`Accessibility.getFullAXTree` CDP method), returning a compact semantic representation instead of raw HTML. This is dramatically more token-efficient for LLM consumption.
 - **State inference**: Inspects URL, DOM (form presence, auth indicators like session cookies or user profile elements), and page title to populate `page_state` for Cedar policy context
 - **Screenshot evidence**: Captures page screenshots at each interaction for the audit trail
 - **Scope enforcement**: Intercepts all navigation (including redirects and link clicks) and validates target URLs against `[browser.scope]`
-- **Content extraction**: Returns structured page content (text, form values, table data) instead of raw HTML
+- **Tab management**: `list_tabs` enumerates available targets. When `connect = "live"`, this shows the user's actual open tabs. The agent can switch between tabs, each maintaining its own scope context.
 
 #### Cedar Policy Examples (Browser)
 
@@ -1300,13 +1361,15 @@ The `allow_external = false` setting is the strictest mode: the browser cannot l
 
 #### Browser Mode Applications
 
-| Use Case | Commands Used | Governance Value |
-|---|---|---|
-| Web application testing | navigate, click, type_text, submit_form, extract | Scope-locked to test environment. Form submission gated. |
-| Competitive intelligence | navigate, extract, screenshot | Read-only. No form submission, no JS execution. |
-| Form filling / workflow automation | navigate, type_text, submit_form, extract | Human approval on submission. Scope-locked to target app. |
-| Web scraping | navigate, extract, click | Read-only. Rate-limited. Domain-locked. |
-| Authenticated workflows | navigate, type_text, submit_form, extract | Credential input gated. Post-auth actions require approval. |
+| Use Case | Connect Mode | Commands Used | Governance Value |
+|---|---|---|---|
+| Web application testing | `launch` | navigate, click, type_text, submit_form, snapshot | Scope-locked to test environment. Form submission gated. |
+| Competitive intelligence | `launch` | navigate, snapshot, screenshot | Read-only. No form submission, no JS execution. |
+| Form filling / workflow automation | `launch` | navigate, type_text, submit_form, snapshot | Human approval on submission. Scope-locked to target app. |
+| Web scraping | `launch` | navigate, snapshot, click | Read-only. Rate-limited. Domain-locked. |
+| Developer assistant (live browser) | `live` | list_tabs, snapshot, extract_html, screenshot | Read-only access to user's logged-in sessions. No mutation. |
+| Internal tool automation | `live` | navigate, click, type_text, submit_form, snapshot | Agent operates in user's authenticated context. Scope-locked to internal domains. |
+| Debugging / monitoring | `live` | snapshot, network_timing, screenshot | Read-only inspection of live page state and performance. |
 
 ---
 
@@ -1446,7 +1509,11 @@ when {
 
 **TUI tools** (`htop`, `lazygit`, `vim`): Full-screen terminal UIs require cursor positioning, screen buffer tracking, and visual layout interpretation. This is a fundamentally different problem from behavioral contracts. ToolClad is the wrong abstraction for TUI tools. The agentic equivalent of a TUI tool is a set of oneshot manifests that expose the same underlying data programmatically: `ps aux` instead of `htop`, `git` subcommand manifests instead of `lazygit`, file-manipulation tools instead of `vim`. If an agent needs the information a TUI tool displays, wrap the underlying data source in a oneshot or session manifest.
 
-**Non-headless browsers**: Browser mode targets headless execution via CDP/Playwright. GUI browser automation with visual interaction (mouse coordinates, visual element recognition, screen coordinate clicking) is a computer-use problem, not a behavioral contract problem.
+**Coordinate-based browser interaction** (`clickxy`, pixel-coordinate clicking, visual element targeting): ToolClad browser commands operate on CSS selectors, which are semantic and validatable. Coordinate-based clicking depends on viewport size, zoom level, and visual layout, making it non-deterministic and ungovernable through typed contracts. This is computer-use / visual automation territory (e.g., Anthropic's computer use API), not a behavioral contract problem.
+
+**Raw CDP passthrough** (`evalraw`, arbitrary CDP method invocation): Exposing raw Chrome DevTools Protocol methods to the agent bypasses all ToolClad validation. Any CDP method can modify browser state, exfiltrate data, or interact with the OS. ToolClad browser commands are the governed surface; raw CDP is the implementation detail that the BrowserExecutor uses internally but never exposes to the agent.
+
+**Non-headless GUI automation**: Browser mode supports both headless (`connect = "launch"`) and live browser attachment (`connect = "live"`), but interaction is always through CSS selectors and typed commands via CDP. GUI-level automation (mouse movement, screen capture-based element detection, window management) is out of scope.
 
 ---
 
@@ -1706,7 +1773,7 @@ Of the 19 existing wrapper scripts:
 - The HTTP executor (reqwest-based, with secrets injection from Vault/OpenBao)
 - The MCP proxy executor (forwards to MCP servers with field mapping and stricter validation)
 - The SessionExecutor (PTY management, prompt detection, state inference, child session registration)
-- The BrowserExecutor (CDP/Playwright management, page state inference, redirect interception, auth flow execution)
+- The BrowserExecutor (CDP-direct WebSocket, persistent daemon per tab, live browser attachment, accessibility tree extraction, page state inference, redirect interception, auth flow execution)
 - Cedar policy integration and automatic policy generation
 - ORGA Gate integration (two-layer validation for oneshot, per-interaction gating for sessions and browser)
 - Session/page state and event types as Cedar policy context
@@ -1913,6 +1980,16 @@ The 80/20 split from symbi-redteam confirms this: ~14 of 19 tools are pure templ
 ---
 
 ## Changelog
+
+### v0.5.1 (2026-03-21)
+
+- Adopted CDP-direct as primary browser backend (direct WebSocket to Chrome debug port, persistent daemon per tab, no Puppeteer/Playwright overhead). Playwright remains as optional convenience layer.
+- Added two browser connection modes: `connect = "launch"` (spawn headless) and `connect = "live"` (attach to user's running Chrome session with logged-in tabs). Inspired by [chrome-cdp](https://github.com/pasky/chrome-cdp-skill) architecture.
+- Changed default content extraction to accessibility tree (`extract_mode = "accessibility_tree"`). Compact semantic representation is dramatically more token-efficient for LLM consumption than raw HTML.
+- Added `snapshot` command (accessibility tree with optional CSS selector scoping), `list_tabs` command (tab discovery for live mode), `extract_html` command (scoped raw HTML when needed), and `network_timing` command (resource timing data).
+- Added live browser manifest variant (`chrome_live.clad.toml`) showing live attachment configuration.
+- Updated browser applications table with live browser use cases (developer assistant, internal tool automation, debugging/monitoring).
+- Explicitly excluded coordinate-based clicking (`clickxy`), raw CDP passthrough (`evalraw`), and GUI-level automation in "Out of Scope by Design" with rationale.
 
 ### v0.5.0 (2026-03-21)
 

@@ -15,13 +15,16 @@ export function loadManifest(path) {
   }
 
   // v0.5.0: http and mcp modes do not require binary or command sections
+  // v0.5.1: session and browser modes also exempt from binary/command
   const hasHttp = !!manifest.http;
   const hasMcp = !!manifest.mcp;
+  const hasSession = !!manifest.session;
+  const hasBrowser = !!manifest.browser;
 
-  if (!hasHttp && !hasMcp) {
+  if (!hasHttp && !hasMcp && !hasSession && !hasBrowser) {
     if (!manifest.tool.binary && !(manifest.command && manifest.command.executor)) {
       throw new Error(
-        `Invalid manifest: must specify tool.binary, command.executor, [http], or [mcp]`
+        `Invalid manifest: must specify tool.binary, command.executor, [http], [mcp], [session], or [browser]`
       );
     }
     if (!manifest.command) {

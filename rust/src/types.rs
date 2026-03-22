@@ -11,6 +11,8 @@ pub struct Manifest {
     pub output: OutputDef,
     pub http: Option<HttpDef>,
     pub mcp: Option<McpProxyDef>,
+    pub session: Option<SessionDef>,
+    pub browser: Option<BrowserDef>,
 }
 
 /// Tool metadata section `[tool]`.
@@ -150,6 +152,134 @@ pub struct McpProxyDef {
     pub tool: String,
     #[serde(default)]
     pub field_map: HashMap<String, String>,
+}
+
+/// Session mode configuration `[session]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SessionDef {
+    pub startup_command: String,
+    pub ready_pattern: String,
+    #[serde(default = "default_timeout")]
+    pub startup_timeout_seconds: u64,
+    #[serde(default = "default_300")]
+    pub idle_timeout_seconds: u64,
+    #[serde(default = "default_1800")]
+    pub session_timeout_seconds: u64,
+    #[serde(default = "default_100")]
+    pub max_interactions: u32,
+    pub interaction: Option<SessionInteractionDef>,
+    #[serde(default)]
+    pub commands: HashMap<String, SessionCommandDef>,
+}
+
+fn default_300() -> u64 {
+    300
+}
+
+fn default_1800() -> u64 {
+    1800
+}
+
+fn default_100() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SessionInteractionDef {
+    #[serde(default)]
+    pub input_sanitize: Vec<String>,
+    #[serde(default = "default_1mb")]
+    pub output_max_bytes: u64,
+    #[serde(default = "default_2000")]
+    pub output_wait_ms: u64,
+}
+
+fn default_1mb() -> u64 {
+    1_048_576
+}
+
+fn default_2000() -> u64 {
+    2000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SessionCommandDef {
+    pub pattern: String,
+    pub description: String,
+    #[serde(default = "default_risk_tier")]
+    pub risk_tier: String,
+    #[serde(default)]
+    pub human_approval: bool,
+    #[serde(default)]
+    pub extract_target: bool,
+    #[serde(default)]
+    pub args: HashMap<String, ArgDef>,
+}
+
+/// Browser mode configuration `[browser]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrowserDef {
+    #[serde(default = "default_cdp")]
+    pub engine: String,
+    #[serde(default = "default_true")]
+    pub headless: bool,
+    /// "launch" (spawn headless) or "live" (attach to running Chrome)
+    #[serde(default = "default_launch")]
+    pub connect: String,
+    /// "accessibility_tree" | "html" | "text"
+    #[serde(default = "default_a11y")]
+    pub extract_mode: String,
+    #[serde(default = "default_timeout")]
+    pub startup_timeout_seconds: u64,
+    #[serde(default = "default_1800")]
+    pub session_timeout_seconds: u64,
+    #[serde(default = "default_300")]
+    pub idle_timeout_seconds: u64,
+    #[serde(default = "default_100")]
+    pub max_interactions: u32,
+    pub scope: Option<BrowserScopeDef>,
+    #[serde(default)]
+    pub commands: HashMap<String, BrowserCommandDef>,
+    pub state: Option<BrowserStateDef>,
+}
+
+fn default_cdp() -> String {
+    "cdp".to_string()
+}
+
+fn default_launch() -> String {
+    "launch".to_string()
+}
+
+fn default_a11y() -> String {
+    "accessibility_tree".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrowserScopeDef {
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    #[serde(default)]
+    pub allow_external: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrowserCommandDef {
+    pub description: String,
+    #[serde(default = "default_risk_tier")]
+    pub risk_tier: String,
+    #[serde(default)]
+    pub human_approval: bool,
+    #[serde(default)]
+    pub args: HashMap<String, ArgDef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrowserStateDef {
+    #[serde(default)]
+    pub fields: Vec<String>,
 }
 
 /// Evidence envelope wrapping tool execution results.

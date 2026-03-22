@@ -622,6 +622,8 @@ mod tests {
             },
             http: None,
             mcp: None,
+            session: None,
+            browser: None,
         }
     }
 
