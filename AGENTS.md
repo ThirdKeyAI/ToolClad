@@ -9,7 +9,7 @@
 |-------|-------|
 | Name | ToolClad |
 | Description | Declarative CLI tool interface contracts for agentic runtimes |
-| Version | 0.4.0 |
+| Version | 0.5.0 |
 | License | MIT (spec), Apache 2.0 (Symbiont integration) |
 | Repository | https://github.com/ThirdKeyAI/ToolClad |
 
@@ -17,12 +17,16 @@
 
 ToolClad provides:
 
-- **Manifest parsing** — Load and validate `.clad.toml` tool interface contracts
-- **Argument validation** — 10 typed validators with shell injection sanitization
-- **Command construction** — Template interpolation with mappings and conditionals
-- **Tool execution** — Run CLI tools with timeout, capture output, SHA-256 evidence hashing
-- **MCP schema generation** — Auto-generate JSON Schema for LLM tool use (inputSchema + outputSchema)
-- **Evidence envelopes** — Structured JSON output with scan_id, timestamps, and integrity hashes
+- **Manifest parsing** — Load and validate `.clad.toml` tool interface contracts (oneshot, session, browser modes)
+- **Argument validation** — 14 typed validators (10 core + 4 extended) with shell injection sanitization
+- **Five execution backends** — Shell command, HTTP API, MCP proxy, PTY session, CDP/Playwright browser
+- **HTTP backend** — REST/GraphQL API tools with `{_secret:name}` template variable injection
+- **MCP proxy backend** — Governed passthrough to upstream MCP servers with field mapping
+- **Command construction** — Template interpolation with mappings, conditionals, and defaults
+- **Tool execution** — Direct argv dispatch, process group kill on timeout, SHA-256 evidence hashing
+- **Output parsers** — builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
+- **MCP schema generation** — Auto-generate inputSchema + outputSchema for LLM tool use
+- **Evidence envelopes** — Structured JSON with scan_id, timestamps, exit_code, stderr, output_hash
 
 ## Available Tools
 
