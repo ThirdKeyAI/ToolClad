@@ -1,9 +1,9 @@
 # ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes
 
-**Version**: 0.4.0
+**Version**: 0.5.0
 **Status**: Release Candidate
 **Author**: Jascha Wanger / ThirdKey AI
-**Date**: 2026-03-20
+**Date**: 2026-03-21
 **License**: MIT (protocol specification), Apache 2.0 (Symbiont integration)
 
 ---
@@ -25,14 +25,14 @@ ToolClad is a declarative manifest format (`.clad.toml`) that defines the comple
 A ToolClad manifest answers four questions:
 
 1. **What can this tool accept?** Typed parameters with validation constraints (enums, ranges, regex, scope checks, injection sanitization).
-2. **How do you invoke it?** A command template that interpolates validated parameters. The LLM never generates a command string.
+2. **How do you invoke it?** A command template, HTTP request, MCP server call, PTY session, or browser engine action. The LLM never generates raw invocation details.
 3. **What does it produce?** Output format declaration, parsing rules, and a mandatory output schema that normalize raw tool output into structured JSON. The LLM knows the shape of results before proposing a call.
-4. **What is the interaction model?** Three execution modes share a common governance layer:
-   - **Oneshot** (default): Execute a single command, return results.
+4. **What is the interaction model?** Three execution modes with five backends share a common governance layer:
+   - **Oneshot** (default): Execute and return. Three backends: shell command (`[command]`), HTTP request (`[http]`), or MCP server proxy (`[mcp]`).
    - **Session**: Maintain a running CLI process (PTY) where each interaction is independently validated and policy-gated.
    - **Browser**: Maintain a governed headless browser session where navigation, clicks, form submission, and JS execution are typed, scoped, and policy-gated.
 
-A universal executor reads the manifest, validates arguments against declared types, dispatches to the appropriate backend (shell command, PTY session, or browser engine), executes with timeout and resource controls, parses output, and wraps everything in a standard evidence envelope.
+A universal executor reads the manifest, validates arguments against declared types, dispatches to the appropriate backend, executes with timeout and resource controls, parses output, and wraps everything in a standard evidence envelope.
 
 ---
 
@@ -480,6 +480,201 @@ The escape hatch is for command construction only. All other ToolClad guarantees
 
 ---
 
+## HTTP Backend
+
+HTTP API tools are structurally identical to oneshot CLI tools: validate inputs, construct the request, execute, parse the response. The manifest uses an `[http]` section instead of `[command]`. No new execution mode; this is a backend for oneshot.
+
+### HTTP Manifest Example
+
+```toml
+# tools/slack_post_message.clad.toml
+[tool]
+name = "slack_post_message"
+version = "1.0.0"
+description = "Post a message to a Slack channel"
+timeout_seconds = 30
+risk_tier = "medium"
+
+[tool.cedar]
+resource = "Comms::SlackChannel"
+action = "post_message"
+
+[http]
+method = "POST"
+url = "https://slack.com/api/chat.postMessage"
+headers = { "Authorization" = "Bearer {_secret:slack_token}", "Content-Type" = "application/json" }
+body_template = '{"channel": "{channel}", "text": "{message}"}'
+success_status = [200]
+error_status = [400, 401, 403, 404, 429]
+
+[args.channel]
+type = "string"
+required = true
+pattern = "^[A-Z0-9]+$"
+description = "Slack channel ID"
+
+[args.message]
+type = "string"
+required = true
+sanitize = ["injection"]
+description = "Message text to post"
+
+[output]
+format = "json"
+parser = "builtin:json"
+envelope = true
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.ok]
+type = "boolean"
+description = "Whether the API call succeeded"
+
+[output.schema.properties.ts]
+type = "string"
+description = "Message timestamp (Slack message ID)"
+```
+
+### Secrets in HTTP Requests
+
+The `{_secret:name}` syntax references secrets from Symbiont's Vault/OpenBao integration. Secrets are resolved by the executor at invocation time and never appear in the manifest, the MCP schema, or the LLM context. The agent proposes `slack_post_message(channel="C01234", message="hello")` and the executor injects the bearer token from Vault.
+
+This applies to headers, URL parameters, and body template values:
+
+```toml
+[http]
+url = "https://api.example.com/v1/{endpoint}?key={_secret:api_key}"
+headers = { "Authorization" = "Bearer {_secret:bearer_token}" }
+```
+
+### HTTP Request Construction
+
+The executor constructs the HTTP request from the `[http]` section:
+
+1. Interpolate `{arg_name}` placeholders in `url`, `headers`, and `body_template` with validated parameter values
+2. Resolve `{_secret:name}` references from secrets management
+3. Set method, headers, and body
+4. Execute with timeout
+5. Check response status against `success_status` / `error_status`
+6. Parse response body with the declared parser
+7. Validate against `[output.schema]`
+8. Wrap in evidence envelope
+
+All ToolClad guarantees apply: argument validation, Cedar policy evaluation, output schema validation, evidence capture with hash, and audit trail. The HTTP backend simply swaps shell execution for an HTTP client.
+
+---
+
+## MCP Proxy Backend
+
+The MCP proxy backend wraps an existing MCP server tool in a ToolClad manifest that applies stricter validation and Cedar policy gating. The manifest uses an `[mcp]` section instead of `[command]`. The upstream MCP tool is an implementation detail; the agent sees the ToolClad contract.
+
+### Why Proxy MCP Tools?
+
+MCP tools from marketplaces and third-party servers have permissive JSON Schemas. A GitHub MCP tool might accept any string for a repository name. A database MCP tool might accept any SQL query. The ToolClad manifest constrains these inputs with the full type system (regex patterns, enums, scope checks) and subjects every invocation to Cedar policy evaluation.
+
+This directly addresses the ClawHub-style supply chain problem: instead of trusting a marketplace MCP tool's self-declared schema, you wrap it in a `.clad.toml` that defines the contract *you* trust. SchemaPin verifies the manifest. Cedar governs the invocation. The upstream MCP tool just executes.
+
+### MCP Proxy Manifest Example
+
+```toml
+# tools/github_create_issue.clad.toml
+[tool]
+name = "github_create_issue"
+version = "1.0.0"
+description = "Create a GitHub issue in an allowed repository"
+timeout_seconds = 30
+risk_tier = "medium"
+
+[tool.cedar]
+resource = "Dev::GitHubRepo"
+action = "create_issue"
+
+[mcp]
+server = "github-mcp"
+tool = "create_issue"
+
+[args.repo]
+type = "string"
+required = true
+pattern = "^[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+$"
+description = "Repository in owner/repo format"
+
+[args.title]
+type = "string"
+required = true
+sanitize = ["injection"]
+description = "Issue title"
+
+[args.body]
+type = "string"
+required = false
+description = "Issue body (markdown)"
+
+[args.labels]
+type = "string"
+required = false
+pattern = "^[a-zA-Z0-9_, -]+$"
+description = "Comma-separated label names"
+
+[output]
+format = "json"
+parser = "builtin:json"
+envelope = true
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.number]
+type = "integer"
+description = "Created issue number"
+
+[output.schema.properties.url]
+type = "string"
+description = "URL of the created issue"
+
+[output.schema.properties.state]
+type = "string"
+description = "Issue state (open)"
+```
+
+### MCP Proxy Execution Flow
+
+1. ToolClad validates all arguments against the manifest's type system (stricter than upstream)
+2. Cedar evaluates policy (e.g., "this agent can only create issues in `ThirdKeyAI/*` repos")
+3. Executor maps validated arguments to the upstream MCP tool's expected input format
+4. Executor forwards the call to the MCP server referenced by `server` in `symbiont.toml`
+5. Response is parsed and validated against `[output.schema]`
+6. Wrapped in evidence envelope with audit trail
+
+The `[mcp].server` field references a named MCP server connection in `symbiont.toml`:
+
+```toml
+# symbiont.toml
+[mcp.servers.github-mcp]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${vault:github/api-token}" }
+```
+
+### Field Mapping
+
+When the ToolClad argument names differ from the upstream MCP tool's parameter names, an explicit mapping can be declared:
+
+```toml
+[mcp]
+server = "github-mcp"
+tool = "create_issue"
+
+[mcp.field_map]
+repo = "repository"       # ToolClad "repo" -> upstream "repository"
+labels = "label_names"     # ToolClad "labels" -> upstream "label_names"
+```
+
+Unmapped fields pass through with the same name. This decouples the ToolClad contract from the upstream tool's naming conventions.
+
+---
+
 ## Output Handling
 
 ### Built-in Parsers
@@ -583,11 +778,13 @@ Beyond oneshot execution, ToolClad supports stateful sessions where a tool proce
 
 | Mode | Backend | State Source | Ready Signal | Use Case |
 |---|---|---|---|---|
-| `oneshot` | Shell command | N/A | Process exit | Single invocations (nmap, curl, jq) |
+| `oneshot` | Shell command (`[command]`) | N/A | Process exit | CLI tools (nmap, jq, git) |
+| `oneshot` | HTTP request (`[http]`) | N/A | Response received | REST/GraphQL APIs (Slack, GitHub, Stripe) |
+| `oneshot` | MCP proxy (`[mcp]`) | N/A | MCP response | Governed proxy over existing MCP tools |
 | `session` | PTY (pseudo-terminal) | Prompt regex parsing | Prompt pattern match | Interactive CLIs (msfconsole, psql, gdb) |
 | `browser` | CDP / Playwright API | URL + DOM inspection | Page load + network idle | Web interaction (testing, scraping, form filling) |
 
-All three share: typed commands, per-interaction Cedar policy evaluation, scope enforcement, output schema validation, evidence capture, and audit trail. The manifest format is the same. The executor implementation differs.
+All five backends share: typed parameters, argument validation, Cedar policy evaluation, scope enforcement, output schema validation, evidence capture, and audit trail. The manifest format is the same. The executor implementation differs.
 
 ### The Problem with Stateful Tools
 
@@ -1113,14 +1310,143 @@ The `allow_external = false` setting is the strictest mode: the browser cannot l
 
 ---
 
-### What Stateful Sessions Do Not Cover
+### Nested Sessions (Architectural Specification)
 
-- **TUI tools** (`htop`, `lazygit`, `vim`): Tools with full-screen terminal UIs that require cursor positioning and screen state tracking. These need a screen-scraping layer that is out of scope for ToolClad.
-- **Sub-process spawning**: Tools that spawn child interactive sessions (msfconsole opening a meterpreter shell, browser spawning popups or new tabs). The current model tracks the top-level session only; nested sessions would need recursive management.
-- **Unsolicited streaming**: Tools that push data without being prompted (log tailing, event streams, WebSocket push). The current model assumes a request-response pattern with ready detection (prompt match or page load).
-- **Non-headless browsers**: Browser mode targets headless execution via CDP/Playwright. GUI browser automation with visual interaction (mouse coordinates, visual element recognition) is a different problem.
+When a session-mode tool spawns a child interactive context (msfconsole opens a meterpreter shell, `kubectl exec` opens a remote shell, a browser opens a popup), the parent session detects it and registers a dynamic child session. This is not recursive PTY management. Child sessions are new tools that get dynamically registered with their own contracts.
 
-These are candidates for future extensions, not v1 scope.
+**Detection:** The parent SessionExecutor detects child session creation through output parsing. A msfconsole `run` command that produces "Meterpreter session 1 opened" triggers child registration. A browser popup triggers a new page context. The detection patterns are declared in the parent manifest:
+
+```toml
+[session.child_detection]
+pattern = "session (\\d+) opened"
+type = "meterpreter"
+manifest = "tools/meterpreter.clad.toml"    # child session contract
+```
+
+**Registration:** The child session gets:
+
+- A session ID derived from the parent (`parent_session_id.child_1`)
+- Its own `[session.commands]` from its own manifest (meterpreter commands differ from msfconsole commands)
+- Its own Cedar policy context (post-exploitation policies, not exploitation policies)
+- Its own evidence stream, linked to the parent's evidence chain
+
+**Agent interaction:** The agent interacts with child sessions through scoped MCP tools: `msfconsole_session.child.sysinfo`, `msfconsole_session.child.download`. The parent SessionExecutor routes commands to the correct child PTY. Each child interaction goes through Cedar gating independently with the child's policy context.
+
+**Policy inheritance:** Child sessions inherit the parent's scope constraints (target IPs, allowed domains) but can have more restrictive policies. A child session can never be less restricted than its parent. Cedar policy evaluation checks both the child's policies and the parent's scope.
+
+**Evidence chain:** The child session transcript is linked to the parent via `parent_session_id`. The evidence chain records: parent session started, parent command triggered child, child session registered, child interactions (each with Cedar decisions), child terminated, parent continued. This provides a complete audit trail across session boundaries.
+
+**v1 scope:** The architecture is specified. Implementation in v1 supports single-level nesting (parent spawns child). Recursive nesting (child spawns grandchild) is deferred.
+
+---
+
+### Unsolicited Output (Architectural Specification)
+
+Session and browser mode tools can produce output without being prompted: log lines during long operations, async alerts, incoming data on monitored connections, server push events. The architecture extends the Observe phase with an event queue.
+
+**Event queue:** Each active session maintains a bounded event queue. The executor polls the PTY/CDP for output between interactions. Output that appears without a corresponding command (no prompt match expected, no request pending) is framed as an event:
+
+```json
+{
+  "event_type": "log_line",
+  "timestamp": "2026-03-21T12:34:56Z",
+  "session_id": "a1b2c3d4",
+  "content": "[*] Meterpreter session 1 opened (10.0.1.5:4444 -> 10.0.1.100:49152)",
+  "source": "stdout"
+}
+```
+
+**Manifest declaration:** Session manifests declare which event types are expected and how the queue behaves:
+
+```toml
+[session.events]
+enabled = true
+max_queue_depth = 100
+poll_interval_ms = 500
+event_types = ["log_line", "session_opened", "alert", "error"]
+ttl_seconds = 300                        # events older than this are dropped
+```
+
+**Observe phase integration:** The agent's ORGA Observe phase drains the event queue alongside normal tool results. Events are presented as additional observations with their types and timestamps. The agent can reason about events in the same way it reasons about tool outputs.
+
+**Cedar policy on events:** Cedar policies can filter which event types reach the agent. Noisy events (debug log lines) can be suppressed. Critical events (session opened, alert) can trigger escalation or priority reordering:
+
+```cedar
+// Only surface session_opened and alert events to the agent
+permit (
+    principal,
+    action == Session::Action::"receive_event",
+    resource
+)
+when {
+    resource.event_type in ["session_opened", "alert"]
+};
+```
+
+**Browser events:** The BrowserExecutor uses the same event queue for page-level events: console errors, network failures, navigation redirects, dialog appearances. These are detected via CDP event listeners rather than PTY polling.
+
+**v1 scope:** Event queue implementation with bounded depth, TTL, and Cedar filtering. Basic event types for session and browser modes. Advanced event routing (event-triggered ORGA loops, priority interrupts) deferred.
+
+---
+
+### Browser Authentication Flows (Architectural Specification)
+
+Browser agents frequently need to authenticate with web services. Credentials must be injected by the executor, never visible to the LLM. The architecture separates the agent's intent ("log in to GitHub") from the executor's mechanics (fill credentials from Vault, submit form, verify success).
+
+**Auth flow declaration:** The browser manifest declares named authentication flows:
+
+```toml
+[browser.auth_flows.github]
+login_url = "https://github.com/login"
+username_selector = "#login_field"
+password_selector = "#password"
+submit_selector = "[name='commit']"
+success_indicator = "url_contains=/dashboard"
+secret_ref = "vault:github/web-credentials"
+mfa_handler = "totp"                      # optional: totp, sms, or manual
+mfa_selector = "#otp"                     # where to enter the TOTP code
+mfa_secret_ref = "vault:github/totp-seed" # TOTP seed from Vault
+```
+
+**Agent interaction:** The agent proposes `browser_session.login(service="github")`. The BrowserExecutor:
+
+1. Looks up the "github" auth flow in the manifest
+2. Navigates to `login_url`
+3. Retrieves credentials from Vault/OpenBao via `secret_ref`
+4. Fills username and password fields using CDP directly (not through the LLM)
+5. Submits the form
+6. If MFA is required and `mfa_handler = "totp"`, retrieves the TOTP seed from Vault, generates the current code, and fills the MFA field
+7. If MFA requires human intervention (`mfa_handler = "manual"`), pauses and waits for human input
+8. Validates success via `success_indicator` (URL check, element presence, cookie check)
+9. Returns `{authenticated: true, service: "github"}` to the agent
+
+The LLM never sees credentials, TOTP seeds, or session tokens. It proposes the high-level action; the executor handles the mechanics.
+
+**Cedar policy:** Auth flows are gated by Cedar. Not every agent can log in to every service:
+
+```cedar
+permit (
+    principal == Agent::"data-collector",
+    action == Web::Action::"authenticate",
+    resource
+)
+when {
+    resource.service == "github" &&
+    resource.access_level == "read-only"
+};
+```
+
+**Session persistence:** After successful authentication, the browser session maintains cookies and local storage for the session's lifetime. The BrowserExecutor can optionally persist browser profiles to encrypted storage for reuse across sessions (configured per auth flow, requires Cedar authorization).
+
+**v1 scope:** Auth flow declaration, Vault credential injection, TOTP support, success validation. OAuth redirect flows (where the browser must follow a redirect chain through a third-party IdP) deferred to v2.
+
+---
+
+### Out of Scope by Design
+
+**TUI tools** (`htop`, `lazygit`, `vim`): Full-screen terminal UIs require cursor positioning, screen buffer tracking, and visual layout interpretation. This is a fundamentally different problem from behavioral contracts. ToolClad is the wrong abstraction for TUI tools. The agentic equivalent of a TUI tool is a set of oneshot manifests that expose the same underlying data programmatically: `ps aux` instead of `htop`, `git` subcommand manifests instead of `lazygit`, file-manipulation tools instead of `vim`. If an agent needs the information a TUI tool displays, wrap the underlying data source in a oneshot or session manifest.
+
+**Non-headless browsers**: Browser mode targets headless execution via CDP/Playwright. GUI browser automation with visual interaction (mouse coordinates, visual element recognition, screen coordinate clicking) is a computer-use problem, not a behavioral contract problem.
 
 ---
 
@@ -1359,10 +1685,16 @@ Of the 19 existing wrapper scripts:
 
 - The `.clad.toml` manifest format (oneshot, session, and browser modes)
 - The type system and validation semantics
-- The command template syntax (oneshot)
+- The command template syntax (`[command]`)
+- The HTTP request syntax (`[http]`)
+- The MCP proxy syntax (`[mcp]`) with field mapping
 - The session command declaration format (`[session.commands]`)
 - The browser command declaration format (`[browser.commands]`)
 - The browser scope declaration format (`[browser.scope]`)
+- The browser auth flow declaration format (`[browser.auth_flows]`)
+- The nested session detection and child manifest reference format
+- The event queue declaration format (`[session.events]`)
+- The secrets reference syntax (`{_secret:name}`)
 - The output envelope schema (oneshot and per-interaction)
 - The output schema declaration (`[output.schema]`)
 - The evidence metadata format
@@ -1371,13 +1703,17 @@ Of the 19 existing wrapper scripts:
 ### What is the Symbiont implementation (Apache 2.0)
 
 - The universal executor (Rust, integrated with tokio async runtime)
-- The SessionExecutor (PTY management, prompt detection, state inference)
-- The BrowserExecutor (CDP/Playwright management, page state inference, redirect interception)
+- The HTTP executor (reqwest-based, with secrets injection from Vault/OpenBao)
+- The MCP proxy executor (forwards to MCP servers with field mapping and stricter validation)
+- The SessionExecutor (PTY management, prompt detection, state inference, child session registration)
+- The BrowserExecutor (CDP/Playwright management, page state inference, redirect interception, auth flow execution)
 - Cedar policy integration and automatic policy generation
 - ORGA Gate integration (two-layer validation for oneshot, per-interaction gating for sessions and browser)
-- Session/page state as Cedar policy context
+- Session/page state and event types as Cedar policy context
+- Event queue with Cedar-based event filtering
 - URL scope enforcement with redirect interception (browser mode)
 - Target scope enforcement against `scope.toml` (oneshot and session modes)
+- Vault/OpenBao secrets injection for HTTP headers, browser auth flows, and MCP server credentials
 - Evidence chain with SHA-256 hashing, screenshot capture, and cryptographic audit trail
 - MCP schema auto-generation from manifests (inputSchema + outputSchema)
 - DSL tool reference resolution
@@ -1566,21 +1902,29 @@ The 80/20 split from symbi-redteam confirms this: ~14 of 19 tools are pure templ
 
 ## Remaining Open Questions
 
-1. **HTTP API backends**: The current design targets CLI tools (oneshot), interactive CLI tools (session), and browsers (browser). HTTP API tools could use similar manifests with an `[http]` execution section: endpoint URL, method, headers, request body template, response schema. This would let ToolClad govern REST/GraphQL API calls with the same typed, policy-gated pattern.
+1. **OAuth redirect flows**: Browser auth flows currently handle direct login forms (username/password/TOTP). OAuth flows where the browser follows a redirect chain through a third-party IdP (Google, Okta, Auth0) require tracking navigation across multiple domains, each with its own scope rules. The `[browser.auth_flows]` architecture supports this in principle (the executor controls the browser and can follow redirects), but the scope enforcement rules need refinement: the auth flow must temporarily allow navigation to the IdP domain during login, then re-lock scope afterward.
 
-2. **MCP server passthrough**: Tools already exposed as MCP servers could use a `[mcp]` execution section that acts as a governed proxy: validate parameters against the manifest's stricter type system, apply Cedar policy, then forward to the MCP server. This would add ToolClad governance to existing MCP tools without rewriting them.
+2. **GraphQL-specific features**: The `[http]` backend handles GraphQL as a POST request with a JSON body, but GraphQL queries have structure (operations, variables, fragments) that could benefit from deeper validation. A `[graphql]` section extending `[http]` with query parsing and variable typing may be warranted if GraphQL API tools become a significant use case.
 
-3. **TUI tools**: Full-screen terminal applications (`htop`, `lazygit`, `vim`) require cursor positioning and screen state tracking. A screen-scraping adapter could expose TUI state as structured data, but the complexity may exceed what a manifest format should express.
+3. **Multi-level nested sessions**: The nested session architecture specifies single-level nesting (parent spawns child). Recursive nesting (child spawns grandchild, e.g., msfconsole opens meterpreter which pivots to a second host's shell) needs the same architecture applied recursively. The evidence chain and policy inheritance model scale to arbitrary depth, but the implementation complexity and testing surface increase significantly.
 
-4. **Nested sessions**: Tools that spawn child interactive sessions (msfconsole opening a meterpreter shell, browser popups, `kubectl exec` opening a remote shell that itself runs `psql`) would need recursive session management. The v1 model tracks the top-level session only.
-
-5. **Unsolicited output**: Session and browser modes assume a request-response pattern with ready detection. Tools that push data without being prompted (log tailing, event streams, WebSocket push) would need an event-driven output model with its own schema and policy hooks.
-
-6. **Browser authentication flows**: Credential entry and OAuth flows require typing sensitive data into form fields. ToolClad should integrate with secrets management (Vault/OpenBao) so that credentials are injected by the executor, never visible to the LLM. The agent proposes "log in to app X" and the executor handles credential retrieval and entry.
+4. **Event-triggered ORGA loops**: The event queue architecture delivers unsolicited events to the agent's Observe phase when the loop is already running. A stronger model would allow critical events (security alerts, session termination, authentication expiry) to *trigger* a new ORGA iteration even when the agent is idle. This requires integration with Symbiont's cron/webhook infrastructure and is deferred to post-v1.
 
 ---
 
 ## Changelog
+
+### v0.5.0 (2026-03-21)
+
+- Added HTTP backend (`[http]` section) for REST/GraphQL API tools as oneshot execution backend. Includes request template construction, secrets injection via `{_secret:name}` syntax, status code validation.
+- Added MCP proxy backend (`[mcp]` section) for governed passthrough to existing MCP server tools. Includes field mapping, stricter-than-upstream validation, and Cedar policy gating.
+- Added Nested Sessions architectural specification: dynamic child session registration, manifest-declared detection patterns, policy inheritance, evidence chain linking. v1 supports single-level nesting.
+- Added Unsolicited Output architectural specification: bounded event queue per session, Cedar-based event filtering, Observe phase drain integration. Covers both PTY polling and CDP event listeners.
+- Added Browser Authentication Flows architectural specification: auth flow declaration in manifests, Vault/OpenBao credential injection, TOTP support, success validation. LLM never sees credentials.
+- Closed TUI tools as out of scope by design with rationale (agentic equivalents are oneshot manifests over underlying data sources).
+- Updated mode/backend table to show five backends (shell, HTTP, MCP proxy, PTY, CDP/Playwright) across three modes.
+- Updated open protocol scope to include HTTP, MCP proxy, event queue, secrets reference, auth flow, and nested session formats.
+- Remaining open questions narrowed to: OAuth redirect flows, GraphQL-specific features, multi-level nested sessions, event-triggered ORGA loops.
 
 ### v0.4.0 (2026-03-20)
 
