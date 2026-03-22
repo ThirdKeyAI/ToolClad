@@ -110,7 +110,7 @@ All types reject shell metacharacters by default.
 
 ToolClad is the `tools/` directory convention for [Symbiont](https://symbiont.dev). The runtime auto-discovers `.clad.toml` files, registers them as MCP tools, and wires them into the ORGA reasoning loop with Cedar policy evaluation.
 
-See [TOOLCLAD_DESIGN_SPEC.md](TOOLCLAD_DESIGN_SPEC.md) for the full specification.
+See [TOOLCLAD_DESIGN_SPEC.md](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md) for the full specification.
 
 ## License
 
