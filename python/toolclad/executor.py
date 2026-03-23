@@ -11,6 +11,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -109,7 +110,7 @@ def build_command(manifest: Manifest, args: Dict[str, str]) -> str:
 
     # --- Executor-injected variables ---
     scan_id = _generate_scan_id()
-    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", "/tmp/toolclad-evidence")
+    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
     tool_name = manifest.tool.name
 
     output_dir = evidence_dir
@@ -367,10 +368,21 @@ def _execute_http(
     envelope["duration_ms"] = elapsed_ms
     envelope["http_status"] = status_code
 
+    is_success = True
     if http.error_status and status_code in http.error_status:
-        envelope["status"] = "error"
+        is_success = False
     elif http.success_status and status_code not in http.success_status:
-        envelope["status"] = "error"
+        is_success = False
+    elif not http.success_status and not http.error_status:
+        is_success = 200 <= status_code < 300
+
+    if not is_success:
+        if 400 <= status_code < 500:
+            envelope["status"] = f"client_error (HTTP {status_code})"
+        elif 500 <= status_code < 600:
+            envelope["status"] = f"server_error (HTTP {status_code})"
+        else:
+            envelope["status"] = f"error (HTTP {status_code})"
 
     envelope["results"] = {"raw_output": resp_body}
     return envelope
@@ -559,7 +571,7 @@ def execute(
         return envelope
 
     # Ensure evidence output directory exists.
-    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", "/tmp/toolclad-evidence")
+    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
     if manifest.tool.evidence.output_dir:
         out_dir = manifest.tool.evidence.output_dir.format(
             evidence_dir=evidence_dir, scan_id=scan_id

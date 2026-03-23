@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { validateArg } from "./validator.js";
 
 /**
@@ -113,7 +115,7 @@ export function buildCommand(manifest, args) {
   const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
   context._scan_id = scanId;
   context._output_file = `/tmp/toolclad-${scanId}-output`;
-  context._evidence_dir = process.env.TOOLCLAD_EVIDENCE_DIR || "/tmp/toolclad-evidence";
+  context._evidence_dir = process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
 
   // Resolve mappings: e.g. scan_type -> _scan_flags
   if (command.mappings) {
@@ -234,7 +236,7 @@ export function execute(manifest, args, options = {}) {
     }
     env.TOOLCLAD_SCAN_ID = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
     env.TOOLCLAD_EVIDENCE_DIR =
-      process.env.TOOLCLAD_EVIDENCE_DIR || "/tmp/toolclad-evidence";
+      process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
 
     // Use array-based execution to avoid shell interpretation.
     const cmdParts = splitCommand(command);

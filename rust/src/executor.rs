@@ -123,6 +123,10 @@ fn execute_http(
 
     let status_str = if is_success {
         "success".to_string()
+    } else if (400..500).contains(&status_code) {
+        format!("client_error (HTTP {})", status_code)
+    } else if (500..600).contains(&status_code) {
+        format!("server_error (HTTP {})", status_code)
     } else {
         format!("error (HTTP {})", status_code)
     };
@@ -262,8 +266,11 @@ pub fn build_command(
     );
     vars.insert("_scan_id".to_string(), scan_id.clone());
 
-    let evidence_dir = std::env::var("TOOLCLAD_EVIDENCE_DIR")
-        .unwrap_or_else(|_| "/tmp/toolclad-evidence".to_string());
+    let evidence_dir = std::env::var("TOOLCLAD_EVIDENCE_DIR").unwrap_or_else(|_| {
+        let mut dir = std::env::temp_dir();
+        dir.push("toolclad-evidence");
+        dir.to_string_lossy().to_string()
+    });
     vars.insert("_evidence_dir".to_string(), evidence_dir.clone());
 
     let output_file = format!("{evidence_dir}/{scan_id}-output");

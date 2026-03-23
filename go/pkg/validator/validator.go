@@ -193,9 +193,9 @@ func isValidCIDR(value string) bool {
 }
 
 func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
-	// NOTE: Scope validation (CIDR, DNS wildcard) should ideally be centralized
-	// to avoid implementation drift across languages. For production use,
-	// defer scope checking to the Symbiont runtime's scope enforcement module.
+	// Scope validation rules (aligned across Rust, Python, JS, Go):
+	// 1. Reject shell metacharacters  2. Block * and ? wildcards
+	// 3. Accept valid IPv4, IPv6, CIDR, or hostname
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
 	}

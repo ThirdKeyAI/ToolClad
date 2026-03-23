@@ -118,20 +118,26 @@ function validateEnum(argDef, value) {
 }
 
 function validateScopeTarget(argDef, value) {
-  // NOTE: Scope validation (CIDR, DNS wildcard) should ideally be centralized
-  // to avoid implementation drift across languages. For production use,
-  // defer scope checking to the Symbiont runtime's scope enforcement module.
+  // Scope validation rules (aligned across Rust, Python, JS, Go):
+  // 1. Reject shell metacharacters  2. Block * and ? wildcards
+  // 3. Accept valid IPv4, IPv6, CIDR, or hostname
   const str = String(value);
   checkInjection(str);
-  // Block wildcards
-  if (str.includes("*")) {
+  if (str.includes("*") || str.includes("?")) {
     throw new Error(`Wildcard not allowed in scope_target: ${str}`);
   }
-  // Must look like an IP, CIDR, or hostname
-  const hostnameRe = /^[a-zA-Z0-9._:-]+$/;
-  const cidrRe = /^[0-9a-fA-F.:]+\/[0-9]+$/;
-  if (!hostnameRe.test(str) && !cidrRe.test(str)) {
-    throw new Error(`Invalid scope_target: ${str}`);
+  const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
+  const ipv6Re = /^[0-9a-fA-F:]+$/;
+  const cidrRe = /^[0-9a-fA-F.:]+\/\d{1,3}$/;
+  const hostnameRe =
+    /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/;
+  if (
+    !ipv4Re.test(str) &&
+    !ipv6Re.test(str) &&
+    !cidrRe.test(str) &&
+    !hostnameRe.test(str)
+  ) {
+    throw new Error(`Invalid scope_target: ${str} (must be IP, CIDR, or hostname)`);
   }
   return str;
 }

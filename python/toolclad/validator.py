@@ -114,9 +114,9 @@ def _is_valid_cidr(value: str) -> bool:
 
 
 def _validate_scope_target(arg_def: ArgDef, value: str) -> str:
-    # NOTE: Scope validation (CIDR, DNS wildcard) should ideally be centralized
-    # to avoid implementation drift across languages. For production use,
-    # defer scope checking to the Symbiont runtime's scope enforcement module.
+    # Scope validation rules (aligned across Rust, Python, JS, Go):
+    # 1. Reject shell metacharacters  2. Block * and ? wildcards
+    # 3. Accept valid IPv4, IPv6, CIDR, or hostname
     _check_injection(value)
     # Block wildcard targets.
     if "*" in value or "?" in value:
