@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -255,16 +256,249 @@ func parseOutput(format string, data []byte) (map[string]any, error) {
 			return nil, fmt.Errorf("parsing JSON output: %w", err)
 		}
 		return result, nil
+
+	case "jsonl":
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		var parsed []any
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var obj any
+			if err := json.Unmarshal([]byte(line), &obj); err != nil {
+				return nil, fmt.Errorf("parsing JSONL line: %w", err)
+			}
+			parsed = append(parsed, obj)
+		}
+		return map[string]any{"parsed_output": parsed}, nil
+
+	case "csv":
+		return parseCsvOutput(data), nil
+
+	case "xml":
+		return parseXmlOutput(data), nil
+
 	case "text", "":
-		return map[string]any{
-			"raw_output": string(data),
-		}, nil
+		return map[string]any{"raw_output": string(data)}, nil
+
 	default:
-		// For xml, csv, jsonl -- fall back to raw text in the reference impl.
-		return map[string]any{
-			"raw_output": string(data),
-		}, nil
+		return map[string]any{"raw_output": string(data)}, nil
 	}
+}
+
+// parseCsvOutput parses CSV data with auto-delimiter detection and type inference.
+func parseCsvOutput(data []byte) map[string]any {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return map[string]any{"parsed_output": []any{}}
+	}
+
+	lines := strings.Split(raw, "\n")
+	if len(lines) == 0 {
+		return map[string]any{"parsed_output": []any{}}
+	}
+
+	// Auto-detect delimiter
+	firstLine := lines[0]
+	delimiter := ','
+	if strings.Contains(firstLine, "\t") {
+		delimiter = '\t'
+	} else if strings.Contains(firstLine, "|") && !strings.Contains(firstLine, ",") {
+		delimiter = '|'
+	}
+
+	headers := splitCsvLine(firstLine, delimiter)
+	for i := range headers {
+		headers[i] = strings.TrimSpace(headers[i])
+	}
+
+	var rows []any
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := splitCsvLine(line, delimiter)
+		row := make(map[string]any)
+		for i, h := range headers {
+			val := ""
+			if i < len(fields) {
+				val = strings.TrimSpace(fields[i])
+			}
+			// Type inference
+			if strings.ToLower(val) == "true" || strings.ToLower(val) == "false" {
+				row[h] = strings.ToLower(val) == "true"
+			} else if n, err := strconv.Atoi(val); err == nil {
+				row[h] = n
+			} else if f, err := strconv.ParseFloat(val, 64); err == nil {
+				row[h] = f
+			} else {
+				row[h] = val
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	return map[string]any{"parsed_output": rows}
+}
+
+// splitCsvLine splits a CSV line respecting quoted fields and escaped quotes.
+func splitCsvLine(line string, delimiter rune) []string {
+	var fields []string
+	var current strings.Builder
+	inQuotes := false
+	runes := []rune(line)
+
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		if c == '"' {
+			if inQuotes && i+1 < len(runes) && runes[i+1] == '"' {
+				current.WriteRune('"')
+				i++ // skip escaped quote
+			} else {
+				inQuotes = !inQuotes
+			}
+		} else if c == delimiter && !inQuotes {
+			fields = append(fields, current.String())
+			current.Reset()
+		} else {
+			current.WriteRune(c)
+		}
+	}
+	fields = append(fields, current.String())
+	return fields
+}
+
+// parseXmlOutput parses XML data into a nested map structure.
+func parseXmlOutput(data []byte) map[string]any {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return map[string]any{"raw_output": ""}
+	}
+
+	// Strip XML declaration
+	if strings.HasPrefix(raw, "<?xml") {
+		if idx := strings.Index(raw, "?>"); idx != -1 {
+			raw = strings.TrimSpace(raw[idx+2:])
+		}
+	}
+
+	type stackEntry struct {
+		name string
+		obj  map[string]any
+	}
+
+	var stack []stackEntry
+	currentName := ""
+	currentObj := make(map[string]any)
+	var textBuf strings.Builder
+	pos := 0
+
+	attrRe := regexp.MustCompile(`(\w+)\s*=\s*["']([^"']*)["']`)
+
+	for pos < len(raw) {
+		if raw[pos] == '<' {
+			// Flush text
+			text := strings.TrimSpace(textBuf.String())
+			if text != "" && currentName != "" {
+				currentObj["#text"] = text
+			}
+			textBuf.Reset()
+			pos++
+			if pos >= len(raw) {
+				break
+			}
+
+			if raw[pos] == '/' {
+				// Closing tag
+				pos++
+				tagEnd := strings.Index(raw[pos:], ">")
+				if tagEnd == -1 {
+					break
+				}
+				pos += tagEnd + 1
+
+				finishedObj := currentObj
+				if len(stack) > 0 {
+					parent := stack[len(stack)-1]
+					stack = stack[:len(stack)-1]
+
+					if existing, ok := parent.obj[currentName]; ok {
+						if arr, ok := existing.([]any); ok {
+							parent.obj[currentName] = append(arr, finishedObj)
+						} else {
+							parent.obj[currentName] = []any{existing, finishedObj}
+						}
+					} else {
+						parent.obj[currentName] = finishedObj
+					}
+					currentName = parent.name
+					currentObj = parent.obj
+				}
+			} else if raw[pos] == '!' || raw[pos] == '?' {
+				// Comment or PI — skip
+				tagEnd := strings.Index(raw[pos:], ">")
+				if tagEnd == -1 {
+					break
+				}
+				pos += tagEnd + 1
+			} else {
+				// Opening tag
+				tagEnd := strings.Index(raw[pos:], ">")
+				if tagEnd == -1 {
+					break
+				}
+				tagContent := raw[pos : pos+tagEnd]
+				selfClosing := strings.HasSuffix(tagContent, "/")
+				if selfClosing {
+					tagContent = tagContent[:len(tagContent)-1]
+				}
+
+				parts := strings.Fields(tagContent)
+				tagName := ""
+				if len(parts) > 0 {
+					tagName = parts[0]
+				}
+
+				attrs := make(map[string]any)
+				attrStr := ""
+				if len(tagContent) > len(tagName) {
+					attrStr = tagContent[len(tagName):]
+				}
+				for _, match := range attrRe.FindAllStringSubmatch(attrStr, -1) {
+					attrs["@"+match[1]] = match[2]
+				}
+
+				if selfClosing {
+					if existing, ok := currentObj[tagName]; ok {
+						if arr, ok := existing.([]any); ok {
+							currentObj[tagName] = append(arr, attrs)
+						} else {
+							currentObj[tagName] = []any{existing, attrs}
+						}
+					} else {
+						currentObj[tagName] = attrs
+					}
+				} else {
+					stack = append(stack, stackEntry{name: currentName, obj: currentObj})
+					currentName = tagName
+					currentObj = attrs
+				}
+				pos += tagEnd + 1
+			}
+		} else {
+			textBuf.WriteByte(raw[pos])
+			pos++
+		}
+	}
+
+	if currentName != "" {
+		result := make(map[string]any)
+		result[currentName] = currentObj
+		return result
+	}
+	return currentObj
 }
 
 // secretPattern matches {_secret:name} placeholders in templates.

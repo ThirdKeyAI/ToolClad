@@ -212,6 +212,16 @@ export function execute(manifest, args, options = {}) {
     );
   }
 
+  // Route to HTTP backend (synchronous via curl)
+  if (manifest.http) {
+    return executeHttpSync(manifest, args, options);
+  }
+
+  // Route to MCP proxy backend
+  if (manifest.mcp) {
+    return executeMcp(manifest, args);
+  }
+
   const { command, resolvedArgs, isExecutor } = buildCommand(manifest, args);
 
   if (options.dryRun) {
@@ -294,10 +304,320 @@ export function execute(manifest, args, options = {}) {
     envelope.error = stderr || `Process exited with code ${exitCode}`;
     envelope.results = { raw_output: stdout };
   } else {
-    envelope.results = { raw_output: stdout };
+    envelope.results = parseOutputJs(manifest, stdout);
   }
 
   return envelope;
+}
+
+/**
+ * Parse tool output based on the manifest's output.format / output.parser.
+ *
+ * @param {object} manifest - Parsed manifest
+ * @param {string} raw - Raw output string
+ * @returns {object} Parsed results
+ */
+function parseOutputJs(manifest, raw) {
+  const format = manifest.output?.format || "text";
+  const parser = manifest.output?.parser || `builtin:${format}`;
+
+  switch (parser) {
+    case "builtin:json": {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return { raw_output: raw };
+      }
+    }
+    case "builtin:jsonl": {
+      try {
+        const lines = raw.trim().split("\n").filter(l => l.trim());
+        return { parsed_output: lines.map(l => JSON.parse(l)) };
+      } catch {
+        return { raw_output: raw };
+      }
+    }
+    case "builtin:csv": {
+      return { parsed_output: parseCsv(raw) };
+    }
+    case "builtin:xml": {
+      return parseXmlToJson(raw);
+    }
+    default:
+      return { raw_output: raw };
+  }
+}
+
+/**
+ * Parse CSV text into an array of objects using the first row as headers.
+ * Auto-detects delimiter (comma, tab, pipe) and performs basic type inference.
+ */
+function parseCsv(raw) {
+  const lines = raw.trim().split("\n").filter(l => l.trim());
+  if (lines.length === 0) return [];
+
+  const firstLine = lines[0];
+  // Auto-detect delimiter
+  const delimiter = firstLine.includes("\t") ? "\t" :
+    (firstLine.includes("|") && !firstLine.includes(",")) ? "|" : ",";
+
+  const headers = splitCsvLine(firstLine, delimiter).map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const fields = splitCsvLine(line, delimiter);
+    const obj = {};
+    headers.forEach((h, i) => {
+      const val = (fields[i] || "").trim();
+      // Type inference
+      if (val.toLowerCase() === "true" || val.toLowerCase() === "false") {
+        obj[h] = val.toLowerCase() === "true";
+      } else if (/^-?\d+$/.test(val)) {
+        obj[h] = parseInt(val, 10);
+      } else if (/^-?\d+\.\d+$/.test(val)) {
+        obj[h] = parseFloat(val);
+      } else {
+        obj[h] = val;
+      }
+    });
+    return obj;
+  });
+}
+
+/**
+ * Split a CSV line by delimiter, respecting double-quoted fields.
+ */
+function splitCsvLine(line, delimiter) {
+  const fields = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === delimiter && !inQuotes) {
+      fields.push(current);
+      current = "";
+    } else {
+      current += c;
+    }
+  }
+  fields.push(current);
+  return fields;
+}
+
+/**
+ * Simple XML-to-JSON parser. Handles elements, attributes, text content,
+ * and self-closing tags. Falls back to raw_output on parse failure.
+ */
+function parseXmlToJson(xml) {
+  const trimmed = xml.trim();
+  if (!trimmed) return { raw_output: "" };
+
+  try {
+    let pos = 0;
+    // Skip XML declaration
+    if (trimmed.startsWith("<?xml")) {
+      const end = trimmed.indexOf("?>");
+      if (end !== -1) pos = end + 2;
+    }
+
+    const stack = [];
+    let currentName = "";
+    let currentObj = {};
+    let textBuf = "";
+
+    while (pos < trimmed.length) {
+      if (trimmed[pos] === "<") {
+        // Flush text
+        const text = textBuf.trim();
+        if (text && currentName) {
+          currentObj["#text"] = text;
+        }
+        textBuf = "";
+        pos++;
+
+        if (trimmed[pos] === "/") {
+          // Closing tag
+          pos++;
+          const tagEnd = trimmed.indexOf(">", pos);
+          pos = tagEnd + 1;
+
+          const finishedObj = { ...currentObj };
+          if (stack.length > 0) {
+            const [parentName, parentObj] = stack.pop();
+            if (parentObj[currentName]) {
+              if (!Array.isArray(parentObj[currentName])) {
+                parentObj[currentName] = [parentObj[currentName]];
+              }
+              parentObj[currentName].push(finishedObj);
+            } else {
+              parentObj[currentName] = finishedObj;
+            }
+            currentName = parentName;
+            currentObj = parentObj;
+          }
+        } else if (trimmed[pos] === "!" || trimmed[pos] === "?") {
+          const end = trimmed.indexOf(">", pos);
+          pos = end + 1;
+        } else {
+          // Opening tag
+          const tagEnd = trimmed.indexOf(">", pos);
+          let tagContent = trimmed.substring(pos, tagEnd);
+          const selfClosing = tagContent.endsWith("/");
+          if (selfClosing) tagContent = tagContent.slice(0, -1);
+
+          const spaceIdx = tagContent.indexOf(" ");
+          const tagName = spaceIdx === -1 ? tagContent : tagContent.substring(0, spaceIdx);
+          const attrStr = spaceIdx === -1 ? "" : tagContent.substring(spaceIdx);
+
+          const attrs = {};
+          const attrRe = /(\w+)\s*=\s*["']([^"']*)["']/g;
+          let m;
+          while ((m = attrRe.exec(attrStr)) !== null) {
+            attrs[`@${m[1]}`] = m[2];
+          }
+
+          if (selfClosing) {
+            if (currentObj[tagName]) {
+              if (!Array.isArray(currentObj[tagName])) {
+                currentObj[tagName] = [currentObj[tagName]];
+              }
+              currentObj[tagName].push(attrs);
+            } else {
+              currentObj[tagName] = attrs;
+            }
+          } else {
+            stack.push([currentName, currentObj]);
+            currentName = tagName;
+            currentObj = attrs;
+          }
+          pos = tagEnd + 1;
+        }
+      } else {
+        textBuf += trimmed[pos];
+        pos++;
+      }
+    }
+
+    if (currentName) {
+      const root = {};
+      root[currentName] = currentObj;
+      return root;
+    }
+    return currentObj;
+  } catch {
+    return { raw_output: xml };
+  }
+}
+
+/**
+ * Execute an HTTP manifest synchronously using curl via spawnSync.
+ *
+ * @param {object} manifest - Parsed manifest with http section
+ * @param {object} args - User-supplied arguments (key=value)
+ * @param {object} [options] - Execution options
+ * @param {boolean} [options.dryRun=false] - If true, build request but don't execute
+ * @returns {object} Evidence envelope with http_status
+ */
+function executeHttpSync(manifest, args, options = {}) {
+  const httpDef = manifest.http;
+  if (!httpDef || !httpDef.url) {
+    throw new Error("Manifest missing [http] section or http.url");
+  }
+
+  const resolvedArgs = resolveArgs(manifest, args);
+  const context = { ...resolvedArgs };
+
+  let url = interpolate(httpDef.url, context);
+  url = injectTemplateVars(url);
+
+  const headers = {};
+  if (httpDef.headers) {
+    for (const [key, val] of Object.entries(httpDef.headers)) {
+      headers[key] = injectTemplateVars(interpolate(val, context));
+    }
+  }
+
+  let body = undefined;
+  if (httpDef.body_template) {
+    // JSON-escape values for safe interpolation into body templates
+    const escaped = {};
+    for (const [k, v] of Object.entries(context)) {
+      escaped[k] = JSON.stringify(String(v)).slice(1, -1);
+    }
+    body = injectTemplateVars(interpolate(httpDef.body_template, escaped));
+  }
+
+  const method = (httpDef.method || "GET").toUpperCase();
+  const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
+
+  if (options.dryRun) {
+    return {
+      status: "dry_run",
+      scan_id: scanId,
+      tool: manifest.tool.name,
+      command: `${method} ${url}`,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // Build curl arguments for synchronous HTTP execution
+  const curlArgs = ["-s", "-S", "-X", method, "-w", "\n%{http_code}"];
+  for (const [k, v] of Object.entries(headers)) {
+    curlArgs.push("-H", `${k}: ${v}`);
+  }
+  if (body && method !== "GET" && method !== "HEAD") {
+    curlArgs.push("-d", body);
+  }
+  const timeout = manifest.tool.timeout_seconds || 30;
+  curlArgs.push("--max-time", String(timeout));
+  curlArgs.push(url);
+
+  const startTime = Date.now();
+  const result = spawnSync("curl", curlArgs, {
+    encoding: "utf-8",
+    timeout: (timeout + 5) * 1000,
+  });
+
+  const durationMs = Date.now() - startTime;
+  const output = (result.stdout || "").trim();
+  const lines = output.split("\n");
+  const statusCode = parseInt(lines.pop(), 10) || 0;
+  const respBody = lines.join("\n");
+
+  const outputHash = createHash("sha256").update(respBody).digest("hex");
+
+  const successStatus = httpDef.success_status || [200, 201, 202, 204];
+  const isSuccess = successStatus.includes(statusCode);
+
+  let status;
+  if (isSuccess) {
+    status = "success";
+  } else if (statusCode >= 400 && statusCode < 500) {
+    status = `client_error (HTTP ${statusCode})`;
+  } else if (statusCode >= 500 && statusCode < 600) {
+    status = `server_error (HTTP ${statusCode})`;
+  } else {
+    status = `error (HTTP ${statusCode})`;
+  }
+
+  return {
+    status,
+    scan_id: scanId,
+    tool: manifest.tool.name,
+    command: `${method} ${url}`,
+    http_status: statusCode,
+    exit_code: result.status ?? -1,
+    stderr: result.stderr || "",
+    duration_ms: durationMs,
+    timestamp: new Date(startTime).toISOString(),
+    output_hash: `sha256:${outputHash}`,
+    results: parseOutputJs(manifest, respBody),
+  };
 }
 
 /**
