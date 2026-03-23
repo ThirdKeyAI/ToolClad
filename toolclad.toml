@@ -1,0 +1,32 @@
+# Project-level custom type definitions for ToolClad.
+#
+# Types defined here can be referenced by any .clad.toml manifest
+# in this project using type = "custom_type_name".
+#
+# Each custom type inherits validation from a base type and adds
+# constraints (allowed values, patterns, min/max ranges).
+
+[types.severity_level]
+base = "enum"
+allowed = ["info", "low", "medium", "high", "critical"]
+
+[types.service_protocol]
+base = "enum"
+allowed = ["ssh", "ftp", "http", "https", "smtp", "dns", "rdp", "smb", "telnet", "snmp"]
+
+[types.scan_rate]
+base = "integer"
+min = 1
+max = 10000
+
+[types.hostname]
+base = "string"
+pattern = "^[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?)*$"
+
+[types.safe_identifier]
+base = "string"
+pattern = "^[a-zA-Z_][a-zA-Z0-9_\\-]{0,63}$"
+
+[types.port_range]
+base = "string"
+pattern = "^\\d{1,5}(-\\d{1,5})?(,\\d{1,5}(-\\d{1,5})?)*$"

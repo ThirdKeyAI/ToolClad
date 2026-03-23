@@ -1,0 +1,82 @@
+# nikto_scan.clad.toml — Web server vulnerability scanner
+#
+# Demonstrates custom types from the project-level toolclad.toml:
+#   hostname, port_range, severity_level, scan_rate
+
+[tool]
+name = "nikto_scan"
+version = "1.0.0"
+binary = "nikto"
+description = "Scan a web server for known vulnerabilities and misconfigurations"
+timeout_seconds = 600
+risk_tier = "medium"
+human_approval = true
+
+[tool.cedar]
+resource = "PenTest::ScanTarget"
+action = "execute_tool"
+
+[args.target]
+position = 1
+required = true
+type = "hostname"
+description = "Target hostname to scan"
+
+[args.port]
+position = 2
+required = false
+type = "port_range"
+default = "80"
+description = "Port or port range (e.g. 80, 443, 8080-8090)"
+
+[args.protocol]
+position = 3
+required = false
+type = "service_protocol"
+default = "http"
+description = "Protocol to use for the scan"
+
+[args.max_rate]
+position = 4
+required = false
+type = "scan_rate"
+default = 100
+description = "Maximum requests per second"
+
+[args.output_format]
+position = 5
+required = false
+type = "enum"
+allowed = ["text", "csv", "json", "xml"]
+default = "json"
+description = "Output format"
+
+[command]
+template = "nikto -h {protocol}://{target}:{port} -maxtime {_timeout} -Format {output_format} {_rate_flag}"
+
+[command.defaults]
+_timeout = "600s"
+
+[command.conditionals.rate_flag]
+when = "max_rate != '100'"
+template = "-Plugins @@ALL -maxrate {max_rate}"
+
+[output]
+format = "json"
+parser = "builtin:json"
+envelope = true
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.vulnerabilities]
+type = "array"
+description = "List of discovered vulnerabilities"
+
+[output.schema.properties.host]
+type = "string"
+description = "Target host that was scanned"
+
+[output.schema.properties.port]
+type = "integer"
+description = "Port that was scanned"
