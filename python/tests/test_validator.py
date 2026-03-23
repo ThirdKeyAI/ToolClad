@@ -86,7 +86,8 @@ class TestPortValidation:
         assert validate_arg(_arg("port"), "443") == "443"
 
     def test_port_zero(self):
-        assert validate_arg(_arg("port"), "0") == "0"
+        with pytest.raises(ValidationError, match="out of range"):
+            validate_arg(_arg("port"), "0")
 
     def test_port_max(self):
         assert validate_arg(_arg("port"), "65535") == "65535"
@@ -167,8 +168,13 @@ class TestScopeTargetValidation:
             validate_arg(_arg("scope_target"), "10.0.1.1; echo pwned")
 
     def test_invalid_target(self):
-        with pytest.raises(ValidationError, match="Invalid scope target"):
+        # "!!!" contains shell metacharacter '!', so injection check fires first
+        with pytest.raises(ValidationError, match="shell metacharacters"):
             validate_arg(_arg("scope_target"), "not a valid target at all!!!")
+
+    def test_invalid_target_no_metachar(self):
+        with pytest.raises(ValidationError, match="Invalid scope target"):
+            validate_arg(_arg("scope_target"), "not a valid target")
 
 
 # ---------------------------------------------------------------------------
@@ -195,16 +201,24 @@ class TestUrlValidation:
 # ---------------------------------------------------------------------------
 
 class TestPathValidation:
-    def test_valid_path(self):
-        assert validate_arg(_arg("path"), "/usr/share/wordlists/common.txt") == "/usr/share/wordlists/common.txt"
+    def test_valid_relative_path(self):
+        assert validate_arg(_arg("path"), "config/settings.toml") == "config/settings.toml"
+
+    def test_absolute_path_rejected(self):
+        with pytest.raises(ValidationError, match="relative"):
+            validate_arg(_arg("path"), "/usr/share/wordlists/common.txt")
 
     def test_traversal_rejected(self):
-        with pytest.raises(ValidationError, match="Path traversal"):
+        with pytest.raises(ValidationError, match="relative"):
             validate_arg(_arg("path"), "/etc/../../../etc/shadow")
+
+    def test_relative_traversal_rejected(self):
+        with pytest.raises(ValidationError, match="traversal"):
+            validate_arg(_arg("path"), "config/../../etc/shadow")
 
     def test_injection_in_path(self):
         with pytest.raises(ValidationError, match="shell metacharacters"):
-            validate_arg(_arg("path"), "/tmp/$(whoami).txt")
+            validate_arg(_arg("path"), "tmp/$(whoami).txt")
 
 
 # ---------------------------------------------------------------------------

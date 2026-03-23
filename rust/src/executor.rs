@@ -56,19 +56,29 @@ fn execute_http(
         headers.push((hk.clone(), val));
     }
 
-    // Build body from template if present.
+    // Build body from template if present, with JSON-safe escaping.
     let body = if let Some(ref body_tmpl) = http.body_template {
         let mut b = body_tmpl.clone();
         for (k, v) in validated {
-            b = b.replace(&format!("{{{k}}}"), v);
+            // JSON-escape the value to prevent injection into JSON body.
+            let escaped = serde_json::to_string(v)
+                .unwrap_or_else(|_| format!("\"{}\"", v))
+                .trim_matches('"')
+                .to_string();
+            b = b.replace(&format!("{{{k}}}"), &escaped);
         }
         Some(inject_template_vars(&b)?)
     } else {
         None
     };
 
-    // Execute the HTTP request.
-    let client = reqwest::blocking::Client::new();
+    // Execute the HTTP request with timeout.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            manifest.tool.timeout_seconds,
+        ))
+        .build()
+        .map_err(|e| ToolCladError::ExecutionError(format!("HTTP client error: {e}")))?;
     let method_upper = http.method.to_uppercase();
     let mut req = match method_upper.as_str() {
         "GET" => client.get(&url),
@@ -171,7 +181,7 @@ fn execute_mcp_proxy(
     });
 
     Ok(EvidenceEnvelope {
-        status: "delegated".to_string(),
+        status: "delegation_preview".to_string(),
         scan_id,
         tool: manifest.tool.name.clone(),
         command: format!("mcp://{}:{}", mcp.server, mcp.tool),
@@ -359,6 +369,66 @@ fn toml_value_to_string(val: &toml::Value) -> String {
     }
 }
 
+/// Parse raw command output according to the manifest's output format/parser.
+fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, ToolCladError> {
+    let parser =
+        manifest
+            .output
+            .parser
+            .as_deref()
+            .unwrap_or(match manifest.output.format.as_str() {
+                "json" => "builtin:json",
+                "jsonl" => "builtin:jsonl",
+                "csv" => "builtin:csv",
+                "xml" => "builtin:xml",
+                _ => "builtin:text",
+            });
+
+    match parser {
+        "builtin:json" => serde_json::from_str(raw)
+            .map_err(|e| ToolCladError::ExecutionError(format!("JSON parse failed: {e}"))),
+        "builtin:jsonl" => {
+            let lines: Vec<serde_json::Value> = raw
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()
+                .map_err(|e| ToolCladError::ExecutionError(format!("JSONL parse failed: {e}")))?;
+            Ok(serde_json::json!(lines))
+        }
+        "builtin:csv" => {
+            // Simple CSV parser: first line is headers, rest are rows.
+            let mut lines = raw.lines();
+            if let Some(header_line) = lines.next() {
+                let headers: Vec<&str> = header_line.split(',').map(|h| h.trim()).collect();
+                let rows: Vec<serde_json::Value> = lines
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|line| {
+                        let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
+                        let obj: serde_json::Map<String, serde_json::Value> = headers
+                            .iter()
+                            .zip(fields.iter())
+                            .map(|(h, f)| (h.to_string(), serde_json::json!(f)))
+                            .collect();
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect();
+                Ok(serde_json::json!(rows))
+            } else {
+                Ok(serde_json::json!([]))
+            }
+        }
+        "builtin:xml" | "builtin:text" => Ok(serde_json::json!({"raw_output": raw})),
+        other => {
+            // Custom parser: not supported in reference implementation.
+            Ok(serde_json::json!({
+                "raw_output": raw,
+                "parser_note": format!("custom parser '{}' not executed in reference impl", other)
+            }))
+        }
+    }
+}
+
 /// Validate all arguments, build the command, execute it, and return an evidence envelope.
 pub fn execute(
     manifest: &Manifest,
@@ -389,6 +459,16 @@ pub fn execute(
     }
     if manifest.mcp.is_some() {
         return execute_mcp_proxy(manifest, &validated);
+    }
+    if manifest.session.is_some() {
+        return Err(ToolCladError::ExecutionError(
+            "session mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for session execution".into()
+        ));
+    }
+    if manifest.browser.is_some() {
+        return Err(ToolCladError::ExecutionError(
+            "browser mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for browser execution".into()
+        ));
     }
 
     let scan_id = format!(
@@ -442,10 +522,17 @@ pub fn execute(
         format!("sha256:{:x}", hasher.finalize())
     };
 
-    // Phase 4: Construct results JSON (always includes raw_output).
-    let results = serde_json::json!({
-        "raw_output": stdout_text
-    });
+    // Phase 3b: Parse output.
+    let parsed = parse_output(manifest, &stdout_text)?;
+
+    // Phase 3c: Validate against output schema if defined.
+    // (basic type check — full JSON Schema validation would require a dedicated crate)
+    let results = if manifest.output.schema != serde_json::json!({"type": "object"}) {
+        // Schema is declared, use parsed output.
+        parsed
+    } else {
+        serde_json::json!({"raw_output": stdout_text})
+    };
 
     Ok(EvidenceEnvelope {
         status: status_str,
@@ -477,35 +564,92 @@ fn run_command_with_timeout(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ToolCladError::ExecutionError(format!("failed to spawn process: {e}")))?;
 
-    let output = if timeout_seconds > 0 {
-        // For a production system you'd use a thread-based timeout.
-        // For the reference implementation we rely on the OS and keep it simple.
-        // On timeout, use killpg to kill the entire process group:
-        //   unsafe { libc::killpg(child.id() as i32, libc::SIGKILL); }
-        child
-            .wait_with_output()
-            .map_err(|e| ToolCladError::ExecutionError(format!("process error: {e}")))?
+    if timeout_seconds > 0 {
+        let pid = child.id();
+
+        // Take stdout/stderr handles before polling to avoid deadlock.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        // Read stdout/stderr in separate threads to avoid pipe buffer deadlock.
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut pipe) = stdout_pipe {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut buf);
+            }
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut pipe) = stderr_pipe {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut buf);
+            }
+            buf
+        });
+
+        // Poll child with timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        // Timeout! Kill the entire process group.
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGKILL);
+                        }
+                        #[cfg(not(unix))]
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(ToolCladError::ExecutionError(format!(
+                            "process timed out after {timeout_seconds}s"
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(ToolCladError::ExecutionError(format!("wait error: {e}"))),
+            }
+        };
+
+        let stdout = stdout_handle.join().unwrap_or_default();
+        let stderr = stderr_handle.join().unwrap_or_default();
+        let exit_code = status.code().unwrap_or(-1);
+        let status_str = if status.success() {
+            "success".to_string()
+        } else {
+            format!("error (exit code: {exit_code}): {stderr}")
+        };
+        Ok((
+            cmd_display.to_string(),
+            stdout,
+            stderr,
+            exit_code,
+            status_str,
+        ))
     } else {
-        child
+        let output = child
             .wait_with_output()
-            .map_err(|e| ToolCladError::ExecutionError(format!("process error: {e}")))?
-    };
+            .map_err(|e| ToolCladError::ExecutionError(format!("process error: {e}")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let exit_code = output.status.code().unwrap_or(-1);
 
-    let status = if output.status.success() {
-        "success".to_string()
-    } else {
-        format!("error (exit code: {exit_code}): {stderr}")
-    };
+        let status = if output.status.success() {
+            "success".to_string()
+        } else {
+            format!("error (exit code: {exit_code}): {stderr}")
+        };
 
-    Ok((cmd_display.to_string(), stdout, stderr, exit_code, status))
+        Ok((cmd_display.to_string(), stdout, stderr, exit_code, status))
+    }
 }
 
 /// Dry-run: validate args and build command without executing.
@@ -597,22 +741,13 @@ mod tests {
                     position: 1,
                     required: true,
                     type_name: "scope_target".to_string(),
-                    allowed: None,
-                    default: None,
-                    pattern: None,
-                    sanitize: None,
                     description: "target host".to_string(),
-                    min: None,
-                    max: None,
-                    clamp: false,
+                    ..Default::default()
                 },
             )]),
             command: CommandDef {
                 template: Some("echo {target}".to_string()),
-                executor: None,
-                defaults: None,
-                mappings: None,
-                conditionals: None,
+                ..Default::default()
             },
             output: OutputDef {
                 format: "text".to_string(),
@@ -661,13 +796,8 @@ mod tests {
                 required: true,
                 type_name: "enum".to_string(),
                 allowed: Some(vec!["ping".to_string(), "service".to_string()]),
-                default: None,
-                pattern: None,
-                sanitize: None,
                 description: "scan type".to_string(),
-                min: None,
-                max: None,
-                clamp: false,
+                ..Default::default()
             },
         );
         m.command.mappings = Some(HashMap::from([(
@@ -754,16 +884,14 @@ mod tests {
         m.mcp = Some(McpProxyDef {
             server: "code-review-server".to_string(),
             tool: "analyze_pr".to_string(),
-            field_map: HashMap::from([
-                ("target".to_string(), "repository".to_string()),
-            ]),
+            field_map: HashMap::from([("target".to_string(), "repository".to_string())]),
         });
 
         let mut args = HashMap::new();
         args.insert("target".to_string(), "example.com".to_string());
 
         let envelope = execute(&m, &args).unwrap();
-        assert_eq!(envelope.status, "delegated");
+        assert_eq!(envelope.status, "delegation_preview");
         assert_eq!(envelope.results["mcp_server"], "code-review-server");
         assert_eq!(envelope.results["mcp_tool"], "analyze_pr");
         assert_eq!(

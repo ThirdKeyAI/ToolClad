@@ -7,6 +7,7 @@ pub struct Manifest {
     pub tool: ToolMeta,
     #[serde(default)]
     pub args: HashMap<String, ArgDef>,
+    #[serde(default)]
     pub command: CommandDef,
     pub output: OutputDef,
     pub http: Option<HttpDef>,
@@ -51,7 +52,7 @@ pub struct CedarMeta {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EvidenceMeta {
     pub output_dir: String,
-    #[serde(default = "default_true")]
+    #[serde(default)] // defaults to false, matching Python
     pub capture: bool,
     #[serde(default = "default_hash")]
     pub hash: String,
@@ -93,10 +94,14 @@ pub struct ArgDef {
     pub max: Option<i64>,
     #[serde(default)]
     pub clamp: bool,
+    #[serde(default)]
+    pub schemes: Vec<String>,
+    #[serde(default)]
+    pub scope_check: bool,
 }
 
 /// Command construction definition `[command]`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandDef {
     pub template: Option<String>,
     pub executor: Option<String>,
@@ -229,18 +234,34 @@ pub struct BrowserDef {
     /// "accessibility_tree" | "html" | "text"
     #[serde(default = "default_a11y")]
     pub extract_mode: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_10")]
     pub startup_timeout_seconds: u64,
-    #[serde(default = "default_1800")]
+    #[serde(default = "default_600")]
     pub session_timeout_seconds: u64,
-    #[serde(default = "default_300")]
+    #[serde(default = "default_120")]
     pub idle_timeout_seconds: u64,
-    #[serde(default = "default_100")]
+    #[serde(default = "default_200")]
     pub max_interactions: u32,
     pub scope: Option<BrowserScopeDef>,
     #[serde(default)]
     pub commands: HashMap<String, BrowserCommandDef>,
     pub state: Option<BrowserStateDef>,
+}
+
+fn default_10() -> u64 {
+    10
+}
+
+fn default_120() -> u64 {
+    120
+}
+
+fn default_200() -> u32 {
+    200
+}
+
+fn default_600() -> u64 {
+    600
 }
 
 fn default_cdp() -> String {

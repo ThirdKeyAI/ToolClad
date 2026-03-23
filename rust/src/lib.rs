@@ -50,13 +50,7 @@
 //!     allowed: Some(vec!["ping".into(), "service".into()]),
 //!     required: true,
 //!     position: 1,
-//!     default: None,
-//!     pattern: None,
-//!     sanitize: None,
-//!     description: String::new(),
-//!     min: None,
-//!     max: None,
-//!     clamp: false,
+//!     ..Default::default()
 //! };
 //!
 //! assert!(toolclad::validator::validate_arg("scan_type", &def, "ping").is_ok());
@@ -114,8 +108,7 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 
 /// Validate internal consistency of a parsed manifest.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
-    // Must have either a template, an executor, an HTTP backend, an MCP proxy,
-    // a session mode, or a browser mode.
+    // Must have at least one execution backend.
     if manifest.command.template.is_none()
         && manifest.command.executor.is_none()
         && manifest.http.is_none()
@@ -124,13 +117,19 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
         && manifest.browser.is_none()
     {
         return Err(ToolCladError::ManifestError(
-            "[command] must have either 'template' or 'executor', or an [http], [mcp], [session], or [browser] backend"
+            "manifest must define at least one execution backend: [command] template/executor, [http], [mcp], [session], or [browser]"
                 .to_string(),
         ));
     }
 
-    // Validate that enum args have an allowed list.
+    // Validate argument types and constraints.
     for (name, def) in &manifest.args {
+        if !validator::SUPPORTED_TYPES.contains(&def.type_name.as_str()) {
+            return Err(ToolCladError::ManifestError(format!(
+                "unknown type '{}' for argument '{}'",
+                def.type_name, name
+            )));
+        }
         if def.type_name == "enum" && def.allowed.is_none() {
             return Err(ToolCladError::ManifestError(format!(
                 "argument '{name}' is type 'enum' but has no 'allowed' list"
@@ -150,7 +149,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
     }
 
     // Validate risk_tier values.
-    let valid_tiers = ["low", "medium", "high", "critical"];
+    let valid_tiers = ["info", "low", "medium", "high", "critical"];
     if !valid_tiers.contains(&manifest.tool.risk_tier.as_str()) {
         return Err(ToolCladError::ManifestError(format!(
             "invalid risk_tier '{}', must be one of: {}",
@@ -233,7 +232,7 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "status": { "type": "string", "enum": ["success", "error"] },
+                "status": { "type": "string", "enum": ["success", "error", "timeout", "delegation_preview"] },
                 "scan_id": { "type": "string" },
                 "tool": { "type": "string" },
                 "command": { "type": "string" },
@@ -241,6 +240,8 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
                 "timestamp": { "type": "string", "format": "date-time" },
                 "output_file": { "type": "string" },
                 "output_hash": { "type": "string" },
+                "exit_code": { "type": "integer" },
+                "stderr": { "type": "string" },
                 "results": manifest.output.schema,
             }
         })
@@ -368,8 +369,6 @@ binary = "bad"
 description = "bad"
 risk_tier = "low"
 
-[command]
-
 [output]
 format = "text"
 
@@ -378,6 +377,8 @@ type = "object"
 "#;
         let result = parse_manifest(toml_str);
         assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("at least one execution backend"));
     }
 
     #[test]
@@ -611,7 +612,10 @@ type = "object"
         assert_eq!(m.tool.name, "psql_session");
         assert!(m.session.is_some());
         let session = m.session.as_ref().unwrap();
-        assert_eq!(session.startup_command, "psql -h localhost -U analyst analytics_db");
+        assert_eq!(
+            session.startup_command,
+            "psql -h localhost -U analyst analytics_db"
+        );
         assert_eq!(session.ready_pattern, "analytics_db=>");
         assert_eq!(session.startup_timeout_seconds, 15);
         assert_eq!(session.idle_timeout_seconds, 600);
@@ -693,7 +697,10 @@ type = "object"
         assert_eq!(browser.idle_timeout_seconds, 120);
         assert_eq!(browser.max_interactions, 50);
         let scope = browser.scope.as_ref().unwrap();
-        assert_eq!(scope.allowed_domains, vec!["example.com", "docs.example.com"]);
+        assert_eq!(
+            scope.allowed_domains,
+            vec!["example.com", "docs.example.com"]
+        );
         assert_eq!(scope.blocked_domains, vec!["evil.com"]);
         assert!(!scope.allow_external);
         assert!(browser.commands.contains_key("navigate"));
@@ -731,10 +738,10 @@ type = "object"
         assert!(browser.headless);
         assert_eq!(browser.connect, "launch");
         assert_eq!(browser.extract_mode, "accessibility_tree");
-        assert_eq!(browser.startup_timeout_seconds, 60);
-        assert_eq!(browser.session_timeout_seconds, 1800);
-        assert_eq!(browser.idle_timeout_seconds, 300);
-        assert_eq!(browser.max_interactions, 100);
+        assert_eq!(browser.startup_timeout_seconds, 10);
+        assert_eq!(browser.session_timeout_seconds, 600);
+        assert_eq!(browser.idle_timeout_seconds, 120);
+        assert_eq!(browser.max_interactions, 200);
     }
 
     #[test]
@@ -747,8 +754,6 @@ binary = "none"
 description = "HTTP-only tool"
 timeout_seconds = 30
 risk_tier = "low"
-
-[command]
 
 [http]
 method = "GET"
@@ -764,5 +769,6 @@ type = "object"
         let m = parse_manifest(toml_str).unwrap();
         assert!(m.http.is_some());
         assert!(m.command.template.is_none());
+        assert!(m.command.executor.is_none());
     }
 }

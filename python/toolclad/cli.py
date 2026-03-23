@@ -126,6 +126,8 @@ def schema(manifest_path: str) -> None:
                 "timestamp": {"type": "string", "format": "date-time"},
                 "output_file": {"type": "string"},
                 "output_hash": {"type": "string"},
+                "exit_code": {"type": "integer"},
+                "stderr": {"type": "string"},
                 "results": manifest.output.schema or {"type": "object"},
             },
         }

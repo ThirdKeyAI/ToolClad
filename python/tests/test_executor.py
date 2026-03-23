@@ -396,7 +396,7 @@ class TestMcpProxyExecution:
     def test_mcp_envelope_status_delegated(self):
         m = self._mcp_manifest()
         envelope = execute(m, {"target": "10.0.1.1", "port": "443"})
-        assert envelope["status"] == "delegated"
+        assert envelope["status"] == "delegation_preview"
 
     def test_mcp_envelope_has_server_and_tool(self):
         m = self._mcp_manifest()

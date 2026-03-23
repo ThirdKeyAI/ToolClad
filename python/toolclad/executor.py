@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -186,6 +188,48 @@ def inject_template_vars(template: str) -> str:
     return re.sub(r"\{_secret:([a-zA-Z0-9_]+)\}", replacer, template)
 
 
+def _parse_output(manifest: Manifest, raw: str) -> dict:
+    """Parse raw output according to manifest output format/parser."""
+    parser = manifest.output.parser or f"builtin:{manifest.output.format}"
+
+    if parser == "builtin:json":
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"JSON parse failed: {e}")
+
+    elif parser == "builtin:jsonl":
+        lines = [l for l in raw.strip().splitlines() if l.strip()]
+        try:
+            return [json.loads(l) for l in lines]
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"JSONL parse failed: {e}")
+
+    elif parser == "builtin:csv":
+        reader = csv.DictReader(io.StringIO(raw))
+        return list(reader)
+
+    elif parser == "builtin:xml":
+        # Return raw — full XML->JSON conversion is out of scope for reference impl
+        return {"raw_output": raw}
+
+    else:  # builtin:text or custom
+        return {"raw_output": raw}
+
+
+def _validate_output_schema(manifest: Manifest, parsed: Any) -> None:
+    """Validate parsed output against manifest output schema, if jsonschema is available."""
+    if not manifest.output.schema:
+        return
+    try:
+        import jsonschema
+        jsonschema.validate(instance=parsed, schema=manifest.output.schema)
+    except ImportError:
+        pass  # jsonschema not installed, skip validation
+    except jsonschema.ValidationError as e:
+        raise RuntimeError(f"Output schema validation failed: {e.message}")
+
+
 def _interpolate_http(template: str, args: Dict[str, str]) -> str:
     """Interpolate arg placeholders then resolve secret references."""
     result = _interpolate(template, args)
@@ -211,7 +255,11 @@ def _execute_http(
     headers = {k: _interpolate_http(v, args) for k, v in http.headers.items()}
     body: Optional[bytes] = None
     if http.body_template is not None:
-        body = _interpolate_http(http.body_template, args).encode("utf-8")
+        # JSON-escape values to prevent injection into JSON body
+        escaped_args = {k: json.dumps(v)[1:-1] for k, v in args.items()}  # strip quotes from json.dumps
+        body_str = _interpolate(http.body_template, escaped_args)
+        body_str = inject_template_vars(body_str)
+        body = body_str.encode("utf-8")
 
     envelope: Dict[str, Any] = {
         "status": "success",
@@ -285,7 +333,7 @@ def _execute_mcp_proxy(
             mapped_args[k] = v
 
     envelope: Dict[str, Any] = {
-        "status": "delegated",
+        "status": "delegation_preview",
         "scan_id": scan_id,
         "tool": manifest.tool.name,
         "command": f"mcp://{mcp.server}/{mcp.tool}",
@@ -329,6 +377,96 @@ def execute(
         return _execute_http(manifest, args, dry_run=dry_run, timeout=timeout)
     if manifest.mcp is not None:
         return _execute_mcp_proxy(manifest, args, dry_run=dry_run)
+
+    if manifest.session is not None:
+        raise RuntimeError(
+            "session mode is parsed but not yet executable in the reference implementation "
+            "— use the Symbiont runtime for session execution"
+        )
+    if manifest.browser is not None:
+        raise RuntimeError(
+            "browser mode is parsed but not yet executable in the reference implementation "
+            "— use the Symbiont runtime for browser execution"
+        )
+
+    # Handle custom executor escape hatch.
+    if manifest.command.executor:
+        # Validate args manually since build_command() isn't called for executor mode
+        validated_args: Dict[str, str] = {}
+        for arg_name, arg_def in manifest.args.items():
+            if arg_name in args:
+                validated_args[arg_name] = validate_arg(arg_def, args[arg_name])
+            elif arg_def.default is not None:
+                validated_args[arg_name] = str(arg_def.default)
+            elif arg_def.required:
+                raise ValidationError(f"Missing required argument: '{arg_name}'")
+
+        scan_id = _generate_scan_id()
+        effective_timeout = timeout or manifest.tool.timeout_seconds
+
+        env = os.environ.copy()
+        for k, v in validated_args.items():
+            env[f"TOOLCLAD_ARG_{k.upper()}"] = str(v)
+        env["TOOLCLAD_SCAN_ID"] = scan_id
+        env["TOOLCLAD_TOOL_NAME"] = manifest.tool.name
+
+        envelope: Dict[str, Any] = {
+            "status": "success",
+            "scan_id": scan_id,
+            "tool": manifest.tool.name,
+            "command": f"{manifest.command.executor} (custom executor)",
+            "duration_ms": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "output_file": "",
+            "output_hash": "",
+            "results": {},
+        }
+
+        if dry_run:
+            envelope["status"] = "dry_run"
+            return envelope
+
+        start = time.monotonic()
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [manifest.command.executor],
+                env=env,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                preexec_fn=os.setpgrp,
+            )
+            stdout, stderr = proc.communicate(timeout=effective_timeout)
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            envelope["duration_ms"] = elapsed_ms
+            envelope["exit_code"] = proc.returncode
+            envelope["stderr"] = stderr
+
+            if proc.returncode != 0:
+                envelope["status"] = "error"
+                envelope["results"] = {"returncode": proc.returncode, "stderr": stderr, "raw_output": stdout}
+            else:
+                try:
+                    parsed = _parse_output(manifest, stdout)
+                    envelope["results"] = parsed if isinstance(parsed, dict) else {"parsed_output": parsed}
+                except RuntimeError:
+                    envelope["results"] = {"raw_output": stdout}
+        except subprocess.TimeoutExpired:
+            if proc is not None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                proc.wait()
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            envelope["duration_ms"] = elapsed_ms
+            envelope["status"] = "timeout"
+            envelope["exit_code"] = -1
+            envelope["results"] = {"error": f"Custom executor timed out after {effective_timeout}s"}
+
+        return envelope
 
     scan_id = _generate_scan_id()
     tool_name = manifest.tool.name
@@ -404,7 +542,12 @@ def execute(
                 "raw_output": stdout,
             }
         else:
-            envelope["results"] = {"raw_output": stdout}
+            try:
+                parsed = _parse_output(manifest, stdout)
+                envelope["results"] = parsed if isinstance(parsed, dict) else {"parsed_output": parsed}
+                _validate_output_schema(manifest, parsed)
+            except RuntimeError:
+                envelope["results"] = {"raw_output": stdout}
 
     except subprocess.TimeoutExpired:
         # Kill the entire process group to reap child processes.

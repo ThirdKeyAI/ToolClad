@@ -3,10 +3,23 @@ use regex::Regex;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 
+/// Supported argument types for validation.
+pub const SUPPORTED_TYPES: &[&str] = &[
+    "string",
+    "integer",
+    "port",
+    "boolean",
+    "enum",
+    "scope_target",
+    "url",
+    "path",
+    "ip_address",
+    "cidr",
+];
+
 /// Shell metacharacters that are rejected by injection sanitization.
 const SHELL_METACHARACTERS: &[char] = &[
-    '\n', '\r',
-    ';', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
+    '\n', '\r', ';', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
 ];
 
 /// Compiled regex for IP address formats.
@@ -30,14 +43,8 @@ pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, Too
     let val = value.trim();
 
     // Apply injection sanitization if requested or for types that require it.
-    let needs_sanitize = def
-        .sanitize
-        .as_ref()
-        .map(|s| s.iter().any(|x| x == "injection"))
-        .unwrap_or(false);
-
     match def.type_name.as_str() {
-        "string" => validate_string(name, def, val, needs_sanitize),
+        "string" => validate_string(name, def, val, true),
         "integer" => validate_integer(name, def, val),
         "port" => validate_port(name, val),
         "boolean" => validate_boolean(name, val),
@@ -47,10 +54,10 @@ pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, Too
         "path" => validate_path(name, val),
         "ip_address" => validate_ip_address(name, val),
         "cidr" => validate_cidr(name, val),
-        _ => {
-            // Unknown type: treat as string with optional pattern.
-            validate_string(name, def, val, true)
-        }
+        _ => Err(ToolCladError::ValidationError(format!(
+            "unknown argument type '{}' for '{}'",
+            def.type_name, name
+        ))),
     }
 }
 
@@ -243,17 +250,8 @@ mod tests {
 
     fn make_arg(type_name: &str) -> ArgDef {
         ArgDef {
-            position: 0,
-            required: false,
             type_name: type_name.to_string(),
-            allowed: None,
-            default: None,
-            pattern: None,
-            sanitize: None,
-            description: String::new(),
-            min: None,
-            max: None,
-            clamp: false,
+            ..Default::default()
         }
     }
 
@@ -261,6 +259,26 @@ mod tests {
     fn test_string_passes() {
         let def = make_arg("string");
         assert!(validate_arg("test", &def, "hello-world").is_ok());
+    }
+
+    #[test]
+    fn test_string_metacharacters_rejected_by_default() {
+        // String type should reject shell metacharacters by default,
+        // even without explicit sanitize = ["injection"].
+        let def = make_arg("string");
+        assert!(validate_arg("test", &def, "hello; rm -rf /").is_err());
+        assert!(validate_arg("test", &def, "$(whoami)").is_err());
+        assert!(validate_arg("test", &def, "foo|bar").is_err());
+    }
+
+    #[test]
+    fn test_unknown_type_rejected() {
+        let def = make_arg("foobar");
+        assert!(validate_arg("test", &def, "anything").is_err());
+        let err = validate_arg("test", &def, "anything")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown argument type"));
     }
 
     #[test]
