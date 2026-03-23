@@ -9,7 +9,7 @@
 |-------|-------|
 | Name | ToolClad |
 | Description | Declarative CLI tool interface contracts for agentic runtimes |
-| Version | 0.5.1 |
+| Version | 0.5.2 |
 | License | MIT (spec), Apache 2.0 (Symbiont integration) |
 | Repository | https://github.com/ThirdKeyAI/ToolClad |
 
@@ -18,7 +18,7 @@
 ToolClad provides:
 
 - **Manifest parsing** — Load and validate `.clad.toml` tool interface contracts (oneshot, session, browser modes)
-- **Argument validation** — 14 typed validators (10 core + 4 extended) with shell injection sanitization
+- **Argument validation** — 14 built-in type validators with shell injection sanitization, plus custom types via `toolclad.toml`
 - **Five execution backends** — Shell command, HTTP API, MCP proxy, PTY session, CDP/Playwright browser
 - **HTTP backend** — REST/GraphQL API tools with `{_secret:name}` template variable injection
 - **MCP proxy backend** — Governed passthrough to upstream MCP servers with field mapping

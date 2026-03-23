@@ -44,7 +44,7 @@ type = "object"
 type = "string"
 ```
 
-The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command.
+The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command. The `[command]` section is optional for HTTP-only or MCP-only manifests.
 
 ## Security Model
 
@@ -62,6 +62,9 @@ The dangerous action cannot be expressed because the interface doesn't permit it
 - **Process group isolation**: Tools spawned in new PGID; timeout kills entire process group (no zombies)
 - **Absolute path blocking**: `path` type rejects `/etc/shadow`, `C:\...` style paths
 - **Newline injection blocking**: `\n` and `\r` rejected in all string-based types
+- **HTTP body JSON-escaping**: Values interpolated into HTTP body templates are JSON-escaped to prevent injection
+- **Platform-aware evidence directories**: Evidence output uses platform-appropriate temp directories
+- **HTTP error semantics**: 4xx responses map to `client_error`, 5xx to `server_error` in evidence envelopes
 - **No eval**: Conditional evaluators use closed-vocabulary parsers, never dynamic code execution
 
 ## Packages
@@ -86,12 +89,12 @@ npm install toolclad           # JavaScript / npm
 Each implementation provides:
 
 - **Manifest parsing** -- load and validate `.clad.toml` files (oneshot, session, browser modes)
-- **14 type validators** -- 10 core + 4 extended, all with injection sanitization
+- **14 built-in type validators** -- all with injection sanitization, plus custom types via `toolclad.toml`
 - **Command construction** -- template interpolation with mappings, conditionals, defaults
-- **Execution** -- direct argv dispatch, process group kill on timeout, SHA-256 evidence hashing
+- **Execution** -- direct argv dispatch, real timeout enforcement with process group kill, SHA-256 evidence hashing
 - **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
 - **Output schema validation** -- validates parsed results against `[output.schema]`
-- **MCP schema generation** -- auto-generate inputSchema + outputSchema for LLM tool use
+- **MCP schema generation** -- rich inputSchema + outputSchema with format/pattern constraints for LLM tool use
 - **Evidence envelopes** -- structured JSON with scan_id, timestamps, exit_code, stderr, output_hash
 - **CLI** -- `validate`, `run`, `schema`, `test` (dry run) subcommands
 

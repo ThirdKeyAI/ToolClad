@@ -1,6 +1,6 @@
 # ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes
 
-**Version**: 0.5.1  
+**Version**: 0.5.2
 **Status**: Release Candidate  
 **Author**: Jascha Wanger / ThirdKey AI  
 **Date**: 2026-03-21  
@@ -1980,6 +1980,19 @@ The 80/20 split from symbi-redteam confirms this: ~14 of 19 tools are pure templ
 ---
 
 ## Changelog
+
+### v0.5.2 (2026-03-22)
+
+- HTTP body JSON-escaping for injection safety in body templates
+- Platform-aware evidence directories (OS-appropriate temp dirs)
+- HTTP error semantics: 4xx maps to `client_error`, 5xx to `server_error`
+- Real timeout enforcement with process group kill across all implementations
+- Rich MCP schema generation with format/pattern constraints
+- `[command]` section is now optional for HTTP-only and MCP-only manifests
+- Custom types via `toolclad.toml` with `load_custom_types` and `validate_arg_with_custom_types` APIs
+- Full feature parity across Rust, Python, JavaScript, and Go implementations
+- All 14 built-in types fully implemented (no stubs)
+- All 5 output parsers (json, jsonl, csv, xml, text) fully implemented
 
 ### v0.5.1 (2026-03-21)
 

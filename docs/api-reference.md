@@ -60,6 +60,24 @@ assert!(toolclad::validator::validate_arg("scan_type", &def, "ping").is_ok());
 assert!(toolclad::validator::validate_arg("scan_type", &def, "exploit").is_err());
 ```
 
+#### `validator::validate_arg_with_custom_types(name, def, value, custom_types) -> Result<()>`
+
+Validate a single argument value against its type definition, resolving custom types from a loaded `toolclad.toml`. If the type is not a built-in type, it is looked up in `custom_types` and validated against the base type with any additional constraints.
+
+```rust
+let custom_types = toolclad::load_custom_types("toolclad.toml")?;
+toolclad::validator::validate_arg_with_custom_types("service", &def, "ssh", &custom_types)?;
+```
+
+#### `load_custom_types(path) -> Result<HashMap<String, CustomTypeDef>>`
+
+Load custom type definitions from a `toolclad.toml` file. Returns a map of type name to definition (base type + constraints).
+
+```rust
+let custom_types = toolclad::load_custom_types("toolclad.toml")?;
+// custom_types["service_protocol"] -> base: "enum", allowed: ["ssh", "ftp", ...]
+```
+
 #### `executor::build_command(manifest, args) -> Result<Vec<String>>`
 
 Construct the command argument array from a manifest and validated arguments. Does not execute. Returns the argv array that would be passed to `execve`.

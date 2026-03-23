@@ -2,7 +2,7 @@
 name: toolclad
 title: ToolClad
 description: Declarative tool interface contracts for agentic runtimes — oneshot CLI, interactive session (PTY), and browser (CDP/Playwright) modes with typed parameters, per-interaction Cedar gating, evidence envelopes
-version: 0.5.1
+version: 0.5.2
 ---
 
 # ToolClad Development Skills Guide
@@ -20,7 +20,7 @@ ToolClad is a declarative manifest format (`.clad.toml`) that defines the comple
 - **Browser**: Maintain a governed headless browser session where navigation, clicks, form submission, and JS execution are typed, scoped, and policy-gated via CDP/Playwright.
 
 All three modes share:
-- **Typed Parameters**: 10 built-in types with injection sanitization
+- **Typed Parameters**: 14 built-in types (10 core + 4 extended) with injection sanitization, plus custom types via `toolclad.toml`
 - **Per-Interaction Cedar Gating**: Every command/action evaluated against policies
 - **Evidence Envelopes**: Every execution wrapped in JSON with scan_id, timestamps, SHA-256 hash
 - **Scope Enforcement**: URL/target scope checking against allow-lists
@@ -108,6 +108,12 @@ description = "Tool output"
 | `path` | No traversal (`../`) | |
 | `ip_address` | Valid IPv4/IPv6 | |
 | `cidr` | Valid CIDR notation | |
+| `msf_options` | Semicolon-delimited `set KEY VALUE` | Metasploit options |
+| `credential_file` | Relative path + must exist | Username/password lists |
+| `duration` | Integer with suffix (`30`, `5m`, `2h`) | Timeout overrides |
+| `regex_match` | Matches declared `pattern` (required) | Module paths |
+
+Custom types can be defined in `toolclad.toml` at the project root with a `base` type and additional constraints.
 
 All types reject shell metacharacters (`;|&$\`(){}[]<>!`) by default.
 

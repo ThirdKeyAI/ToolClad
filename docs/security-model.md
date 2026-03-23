@@ -46,6 +46,24 @@ sh -c "nmap -sT -sV --max-rate 1000 10.0.1.0/24"
 
 Array-based execution means that even if a metacharacter somehow passed validation (it cannot, but defense in depth), the shell would never interpret it. There is no shell.
 
+## HTTP Body JSON-Escaping
+
+When values are interpolated into HTTP body templates (`[http].body_template`), they are JSON-escaped before substitution. This prevents injection attacks where an agent-supplied value could break out of a JSON string field and alter the structure of the request body. Quotes, backslashes, newlines, and control characters are all escaped.
+
+## Platform-Aware Evidence Directories
+
+Evidence output directories use platform-appropriate temporary directories (`/tmp` on Linux/macOS, `%TEMP%` on Windows) when no explicit `output_dir` is configured. This ensures evidence capture works correctly across operating systems without hardcoded paths.
+
+## HTTP Error Semantics
+
+HTTP backend responses are classified by status code:
+
+- **2xx**: `success` status in the evidence envelope
+- **4xx**: `client_error` status -- the request was malformed or unauthorized
+- **5xx**: `server_error` status -- the upstream service failed
+
+This classification gives LLM agents actionable error semantics for self-correction.
+
 ## Process Group Kill
 
 Tools are spawned in a new process group (PGID). When a timeout fires, the executor kills the entire process group, not just the top-level process. This prevents:
