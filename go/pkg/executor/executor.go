@@ -115,6 +115,15 @@ func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) 
 // Execute validates arguments, builds the command, executes it with a timeout,
 // captures output, and returns an EvidenceEnvelope.
 func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	// Route to HTTP backend
+	if m.Http != nil {
+		return ExecuteHTTP(m, args)
+	}
+	// Route to MCP proxy backend
+	if m.Mcp != nil {
+		return ExecuteMCP(m, args)
+	}
+	// Gate unimplemented modes
 	if m.Session != nil {
 		return nil, fmt.Errorf("session mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for session execution")
 	}
@@ -490,10 +499,8 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 	var required []string
 
 	for _, arg := range m.ArgsSorted() {
-		prop := map[string]any{
-			"type":        mcpType(arg.Type),
-			"description": arg.Description,
-		}
+		prop := mcpTypeConstraints(arg.Type)
+		prop["description"] = arg.Description
 		if len(arg.Allowed) > 0 {
 			prop["enum"] = arg.Allowed
 		}
@@ -542,14 +549,24 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 	return schema
 }
 
-// mcpType maps ToolClad types to JSON Schema types for MCP.
-func mcpType(t string) string {
+// mcpTypeConstraints maps ToolClad types to JSON Schema type and constraints for MCP.
+func mcpTypeConstraints(t string) map[string]any {
 	switch t {
-	case "integer", "port":
-		return "integer"
+	case "integer":
+		return map[string]any{"type": "integer"}
+	case "port":
+		return map[string]any{"type": "integer", "minimum": 1, "maximum": 65535}
 	case "boolean":
-		return "boolean"
+		return map[string]any{"type": "boolean"}
+	case "ip_address":
+		return map[string]any{"type": "string", "format": "ipv4"}
+	case "cidr":
+		return map[string]any{"type": "string", "pattern": `^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$`}
+	case "url":
+		return map[string]any{"type": "string", "format": "uri"}
+	case "duration":
+		return map[string]any{"type": "string", "pattern": `^(\d+|(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?)$`}
 	default:
-		return "string"
+		return map[string]any{"type": "string"}
 	}
 }

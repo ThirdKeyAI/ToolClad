@@ -77,6 +77,30 @@ def run(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
     click.echo(json.dumps(envelope, indent=2))
 
 
+def _mcp_type_and_constraints(arg) -> Tuple[str, dict]:
+    """Return (json_schema_type, extra_constraints) for an arg."""
+    t = arg.type
+    extra: dict = {}
+    if t == "integer":
+        return "integer", extra
+    if t == "port":
+        extra = {"minimum": 1, "maximum": 65535}
+        return "integer", extra
+    if t == "boolean":
+        return "boolean", extra
+    if t == "ip_address":
+        extra["format"] = "ipv4"
+    elif t == "cidr":
+        if not arg.pattern:
+            extra["pattern"] = r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$"
+    elif t == "url":
+        extra["format"] = "uri"
+    elif t == "duration":
+        if not arg.pattern:
+            extra["pattern"] = r"^(\d+|(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?)$"
+    return "string", extra
+
+
 @main.command()
 @click.argument("manifest_path", type=click.Path(exists=True))
 def schema(manifest_path: str) -> None:
@@ -91,13 +115,9 @@ def schema(manifest_path: str) -> None:
     properties: Dict[str, dict] = {}
     required: List[str] = []
     for arg in manifest.args_sorted:
-        prop: dict = {"type": "string", "description": arg.description}
-        if arg.type == "integer":
-            prop["type"] = "integer"
-        elif arg.type == "port":
-            prop["type"] = "integer"
-        elif arg.type == "boolean":
-            prop["type"] = "boolean"
+        json_type, extra = _mcp_type_and_constraints(arg)
+        prop: dict = {"type": json_type, "description": arg.description}
+        prop.update(extra)
         if arg.allowed:
             prop["enum"] = arg.allowed
         if arg.default is not None:

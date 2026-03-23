@@ -369,6 +369,172 @@ fn toml_value_to_string(val: &toml::Value) -> String {
     }
 }
 
+/// Split a CSV line respecting quoted fields and escaped quotes.
+fn split_csv_line(line: &str, delimiter: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if in_quotes {
+                // Check for escaped quote ""
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                in_quotes = true;
+            }
+        } else if c == delimiter && !in_quotes {
+            fields.push(current.clone());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+/// Simple XML to JSON conversion using a state-machine parser.
+///
+/// Produces nested structures: `{ "tag": { "@attr": "val", "#text": "content", "child": [...] } }`.
+/// For repeated child elements with the same tag name, values are collected into arrays.
+/// Falls back to `{"raw_output": ...}` on parse failure.
+fn parse_xml_to_json(xml: &str) -> Result<serde_json::Value, ToolCladError> {
+    let xml = xml.trim();
+    if xml.is_empty() {
+        return Ok(serde_json::json!({"raw_output": ""}));
+    }
+
+    // Strip XML declaration if present
+    let xml = if xml.starts_with("<?xml") {
+        if let Some(end) = xml.find("?>") {
+            xml[end + 2..].trim()
+        } else {
+            xml
+        }
+    } else {
+        xml
+    };
+
+    let attr_re = Regex::new(r#"(\w[\w\-.]*)\s*=\s*["']([^"']*)["']"#).unwrap();
+
+    let mut stack: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+    let mut current_name = String::new();
+    let mut current_obj = serde_json::Map::new();
+    let mut text_buf = String::new();
+    let mut pos = 0;
+    let bytes = xml.as_bytes();
+
+    while pos < bytes.len() {
+        if bytes[pos] == b'<' {
+            // Flush text
+            let text = text_buf.trim().to_string();
+            if !text.is_empty() && !current_name.is_empty() {
+                current_obj.insert("#text".to_string(), serde_json::json!(text));
+            }
+            text_buf.clear();
+
+            pos += 1;
+            if pos >= bytes.len() {
+                break;
+            }
+
+            if bytes[pos] == b'/' {
+                // Closing tag
+                pos += 1;
+                let tag_end = xml[pos..].find('>').map(|i| pos + i).unwrap_or(bytes.len());
+                pos = tag_end + 1;
+
+                let finished_obj = serde_json::Value::Object(std::mem::take(&mut current_obj));
+                if let Some((parent_name, mut parent_obj)) = stack.pop() {
+                    // Add to parent - if key exists, make it an array
+                    if parent_obj.contains_key(&current_name) {
+                        let existing = parent_obj.remove(&current_name).unwrap();
+                        if let serde_json::Value::Array(mut arr) = existing {
+                            arr.push(finished_obj);
+                            parent_obj.insert(current_name.clone(), serde_json::Value::Array(arr));
+                        } else {
+                            parent_obj.insert(
+                                current_name.clone(),
+                                serde_json::json!([existing, finished_obj]),
+                            );
+                        }
+                    } else {
+                        parent_obj.insert(current_name.clone(), finished_obj);
+                    }
+                    current_name = parent_name;
+                    current_obj = parent_obj;
+                }
+            } else if bytes[pos] == b'!' || bytes[pos] == b'?' {
+                // Comment or processing instruction - skip
+                let end = xml[pos..].find('>').map(|i| pos + i).unwrap_or(bytes.len());
+                pos = end + 1;
+            } else {
+                // Opening tag
+                let tag_end = xml[pos..].find('>').map(|i| pos + i).unwrap_or(bytes.len());
+                let tag_content = &xml[pos..tag_end];
+                let self_closing = tag_content.ends_with('/');
+                let tag_content = if self_closing {
+                    &tag_content[..tag_content.len() - 1]
+                } else {
+                    tag_content
+                };
+
+                // Parse tag name and attributes
+                let tag_name = tag_content
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let mut attrs = serde_json::Map::new();
+
+                let attr_str = tag_content[tag_name.len()..].trim();
+                for cap in attr_re.captures_iter(attr_str) {
+                    attrs.insert(format!("@{}", &cap[1]), serde_json::json!(&cap[2]));
+                }
+
+                if self_closing {
+                    let obj = serde_json::Value::Object(attrs);
+                    if current_obj.contains_key(&tag_name) {
+                        let existing = current_obj.remove(&tag_name).unwrap();
+                        if let serde_json::Value::Array(mut arr) = existing {
+                            arr.push(obj);
+                            current_obj.insert(tag_name, serde_json::Value::Array(arr));
+                        } else {
+                            current_obj.insert(tag_name, serde_json::json!([existing, obj]));
+                        }
+                    } else {
+                        current_obj.insert(tag_name, obj);
+                    }
+                } else {
+                    stack.push((current_name, current_obj));
+                    current_name = tag_name;
+                    current_obj = attrs;
+                }
+
+                pos = tag_end + 1;
+            }
+        } else {
+            text_buf.push(xml[pos..].chars().next().unwrap());
+            pos += xml[pos..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    if current_name.is_empty() {
+        Ok(serde_json::Value::Object(current_obj))
+    } else {
+        let mut root = serde_json::Map::new();
+        root.insert(current_name, serde_json::Value::Object(current_obj));
+        Ok(serde_json::Value::Object(root))
+    }
+}
+
 /// Parse raw command output according to the manifest's output format/parser.
 fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, ToolCladError> {
     let parser =
@@ -397,18 +563,43 @@ fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, Too
             Ok(serde_json::json!(lines))
         }
         "builtin:csv" => {
-            // Simple CSV parser: first line is headers, rest are rows.
             let mut lines = raw.lines();
             if let Some(header_line) = lines.next() {
-                let headers: Vec<&str> = header_line.split(',').map(|h| h.trim()).collect();
+                // Auto-detect delimiter: tab, pipe, comma
+                let delimiter = if header_line.contains('\t') {
+                    '\t'
+                } else if header_line.contains('|') && !header_line.contains(',') {
+                    '|'
+                } else {
+                    ','
+                };
+
+                let headers: Vec<String> = split_csv_line(header_line, delimiter)
+                    .iter()
+                    .map(|h| h.trim().to_string())
+                    .collect();
+
                 let rows: Vec<serde_json::Value> = lines
                     .filter(|l| !l.trim().is_empty())
                     .map(|line| {
-                        let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
+                        let fields = split_csv_line(line, delimiter);
                         let obj: serde_json::Map<String, serde_json::Value> = headers
                             .iter()
                             .zip(fields.iter())
-                            .map(|(h, f)| (h.to_string(), serde_json::json!(f)))
+                            .map(|(h, f)| {
+                                let f = f.trim();
+                                // Type inference
+                                let val = if let Ok(n) = f.parse::<i64>() {
+                                    serde_json::json!(n)
+                                } else if let Ok(n) = f.parse::<f64>() {
+                                    serde_json::json!(n)
+                                } else if f == "true" || f == "false" {
+                                    serde_json::json!(f == "true")
+                                } else {
+                                    serde_json::json!(f)
+                                };
+                                (h.to_string(), val)
+                            })
                             .collect();
                         serde_json::Value::Object(obj)
                     })
@@ -418,7 +609,8 @@ fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, Too
                 Ok(serde_json::json!([]))
             }
         }
-        "builtin:xml" | "builtin:text" => Ok(serde_json::json!({"raw_output": raw})),
+        "builtin:xml" => parse_xml_to_json(raw),
+        "builtin:text" => Ok(serde_json::json!({"raw_output": raw})),
         other => {
             // Custom parser: not supported in reference implementation.
             Ok(serde_json::json!({
@@ -898,5 +1090,53 @@ mod tests {
             envelope.results["mcp_arguments"]["repository"],
             "example.com"
         );
+    }
+
+    #[test]
+    fn test_parse_xml_simple() {
+        let xml = r#"<?xml version="1.0"?><root><item name="a">text</item><item name="b">more</item></root>"#;
+        let result = parse_xml_to_json(xml).unwrap();
+        assert!(result["root"]["item"].is_array());
+        assert_eq!(result["root"]["item"][0]["@name"], "a");
+        assert_eq!(result["root"]["item"][0]["#text"], "text");
+        assert_eq!(result["root"]["item"][1]["@name"], "b");
+        assert_eq!(result["root"]["item"][1]["#text"], "more");
+    }
+
+    #[test]
+    fn test_parse_xml_empty() {
+        let result = parse_xml_to_json("").unwrap();
+        assert_eq!(result["raw_output"], "");
+    }
+
+    #[test]
+    fn test_parse_xml_self_closing() {
+        let xml = r#"<root><item name="a"/><item name="b"/></root>"#;
+        let result = parse_xml_to_json(xml).unwrap();
+        assert!(result["root"]["item"].is_array());
+    }
+
+    #[test]
+    fn test_parse_csv_with_types() {
+        let result = split_csv_line("Alice,30,true", ',');
+        assert_eq!(result, vec!["Alice", "30", "true"]);
+    }
+
+    #[test]
+    fn test_split_csv_quoted() {
+        let result = split_csv_line(r#""hello, world",42,"test""#, ',');
+        assert_eq!(result, vec!["hello, world", "42", "test"]);
+    }
+
+    #[test]
+    fn test_split_csv_tab_delimiter() {
+        let result = split_csv_line("a\tb\tc", '\t');
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_split_csv_escaped_quotes() {
+        let result = split_csv_line(r#""he said ""hi""",val"#, ',');
+        assert_eq!(result, vec![r#"he said "hi""#, "val"]);
     }
 }

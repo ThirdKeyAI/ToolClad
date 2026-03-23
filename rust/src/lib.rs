@@ -211,13 +211,53 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
     for (name, def) in &args {
         let mut prop = serde_json::Map::new();
 
-        // Map ToolClad types to JSON Schema types.
-        let json_type = match def.type_name.as_str() {
-            "integer" | "port" => "integer",
-            "boolean" => "boolean",
-            _ => "string",
+        // Map ToolClad types to JSON Schema types with constraints.
+        match def.type_name.as_str() {
+            "integer" => {
+                prop.insert("type".to_string(), serde_json::json!("integer"));
+            }
+            "port" => {
+                prop.insert("type".to_string(), serde_json::json!("integer"));
+                if def.min.is_none() {
+                    prop.insert("minimum".to_string(), serde_json::json!(1));
+                }
+                if def.max.is_none() {
+                    prop.insert("maximum".to_string(), serde_json::json!(65535));
+                }
+            }
+            "boolean" => {
+                prop.insert("type".to_string(), serde_json::json!("boolean"));
+            }
+            "ip_address" => {
+                prop.insert("type".to_string(), serde_json::json!("string"));
+                prop.insert("format".to_string(), serde_json::json!("ipv4"));
+            }
+            "cidr" => {
+                prop.insert("type".to_string(), serde_json::json!("string"));
+                if def.pattern.is_none() {
+                    prop.insert(
+                        "pattern".to_string(),
+                        serde_json::json!(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$"),
+                    );
+                }
+            }
+            "url" => {
+                prop.insert("type".to_string(), serde_json::json!("string"));
+                prop.insert("format".to_string(), serde_json::json!("uri"));
+            }
+            "duration" => {
+                prop.insert("type".to_string(), serde_json::json!("string"));
+                if def.pattern.is_none() {
+                    prop.insert(
+                        "pattern".to_string(),
+                        serde_json::json!(r"^(\d+|(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?)$"),
+                    );
+                }
+            }
+            _ => {
+                prop.insert("type".to_string(), serde_json::json!("string"));
+            }
         };
-        prop.insert("type".to_string(), serde_json::json!(json_type));
 
         if !def.description.is_empty() {
             prop.insert(

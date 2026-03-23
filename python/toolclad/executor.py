@@ -188,6 +188,72 @@ def inject_template_vars(template: str) -> str:
     return re.sub(r"\{_secret:([a-zA-Z0-9_]+)\}", replacer, template)
 
 
+def _xml_element_to_dict(elem) -> dict:
+    """Convert an XML element to a dict recursively."""
+    result = {}
+    # Attributes
+    for k, v in elem.attrib.items():
+        result[f"@{k}"] = v
+    # Text content
+    if elem.text and elem.text.strip():
+        result["#text"] = elem.text.strip()
+    # Child elements
+    children: Dict[str, Any] = {}
+    for child in elem:
+        child_dict = _xml_element_to_dict(child)
+        tag = child.tag
+        if tag in children:
+            if not isinstance(children[tag], list):
+                children[tag] = [children[tag]]
+            children[tag].append(child_dict)
+        else:
+            children[tag] = child_dict
+    result.update(children)
+    return result
+
+
+def _parse_xml_to_json(raw: str) -> dict:
+    """Parse XML string to a JSON-compatible dict."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(raw)
+    return {root.tag: _xml_element_to_dict(root)}
+
+
+def _parse_csv(raw: str) -> list:
+    """Parse CSV with auto-delimiter detection and type inference."""
+    # Auto-detect delimiter
+    first_line = raw.split('\n', 1)[0]
+    if '\t' in first_line:
+        delimiter = '\t'
+    elif '|' in first_line and ',' not in first_line:
+        delimiter = '|'
+    else:
+        delimiter = ','
+
+    reader = csv.DictReader(io.StringIO(raw), delimiter=delimiter)
+    rows = []
+    for row in reader:
+        typed_row: Dict[str, Any] = {}
+        for k, v in row.items():
+            if v is None:
+                typed_row[k] = None
+                continue
+            v = v.strip()
+            # Type inference
+            if v.lower() in ('true', 'false'):
+                typed_row[k] = v.lower() == 'true'
+            else:
+                try:
+                    typed_row[k] = int(v)
+                except ValueError:
+                    try:
+                        typed_row[k] = float(v)
+                    except ValueError:
+                        typed_row[k] = v
+        rows.append(typed_row)
+    return rows
+
+
 def _parse_output(manifest: Manifest, raw: str) -> dict:
     """Parse raw output according to manifest output format/parser."""
     parser = manifest.output.parser or f"builtin:{manifest.output.format}"
@@ -206,12 +272,13 @@ def _parse_output(manifest: Manifest, raw: str) -> dict:
             raise RuntimeError(f"JSONL parse failed: {e}")
 
     elif parser == "builtin:csv":
-        reader = csv.DictReader(io.StringIO(raw))
-        return list(reader)
+        return _parse_csv(raw)
 
     elif parser == "builtin:xml":
-        # Return raw — full XML->JSON conversion is out of scope for reference impl
-        return {"raw_output": raw}
+        try:
+            return _parse_xml_to_json(raw)
+        except Exception:
+            return {"raw_output": raw}
 
     else:  # builtin:text or custom
         return {"raw_output": raw}

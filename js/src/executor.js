@@ -440,8 +440,9 @@ export function generateMcpSchema(manifest) {
 
   const argDefs = manifest.args || {};
   for (const [name, def] of Object.entries(argDefs)) {
+    const typeInfo = mcpTypeAndConstraints(def.type);
     const prop = {
-      type: mcpType(def.type),
+      ...typeInfo,
       description: def.description || "",
     };
     if (def.type === "enum" && def.allowed) {
@@ -474,15 +475,30 @@ export function generateMcpSchema(manifest) {
   return schema;
 }
 
-function mcpType(toolcladType) {
+function mcpTypeAndConstraints(toolcladType) {
   switch (toolcladType) {
     case "integer":
+      return { type: "integer" };
     case "port":
-      return "integer";
+      return { type: "integer", minimum: 1, maximum: 65535 };
     case "boolean":
-      return "boolean";
+      return { type: "boolean" };
+    case "ip_address":
+      return { type: "string", format: "ipv4" };
+    case "cidr":
+      return {
+        type: "string",
+        pattern: String.raw`^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$`,
+      };
+    case "url":
+      return { type: "string", format: "uri" };
+    case "duration":
+      return {
+        type: "string",
+        pattern: String.raw`^(\d+|(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?)$`,
+      };
     default:
-      return "string";
+      return { type: "string" };
   }
 }
 
