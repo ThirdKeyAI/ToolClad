@@ -42,3 +42,31 @@ export function loadManifest(path) {
 
   return manifest;
 }
+
+/**
+ * Load custom type definitions from a toolclad.toml file.
+ * @param {string} path - Path to toolclad.toml
+ * @returns {object} Map of type name to custom type definition
+ */
+export function loadCustomTypes(path) {
+  const content = readFileSync(path, "utf-8");
+  const config = TOML.parse(content);
+
+  const types = {};
+  if (config.types) {
+    for (const [name, def] of Object.entries(config.types)) {
+      if (!def.base) {
+        throw new Error(`Custom type '${name}' missing required 'base' field`);
+      }
+      types[name] = {
+        base: def.base,
+        allowed: def.allowed || undefined,
+        pattern: def.pattern || undefined,
+        min: def.min ?? undefined,
+        max: def.max ?? undefined,
+      };
+    }
+  }
+
+  return types;
+}

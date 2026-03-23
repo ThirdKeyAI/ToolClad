@@ -198,6 +198,18 @@ function evaluateSingleCondition(expr, context) {
  * @returns {object} Evidence envelope with results
  */
 export function execute(manifest, args, options = {}) {
+  // Gate unimplemented modes
+  if (manifest.session) {
+    throw new Error(
+      "session mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for session execution"
+    );
+  }
+  if (manifest.browser) {
+    throw new Error(
+      "browser mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for browser execution"
+    );
+  }
+
   const { command, resolvedArgs, isExecutor } = buildCommand(manifest, args);
 
   if (options.dryRun) {
@@ -406,7 +418,7 @@ export function executeMcp(manifest, args) {
   const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
 
   return {
-    status: "delegated",
+    status: "delegation_preview",
     scan_id: scanId,
     tool: manifest.tool.name,
     mcp_server: mcpDef.server,
@@ -485,6 +497,8 @@ function buildOutputSchema(manifest) {
         scan_id: { type: "string" },
         tool: { type: "string" },
         command: { type: "string" },
+        exit_code: { type: "integer" },
+        stderr: { type: "string" },
         duration_ms: { type: "integer" },
         timestamp: { type: "string", format: "date-time" },
         output_hash: { type: "string" },

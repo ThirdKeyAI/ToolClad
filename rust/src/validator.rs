@@ -15,6 +15,10 @@ pub const SUPPORTED_TYPES: &[&str] = &[
     "path",
     "ip_address",
     "cidr",
+    "msf_options",
+    "credential_file",
+    "duration",
+    "regex_match",
 ];
 
 /// Shell metacharacters that are rejected by injection sanitization.
@@ -54,6 +58,10 @@ pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, Too
         "path" => validate_path(name, val),
         "ip_address" => validate_ip_address(name, val),
         "cidr" => validate_cidr(name, val),
+        "msf_options" => validate_msf_options(name, def, val),
+        "credential_file" => validate_credential_file(name, def, val),
+        "duration" => validate_duration(name, def, val),
+        "regex_match" => validate_regex_match(name, def, val),
         _ => Err(ToolCladError::ValidationError(format!(
             "unknown argument type '{}' for '{}'",
             def.type_name, name
@@ -244,6 +252,137 @@ fn validate_cidr(name: &str, val: &str) -> Result<String, ToolCladError> {
     }
 }
 
+fn validate_msf_options(name: &str, _def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    let msf_key_re = Regex::new(r"^[A-Z][A-Z0-9_]*$").unwrap();
+    for pair in val.split(';') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = pair.splitn(2, ' ').collect();
+        if parts.len() != 2 {
+            return Err(ToolCladError::ValidationError(format!(
+                "argument '{name}' msf_options: invalid pair '{pair}' (expected 'KEY VALUE')"
+            )));
+        }
+        if !msf_key_re.is_match(parts[0]) {
+            return Err(ToolCladError::ValidationError(format!(
+                "argument '{name}' msf_options: invalid key '{}' (must be uppercase alphanumeric)",
+                parts[0]
+            )));
+        }
+        // Check value for injection (excluding ; which is the delimiter)
+        for ch in &[
+            '\n', '\r', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
+        ] {
+            if parts[1].contains(*ch) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' msf_options: value contains disallowed character '{ch}'"
+                )));
+            }
+        }
+    }
+    Ok(val.to_string())
+}
+
+fn validate_credential_file(name: &str, _def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    reject_injection(name, val)?;
+    if val.starts_with('/') || (val.len() >= 2 && val.as_bytes()[1] == b':') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must be a relative path"
+        )));
+    }
+    if val.contains("../") || val.contains("..\\") {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' path must not contain traversal sequences"
+        )));
+    }
+    let path = std::path::Path::new(val);
+    if !path.exists() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' credential file not found: {val}"
+        )));
+    }
+    if !path.is_file() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a file: {val}"
+        )));
+    }
+    Ok(val.to_string())
+}
+
+fn validate_duration(name: &str, _def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    // Try plain integer (seconds)
+    if val.parse::<u64>().is_ok() {
+        return Ok(val.to_string());
+    }
+    // Parse duration suffixes: ms, s, m, h
+    let duration_re = Regex::new(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?(?:(\d+)ms)?$").unwrap();
+    if !duration_re.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid duration (e.g. '30', '5m', '2h', '1h30m', '500ms')"
+        )));
+    }
+    Ok(val.to_string())
+}
+
+fn validate_regex_match(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    reject_injection(name, val)?;
+    let pat = def.pattern.as_ref().ok_or_else(|| {
+        ToolCladError::ManifestError(format!(
+            "argument '{name}' is type 'regex_match' but has no 'pattern' field"
+        ))
+    })?;
+    let re = Regex::new(pat)
+        .map_err(|e| ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}")))?;
+    if !re.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' does not match required pattern '{pat}'"
+        )));
+    }
+    Ok(val.to_string())
+}
+
+/// Validate an argument using custom type definitions.
+/// If the arg type matches a custom type, create a synthetic ArgDef from the custom type
+/// and delegate to the base type validator.
+pub fn validate_arg_with_custom_types(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+) -> Result<String, ToolCladError> {
+    // Check if the type is a custom type
+    if let Some(custom) = custom_types.get(&def.type_name) {
+        // Verify the base type is valid
+        if !SUPPORTED_TYPES.contains(&custom.base.as_str()) {
+            return Err(ToolCladError::ManifestError(format!(
+                "custom type '{}' has invalid base type '{}'",
+                def.type_name, custom.base
+            )));
+        }
+        // Create a synthetic ArgDef with the custom type's constraints merged
+        let mut synthetic = def.clone();
+        synthetic.type_name = custom.base.clone();
+        if let Some(ref allowed) = custom.allowed {
+            synthetic.allowed = Some(allowed.clone());
+        }
+        if let Some(ref pattern) = custom.pattern {
+            synthetic.pattern = Some(pattern.clone());
+        }
+        if let Some(min) = custom.min {
+            synthetic.min = Some(min);
+        }
+        if let Some(max) = custom.max {
+            synthetic.max = Some(max);
+        }
+        return validate_arg(name, &synthetic, value);
+    }
+
+    // Not a custom type, use standard validation
+    validate_arg(name, def, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +571,76 @@ mod tests {
         assert!(validate_arg("c", &def, "10.0.0.0/24").is_ok());
         assert!(validate_arg("c", &def, "10.0.0.0/33").is_err());
         assert!(validate_arg("c", &def, "10.0.0.0").is_err());
+    }
+
+    #[test]
+    fn test_msf_options_valid() {
+        let def = make_arg("msf_options");
+        assert!(validate_arg("opts", &def, "RHOSTS 10.0.1.1;RPORT 445").is_ok());
+    }
+
+    #[test]
+    fn test_msf_options_invalid_key() {
+        let def = make_arg("msf_options");
+        assert!(validate_arg("opts", &def, "rhosts 10.0.1.1").is_err()); // lowercase
+    }
+
+    #[test]
+    fn test_msf_options_injection() {
+        let def = make_arg("msf_options");
+        assert!(validate_arg("opts", &def, "RHOSTS $(whoami)").is_err());
+    }
+
+    #[test]
+    fn test_credential_file_rejects_absolute() {
+        let def = make_arg("credential_file");
+        assert!(validate_arg("f", &def, "/etc/shadow").is_err());
+    }
+
+    #[test]
+    fn test_credential_file_rejects_traversal() {
+        let def = make_arg("credential_file");
+        assert!(validate_arg("f", &def, "../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_duration_plain_seconds() {
+        let def = make_arg("duration");
+        assert_eq!(validate_arg("t", &def, "30").unwrap(), "30");
+    }
+
+    #[test]
+    fn test_duration_with_suffix() {
+        let def = make_arg("duration");
+        assert!(validate_arg("t", &def, "5m").is_ok());
+        assert!(validate_arg("t", &def, "2h").is_ok());
+        assert!(validate_arg("t", &def, "1h30m").is_ok());
+        assert!(validate_arg("t", &def, "500ms").is_ok());
+    }
+
+    #[test]
+    fn test_duration_invalid() {
+        let def = make_arg("duration");
+        assert!(validate_arg("t", &def, "abc").is_err());
+    }
+
+    #[test]
+    fn test_regex_match_valid() {
+        let mut def = make_arg("regex_match");
+        def.pattern = Some(r"^\d{3}-\d{4}$".to_string());
+        assert!(validate_arg("code", &def, "123-4567").is_ok());
+    }
+
+    #[test]
+    fn test_regex_match_invalid() {
+        let mut def = make_arg("regex_match");
+        def.pattern = Some(r"^\d{3}-\d{4}$".to_string());
+        assert!(validate_arg("code", &def, "abc").is_err());
+    }
+
+    #[test]
+    fn test_regex_match_no_pattern() {
+        let def = make_arg("regex_match");
+        assert!(validate_arg("code", &def, "anything").is_err()); // missing pattern
     }
 }

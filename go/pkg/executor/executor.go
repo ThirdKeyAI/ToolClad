@@ -115,6 +115,13 @@ func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) 
 // Execute validates arguments, builds the command, executes it with a timeout,
 // captures output, and returns an EvidenceEnvelope.
 func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	if m.Session != nil {
+		return nil, fmt.Errorf("session mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for session execution")
+	}
+	if m.Browser != nil {
+		return nil, fmt.Errorf("browser mode is parsed but not yet executable in the reference implementation — use the Symbiont runtime for browser execution")
+	}
+
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
 
@@ -465,7 +472,7 @@ func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope
 	}
 
 	return &EvidenceEnvelope{
-		Status:    "delegated",
+		Status:    "delegation_preview",
 		ScanID:    scanID,
 		Tool:      m.Tool.Name,
 		Timestamp: start.UTC().Format(time.RFC3339),
@@ -515,6 +522,21 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 
 	if len(m.Output.Schema) > 0 {
 		schema["outputSchema"] = m.Output.Schema
+	}
+
+	// Always include exit_code and stderr in the envelope schema.
+	schema["envelopeSchema"] = map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"exit_code": map[string]any{
+				"type":        "integer",
+				"description": "Process exit code (0 = success)",
+			},
+			"stderr": map[string]any{
+				"type":        "string",
+				"description": "Standard error output from the tool",
+			},
+		},
 	}
 
 	return schema

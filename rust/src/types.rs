@@ -346,3 +346,17 @@ impl std::fmt::Display for ToolCladError {
 }
 
 impl std::error::Error for ToolCladError {}
+
+/// Custom type definition from toolclad.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomTypeDef {
+    pub base: String,
+    #[serde(default)]
+    pub allowed: Option<Vec<String>>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub min: Option<i64>,
+    #[serde(default)]
+    pub max: Option<i64>,
+}

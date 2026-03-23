@@ -279,6 +279,94 @@ class TestInjectionSanitization:
 # Unknown type
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# msf_options
+# ---------------------------------------------------------------------------
+
+class TestMsfOptionsValidation:
+    def test_valid_options(self):
+        assert validate_arg(_arg("msf_options"), "RHOSTS 10.0.1.1;RPORT 445") == "RHOSTS 10.0.1.1;RPORT 445"
+
+    def test_invalid_key(self):
+        with pytest.raises(ValidationError, match="invalid key"):
+            validate_arg(_arg("msf_options"), "rhosts 10.0.1.1")
+
+    def test_injection_in_value(self):
+        with pytest.raises(ValidationError, match="disallowed"):
+            validate_arg(_arg("msf_options"), "RHOSTS $(whoami)")
+
+    def test_single_pair(self):
+        assert validate_arg(_arg("msf_options"), "RHOSTS 10.0.1.1") == "RHOSTS 10.0.1.1"
+
+
+# ---------------------------------------------------------------------------
+# credential_file
+# ---------------------------------------------------------------------------
+
+class TestCredentialFileValidation:
+    def test_absolute_rejected(self):
+        with pytest.raises(ValidationError, match="relative"):
+            validate_arg(_arg("credential_file"), "/etc/shadow")
+
+    def test_traversal_rejected(self):
+        with pytest.raises(ValidationError, match="traversal"):
+            validate_arg(_arg("credential_file"), "../../../etc/passwd")
+
+    def test_nonexistent(self):
+        with pytest.raises(ValidationError, match="not found"):
+            validate_arg(_arg("credential_file"), "nonexistent_file.txt")
+
+
+# ---------------------------------------------------------------------------
+# duration
+# ---------------------------------------------------------------------------
+
+class TestDurationValidation:
+    def test_plain_seconds(self):
+        assert validate_arg(_arg("duration"), "30") == "30"
+
+    def test_minutes(self):
+        assert validate_arg(_arg("duration"), "5m") == "5m"
+
+    def test_hours(self):
+        assert validate_arg(_arg("duration"), "2h") == "2h"
+
+    def test_combined(self):
+        assert validate_arg(_arg("duration"), "1h30m") == "1h30m"
+
+    def test_milliseconds(self):
+        assert validate_arg(_arg("duration"), "500ms") == "500ms"
+
+    def test_invalid(self):
+        with pytest.raises(ValidationError, match="Invalid duration"):
+            validate_arg(_arg("duration"), "abc")
+
+
+# ---------------------------------------------------------------------------
+# regex_match
+# ---------------------------------------------------------------------------
+
+class TestRegexMatchValidation:
+    def test_valid_match(self):
+        ad = _arg("regex_match")
+        ad.pattern = r"^\d{3}-\d{4}$"
+        assert validate_arg(ad, "123-4567") == "123-4567"
+
+    def test_no_match(self):
+        ad = _arg("regex_match")
+        ad.pattern = r"^\d{3}-\d{4}$"
+        with pytest.raises(ValidationError, match="does not match"):
+            validate_arg(ad, "abc")
+
+    def test_missing_pattern(self):
+        with pytest.raises(ValidationError, match="requires.*pattern"):
+            validate_arg(_arg("regex_match"), "anything")
+
+
+# ---------------------------------------------------------------------------
+# Unknown type
+# ---------------------------------------------------------------------------
+
 class TestUnknownType:
     def test_unknown_type_raises(self):
         with pytest.raises(ValidationError, match="Unknown type"):

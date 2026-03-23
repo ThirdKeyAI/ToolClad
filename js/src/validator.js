@@ -1,3 +1,5 @@
+import { existsSync, statSync } from "node:fs";
+
 /**
  * Shell metacharacters that indicate injection attempts.
  */
@@ -45,6 +47,10 @@ const TYPE_HANDLERS = {
   path: validatePath,
   ip_address: validateIpAddress,
   cidr: validateCidr,
+  msf_options: validateMsfOptions,
+  credential_file: validateCredentialFile,
+  duration: validateDuration,
+  regex_match: validateRegexMatch,
 };
 
 function validateString(argDef, value) {
@@ -198,4 +204,106 @@ function validateCidr(argDef, value) {
     }
   }
   return str;
+}
+
+function validateMsfOptions(argDef, value) {
+  const str = String(value);
+  const keyRe = /^[A-Z][A-Z0-9_]*$/;
+  const metacharNoSemi = /[|&$`(){}[\]!#<>\n\r]/;
+  for (const pair of str.split(";")) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const spaceIdx = trimmed.indexOf(" ");
+    if (spaceIdx === -1) {
+      throw new Error(
+        `msf_options: invalid pair '${trimmed}' (expected 'KEY VALUE')`
+      );
+    }
+    const key = trimmed.substring(0, spaceIdx);
+    const val = trimmed.substring(spaceIdx + 1);
+    if (!keyRe.test(key)) {
+      throw new Error(
+        `msf_options: invalid key '${key}' (must be uppercase alphanumeric)`
+      );
+    }
+    if (metacharNoSemi.test(val)) {
+      throw new Error(`msf_options: value contains disallowed characters`);
+    }
+  }
+  return str;
+}
+
+function validateCredentialFile(argDef, value) {
+  const str = String(value);
+  checkInjection(str);
+  if (str.startsWith("/") || (str.length >= 2 && str[1] === ":")) {
+    throw new Error(`Credential file must be a relative path: ${str}`);
+  }
+  if (str.includes("../") || str.includes("..\\")) {
+    throw new Error(`Path traversal not allowed: ${str}`);
+  }
+  if (!existsSync(str)) {
+    throw new Error(`Credential file not found: ${str}`);
+  }
+  if (!statSync(str).isFile()) {
+    throw new Error(`Not a file: ${str}`);
+  }
+  return str;
+}
+
+function validateDuration(argDef, value) {
+  const str = String(value);
+  // Plain integer seconds
+  if (/^\d+$/.test(str)) return str;
+  // Duration with suffix
+  if (/^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$/.test(str) && str.length > 0)
+    return str;
+  throw new Error(
+    `Invalid duration: '${str}' (e.g. '30', '5m', '2h', '1h30m', '500ms')`
+  );
+}
+
+function validateRegexMatch(argDef, value) {
+  const str = String(value);
+  checkInjection(str);
+  if (!argDef.pattern) {
+    throw new Error("regex_match type requires a 'pattern' field");
+  }
+  const re = new RegExp(argDef.pattern);
+  if (!re.test(str)) {
+    throw new Error(
+      `Value '${str}' does not match required pattern: ${argDef.pattern}`
+    );
+  }
+  return str;
+}
+
+/**
+ * Validate an argument using custom type definitions.
+ * @param {object} argDef - Argument definition
+ * @param {*} value - Value to validate
+ * @param {object} customTypes - Map of custom type name to definition
+ * @returns {*} Validated value
+ */
+export function validateArgWithCustomTypes(argDef, value, customTypes) {
+  if (customTypes && customTypes[argDef.type]) {
+    const custom = customTypes[argDef.type];
+    const handler = TYPE_HANDLERS[custom.base];
+    if (!handler) {
+      throw new Error(
+        `Custom type '${argDef.type}' has invalid base type '${custom.base}'`
+      );
+    }
+    // Merge custom type constraints into a synthetic argDef
+    const synthetic = {
+      ...argDef,
+      type: custom.base,
+      allowed: custom.allowed || argDef.allowed,
+      pattern: custom.pattern || argDef.pattern,
+      min: custom.min ?? argDef.min,
+      max: custom.max ?? argDef.max,
+    };
+    return handler(synthetic, value);
+  }
+  return validateArg(argDef, value);
 }

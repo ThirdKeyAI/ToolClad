@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Any, List
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from toolclad.manifest import ArgDef
@@ -169,6 +169,65 @@ def _validate_cidr(arg_def: ArgDef, value: str) -> str:
     return value
 
 
+def _validate_msf_options(arg_def: ArgDef, value: str) -> str:
+    import re as _re
+    key_re = _re.compile(r'^[A-Z][A-Z0-9_]*$')
+    # Don't use _check_injection on the whole value since ; is a valid delimiter
+    metachar_no_semi = set("|&$`(){}[]<>!\n\r")
+    for pair in value.split(';'):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(' ', 1)
+        if len(parts) != 2:
+            raise ValidationError(f"msf_options: invalid pair '{pair}' (expected 'KEY VALUE')")
+        key, val = parts
+        if not key_re.match(key):
+            raise ValidationError(f"msf_options: invalid key '{key}' (must be uppercase alphanumeric)")
+        found = set(val) & metachar_no_semi
+        if found:
+            chars = ", ".join(sorted(repr(c) for c in found))
+            raise ValidationError(f"msf_options: value contains disallowed characters: {chars}")
+    return value
+
+
+def _validate_credential_file(arg_def: ArgDef, value: str) -> str:
+    _check_injection(value)
+    if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
+        raise ValidationError(f"Credential file must be a relative path: {value}")
+    if ".." in value.split("/") or ".." in value.split("\\"):
+        raise ValidationError(f"Path traversal detected: {value}")
+    import os
+    if not os.path.exists(value):
+        raise ValidationError(f"Credential file not found: {value}")
+    if not os.path.isfile(value):
+        raise ValidationError(f"Not a file: {value}")
+    return value
+
+
+def _validate_duration(arg_def: ArgDef, value: str) -> str:
+    import re as _re
+    # Plain integer seconds
+    try:
+        int(value)
+        return value
+    except ValueError:
+        pass
+    # Duration with suffix
+    if not _re.match(r'^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$', value) or value == '':
+        raise ValidationError(f"Invalid duration: {value!r} (e.g. '30', '5m', '2h', '1h30m', '500ms')")
+    return value
+
+
+def _validate_regex_match(arg_def: ArgDef, value: str) -> str:
+    _check_injection(value)
+    if not arg_def.pattern:
+        raise ValidationError("regex_match type requires a 'pattern' field")
+    if not re.match(arg_def.pattern, value):
+        raise ValidationError(f"Value {value!r} does not match required pattern: {arg_def.pattern}")
+    return value
+
+
 # Registry of type handlers.
 _TYPE_HANDLERS = {
     "string": _validate_string,
@@ -181,6 +240,10 @@ _TYPE_HANDLERS = {
     "path": _validate_path,
     "ip_address": _validate_ip_address,
     "cidr": _validate_cidr,
+    "msf_options": _validate_msf_options,
+    "credential_file": _validate_credential_file,
+    "duration": _validate_duration,
+    "regex_match": _validate_regex_match,
 }
 
 SUPPORTED_TYPES: List[str] = sorted(_TYPE_HANDLERS.keys())
@@ -206,3 +269,44 @@ def validate_arg(arg_def: ArgDef, value: Any) -> str:
         raise ValidationError(f"Unknown type: {arg_def.type!r}")
 
     return handler(arg_def, str_value)
+
+
+def validate_arg_with_custom_types(
+    arg_def: ArgDef,
+    value: Any,
+    custom_types: Dict[str, "CustomTypeDef"],
+) -> str:
+    """Validate using custom type definitions.
+
+    If the arg type matches a custom type, create a synthetic ArgDef
+    from the custom type and delegate to the base type validator.
+    """
+    from toolclad.manifest import CustomTypeDef  # avoid circular import  # noqa: F811
+
+    if arg_def.type in custom_types:
+        custom = custom_types[arg_def.type]
+        handler = _TYPE_HANDLERS.get(custom.base)
+        if handler is None:
+            raise ValidationError(f"Custom type '{arg_def.type}' has invalid base type '{custom.base}'")
+
+        # Create synthetic ArgDef with custom type constraints merged
+        synthetic = ArgDef(
+            name=arg_def.name,
+            position=arg_def.position,
+            required=arg_def.required,
+            type=custom.base,
+            description=arg_def.description,
+            default=arg_def.default,
+            allowed=custom.allowed or arg_def.allowed,
+            pattern=custom.pattern or arg_def.pattern,
+            min=custom.min if custom.min is not None else arg_def.min,
+            max=custom.max if custom.max is not None else arg_def.max,
+            clamp=arg_def.clamp,
+            sanitize=arg_def.sanitize,
+            schemes=arg_def.schemes,
+            scope_check=arg_def.scope_check,
+        )
+        return handler(synthetic, str(value))
+
+    # Not a custom type, use standard validation
+    return validate_arg(arg_def, value)

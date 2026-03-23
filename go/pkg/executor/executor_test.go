@@ -436,8 +436,8 @@ func TestExecuteMCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if env.Status != "delegated" {
-		t.Errorf("expected status 'delegated', got %q", env.Status)
+	if env.Status != "delegation_preview" {
+		t.Errorf("expected status 'delegation_preview', got %q", env.Status)
 	}
 	if env.Results["mcp_server"] != "mcp://security-tools.example.com" {
 		t.Errorf("unexpected mcp_server: %v", env.Results["mcp_server"])
@@ -478,8 +478,8 @@ func TestExecuteMCPNoFieldMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if env.Status != "delegated" {
-		t.Errorf("expected status 'delegated', got %q", env.Status)
+	if env.Status != "delegation_preview" {
+		t.Errorf("expected status 'delegation_preview', got %q", env.Status)
 	}
 	mappedArgs, ok := env.Results["mapped_args"].(map[string]any)
 	if !ok {

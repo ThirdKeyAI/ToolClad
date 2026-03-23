@@ -86,8 +86,9 @@ pub mod executor;
 pub mod types;
 pub mod validator;
 
+use std::collections::HashMap;
 use std::path::Path;
-use types::{Manifest, ToolCladError};
+use types::{CustomTypeDef, Manifest, ToolCladError};
 
 /// Load and parse a `.clad.toml` manifest from the given path.
 pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, ToolCladError> {
@@ -159,6 +160,43 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
     }
 
     Ok(())
+}
+
+/// Load custom type definitions from a toolclad.toml file.
+pub fn load_custom_types<P: AsRef<Path>>(
+    path: P,
+) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    let content = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| ToolCladError::ManifestError(format!("failed to read toolclad.toml: {e}")))?;
+    let config: toml::Value = toml::from_str(&content).map_err(|e| {
+        ToolCladError::ManifestError(format!("TOML parse error in toolclad.toml: {e}"))
+    })?;
+
+    let mut types = HashMap::new();
+    if let Some(types_table) = config.get("types").and_then(|t| t.as_table()) {
+        for (name, def) in types_table {
+            let base = def.get("base").and_then(|b| b.as_str()).ok_or_else(|| {
+                ToolCladError::ManifestError(format!("custom type '{name}' missing 'base' field"))
+            })?;
+
+            let custom = CustomTypeDef {
+                base: base.to_string(),
+                allowed: def.get("allowed").and_then(|a| a.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                }),
+                pattern: def
+                    .get("pattern")
+                    .and_then(|p| p.as_str())
+                    .map(String::from),
+                min: def.get("min").and_then(|m| m.as_integer()),
+                max: def.get("max").and_then(|m| m.as_integer()),
+            };
+            types.insert(name.clone(), custom);
+        }
+    }
+    Ok(types)
 }
 
 /// Generate an MCP-compatible JSON schema from a manifest.

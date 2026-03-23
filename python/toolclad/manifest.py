@@ -405,6 +405,41 @@ def _parse_browser(data: Dict[str, Any]) -> BrowserDef:
     return browser
 
 
+@dataclass
+class CustomTypeDef:
+    """Custom type definition from toolclad.toml."""
+
+    base: str = ""
+    allowed: List[str] = field(default_factory=list)
+    pattern: str = ""
+    min: Optional[int] = None
+    max: Optional[int] = None
+
+
+def load_custom_types(path: str) -> Dict[str, CustomTypeDef]:
+    """Load custom type definitions from a toolclad.toml file.
+
+    Returns a dict mapping type name to CustomTypeDef.
+    """
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+
+    with open(file_path, "rb") as f:
+        data = tomllib.load(f)
+
+    types = {}
+    for name, tdef in data.get("types", {}).items():
+        types[name] = CustomTypeDef(
+            base=tdef.get("base", ""),
+            allowed=tdef.get("allowed", []),
+            pattern=tdef.get("pattern", ""),
+            min=tdef.get("min"),
+            max=tdef.get("max"),
+        )
+    return types
+
+
 def load_manifest(path: str) -> Manifest:
     """Parse a .clad.toml file and return a Manifest.
 

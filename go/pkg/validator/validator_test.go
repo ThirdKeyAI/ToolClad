@@ -94,10 +94,10 @@ func TestValidateArg(t *testing.T) {
 			want:  "443",
 		},
 		{
-			name:  "port/zero",
-			def:   &manifest.ArgDef{Name: "p", Type: "port"},
-			value: "0",
-			want:  "0",
+			name:    "port/zero",
+			def:     &manifest.ArgDef{Name: "p", Type: "port"},
+			value:   "0",
+			wantErr: true,
 		},
 		{
 			name:    "port/negative",
@@ -230,10 +230,16 @@ func TestValidateArg(t *testing.T) {
 
 		// --- path ---
 		{
-			name:  "path/valid",
+			name:  "path/valid_relative",
 			def:   &manifest.ArgDef{Name: "f", Type: "path"},
-			value: "/usr/share/wordlists/rockyou.txt",
-			want:  "/usr/share/wordlists/rockyou.txt",
+			value: "wordlists/rockyou.txt",
+			want:  "wordlists/rockyou.txt",
+		},
+		{
+			name:    "path/absolute_rejected",
+			def:     &manifest.ArgDef{Name: "f", Type: "path"},
+			value:   "/usr/share/wordlists/rockyou.txt",
+			wantErr: true,
 		},
 		{
 			name:    "path/traversal",
@@ -282,6 +288,116 @@ func TestValidateArg(t *testing.T) {
 			wantErr: true,
 		},
 
+		// --- msf_options ---
+		{
+			name:  "msf_options/valid single",
+			def:   &manifest.ArgDef{Name: "opts", Type: "msf_options"},
+			value: "RHOSTS 192.168.1.1",
+			want:  "RHOSTS 192.168.1.1",
+		},
+		{
+			name:  "msf_options/valid multiple",
+			def:   &manifest.ArgDef{Name: "opts", Type: "msf_options"},
+			value: "RHOSTS 192.168.1.1; RPORT 445",
+			want:  "RHOSTS 192.168.1.1; RPORT 445",
+		},
+		{
+			name:    "msf_options/invalid key lowercase",
+			def:     &manifest.ArgDef{Name: "opts", Type: "msf_options"},
+			value:   "rhosts 192.168.1.1",
+			wantErr: true,
+		},
+		{
+			name:    "msf_options/missing value",
+			def:     &manifest.ArgDef{Name: "opts", Type: "msf_options"},
+			value:   "RHOSTS",
+			wantErr: true,
+		},
+		{
+			name:    "msf_options/pipe in value",
+			def:     &manifest.ArgDef{Name: "opts", Type: "msf_options"},
+			value:   "RHOSTS foo|bar",
+			wantErr: true,
+		},
+
+		// --- credential_file ---
+		{
+			name:    "credential_file/absolute path",
+			def:     &manifest.ArgDef{Name: "cred", Type: "credential_file"},
+			value:   "/etc/shadow",
+			wantErr: true,
+		},
+		{
+			name:    "credential_file/path traversal",
+			def:     &manifest.ArgDef{Name: "cred", Type: "credential_file"},
+			value:   "creds/../../../etc/shadow",
+			wantErr: true,
+		},
+		{
+			name:    "credential_file/nonexistent",
+			def:     &manifest.ArgDef{Name: "cred", Type: "credential_file"},
+			value:   "nonexistent_file.txt",
+			wantErr: true,
+		},
+
+		// --- duration ---
+		{
+			name:  "duration/plain seconds",
+			def:   &manifest.ArgDef{Name: "d", Type: "duration"},
+			value: "30",
+			want:  "30",
+		},
+		{
+			name:  "duration/minutes",
+			def:   &manifest.ArgDef{Name: "d", Type: "duration"},
+			value: "5m",
+			want:  "5m",
+		},
+		{
+			name:  "duration/hours and minutes",
+			def:   &manifest.ArgDef{Name: "d", Type: "duration"},
+			value: "1h30m",
+			want:  "1h30m",
+		},
+		{
+			name:  "duration/milliseconds",
+			def:   &manifest.ArgDef{Name: "d", Type: "duration"},
+			value: "500ms",
+			want:  "500ms",
+		},
+		{
+			name:    "duration/invalid",
+			def:     &manifest.ArgDef{Name: "d", Type: "duration"},
+			value:   "five minutes",
+			wantErr: true,
+		},
+		{
+			name:    "duration/empty",
+			def:     &manifest.ArgDef{Name: "d", Type: "duration"},
+			value:   "",
+			wantErr: true,
+		},
+
+		// --- regex_match ---
+		{
+			name:  "regex_match/valid",
+			def:   &manifest.ArgDef{Name: "r", Type: "regex_match", Pattern: `^[a-z0-9_]+$`},
+			value: "hello_world",
+			want:  "hello_world",
+		},
+		{
+			name:    "regex_match/no match",
+			def:     &manifest.ArgDef{Name: "r", Type: "regex_match", Pattern: `^[a-z0-9_]+$`},
+			value:   "HELLO",
+			wantErr: true,
+		},
+		{
+			name:    "regex_match/no pattern",
+			def:     &manifest.ArgDef{Name: "r", Type: "regex_match"},
+			value:   "anything",
+			wantErr: true,
+		},
+
 		// --- unknown type ---
 		{
 			name:    "unknown type",
@@ -294,6 +410,87 @@ func TestValidateArg(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ValidateArg(tt.def, tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil (value=%q)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateArgWithCustomTypes(t *testing.T) {
+	customTypes := map[string]*manifest.CustomTypeDef{
+		"severity": {
+			Base:    "enum",
+			Allowed: []string{"low", "medium", "high", "critical"},
+		},
+		"bounded_int": {
+			Base: "integer",
+			Min:  intPtr(1),
+			Max:  intPtr(100),
+		},
+	}
+
+	tests := []struct {
+		name    string
+		def     *manifest.ArgDef
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "custom enum type valid",
+			def:   &manifest.ArgDef{Name: "sev", Type: "severity"},
+			value: "high",
+			want:  "high",
+		},
+		{
+			name:    "custom enum type invalid",
+			def:     &manifest.ArgDef{Name: "sev", Type: "severity"},
+			value:   "unknown",
+			wantErr: true,
+		},
+		{
+			name:  "custom integer type valid",
+			def:   &manifest.ArgDef{Name: "num", Type: "bounded_int"},
+			value: "50",
+			want:  "50",
+		},
+		{
+			name:    "custom integer type out of range",
+			def:     &manifest.ArgDef{Name: "num", Type: "bounded_int"},
+			value:   "200",
+			wantErr: true,
+		},
+		{
+			name:  "fallback to builtin type",
+			def:   &manifest.ArgDef{Name: "p", Type: "port"},
+			value: "443",
+			want:  "443",
+		},
+		{
+			name:    "custom type with invalid base",
+			def:     &manifest.ArgDef{Name: "x", Type: "bad_custom"},
+			value:   "anything",
+			wantErr: true,
+		},
+	}
+
+	// Add a custom type with invalid base for testing
+	customTypes["bad_custom"] = &manifest.CustomTypeDef{Base: "nonexistent"}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ValidateArgWithCustomTypes(tt.def, tt.value, customTypes)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error, got nil (value=%q)", got)

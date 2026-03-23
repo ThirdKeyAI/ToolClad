@@ -266,7 +266,7 @@ describe("executeMcp", () => {
     };
 
     const result = executeMcp(manifest, { target: "10.0.1.1", scan_type: "ping" });
-    assert.equal(result.status, "delegated");
+    assert.equal(result.status, "delegation_preview");
     assert.equal(result.mcp_server, "mcp://security-tools.example.com");
     assert.equal(result.mcp_tool, "remote_scan");
     assert.equal(result.mapped_args.host, "10.0.1.1");
@@ -293,7 +293,7 @@ describe("executeMcp", () => {
     };
 
     const result = executeMcp(manifest, { msg: "hello" });
-    assert.equal(result.status, "delegated");
+    assert.equal(result.status, "delegation_preview");
     assert.equal(result.mapped_args.msg, "hello");
   });
 

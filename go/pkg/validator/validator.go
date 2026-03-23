@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -66,11 +67,15 @@ var typeHandlers = map[string]typeHandler{
 	"port":         validatePort,
 	"boolean":      validateBoolean,
 	"enum":         validateEnum,
-	"scope_target": validateScopeTarget,
-	"url":          validateURL,
-	"path":         validatePath,
-	"ip_address":   validateIPAddress,
-	"cidr":         validateCIDR,
+	"scope_target":   validateScopeTarget,
+	"url":            validateURL,
+	"path":           validatePath,
+	"ip_address":     validateIPAddress,
+	"cidr":           validateCIDR,
+	"msf_options":    validateMsfOptions,
+	"credential_file": validateCredentialFile,
+	"duration":       validateDuration,
+	"regex_match":    validateRegexMatch,
 }
 
 // SupportedTypes returns a sorted list of supported type names.
@@ -262,4 +267,107 @@ func validateCIDR(def *manifest.ArgDef, value string) (string, error) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid CIDR: %q", value))
 	}
 	return value, nil
+}
+
+func validateMsfOptions(def *manifest.ArgDef, value string) (string, error) {
+	keyRe := regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	metacharNoSemi := "|&$`(){}[]<>!\n\r"
+	for _, pair := range strings.Split(value, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, " ", 2)
+		if len(parts) != 2 {
+			return "", newErr(def.Name, fmt.Sprintf("msf_options: invalid pair '%s' (expected 'KEY VALUE')", pair))
+		}
+		if !keyRe.MatchString(parts[0]) {
+			return "", newErr(def.Name, fmt.Sprintf("msf_options: invalid key '%s' (must be uppercase alphanumeric)", parts[0]))
+		}
+		for _, c := range parts[1] {
+			if strings.ContainsRune(metacharNoSemi, c) {
+				return "", newErr(def.Name, fmt.Sprintf("msf_options: value contains disallowed character: %q", string(c)))
+			}
+		}
+	}
+	return value, nil
+}
+
+func validateCredentialFile(def *manifest.ArgDef, value string) (string, error) {
+	if err := CheckInjection(value); err != nil {
+		return "", newErr(def.Name, err.Error())
+	}
+	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
+		return "", newErr(def.Name, "credential file must be a relative path")
+	}
+	for _, part := range strings.Split(value, "/") {
+		if part == ".." {
+			return "", newErr(def.Name, fmt.Sprintf("path traversal detected: %q", value))
+		}
+	}
+	info, err := os.Stat(value)
+	if err != nil {
+		return "", newErr(def.Name, fmt.Sprintf("credential file not found: %q", value))
+	}
+	if info.IsDir() {
+		return "", newErr(def.Name, fmt.Sprintf("not a file: %q", value))
+	}
+	return value, nil
+}
+
+func validateDuration(def *manifest.ArgDef, value string) (string, error) {
+	// Plain integer seconds
+	if _, err := strconv.Atoi(value); err == nil {
+		return value, nil
+	}
+	// Duration with suffix
+	durationRe := regexp.MustCompile(`^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$`)
+	if !durationRe.MatchString(value) || value == "" {
+		return "", newErr(def.Name, fmt.Sprintf("invalid duration: %q (e.g. '30', '5m', '2h', '1h30m', '500ms')", value))
+	}
+	return value, nil
+}
+
+func validateRegexMatch(def *manifest.ArgDef, value string) (string, error) {
+	if err := CheckInjection(value); err != nil {
+		return "", newErr(def.Name, err.Error())
+	}
+	if def.Pattern == "" {
+		return "", newErr(def.Name, "regex_match type requires a 'pattern' field")
+	}
+	re, err := regexp.Compile(def.Pattern)
+	if err != nil {
+		return "", newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+	}
+	if !re.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("value %q does not match required pattern: %s", value, def.Pattern))
+	}
+	return value, nil
+}
+
+// ValidateArgWithCustomTypes validates using custom type definitions.
+func ValidateArgWithCustomTypes(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef) (string, error) {
+	if ct, ok := customTypes[def.Type]; ok {
+		handler, ok := typeHandlers[ct.Base]
+		if !ok {
+			return "", newErr(def.Name, fmt.Sprintf("custom type '%s' has invalid base type '%s'", def.Type, ct.Base))
+		}
+		// Create synthetic def with merged constraints
+		synthetic := *def
+		synthetic.Type = ct.Base
+		if len(ct.Allowed) > 0 {
+			synthetic.Allowed = ct.Allowed
+		}
+		if ct.Pattern != "" {
+			synthetic.Pattern = ct.Pattern
+		}
+		if ct.Min != nil {
+			synthetic.Min = ct.Min
+		}
+		if ct.Max != nil {
+			synthetic.Max = ct.Max
+		}
+		return handler(&synthetic, value)
+	}
+	return ValidateArg(def, value)
 }

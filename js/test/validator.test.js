@@ -140,16 +140,20 @@ describe("validateArg - url", () => {
 });
 
 describe("validateArg - path", () => {
-  it("accepts valid paths", () => {
-    assert.equal(validateArg({ type: "path" }, "/tmp/wordlist.txt"), "/tmp/wordlist.txt");
+  it("accepts valid relative paths", () => {
+    assert.equal(validateArg({ type: "path" }, "tmp/wordlist.txt"), "tmp/wordlist.txt");
+  });
+
+  it("rejects absolute paths", () => {
+    assert.throws(() => validateArg({ type: "path" }, "/tmp/wordlist.txt"), /must be relative/);
   });
 
   it("rejects path traversal", () => {
-    assert.throws(() => validateArg({ type: "path" }, "/etc/../shadow"), /traversal/);
+    assert.throws(() => validateArg({ type: "path" }, "etc/../shadow"), /traversal/);
   });
 
   it("rejects injection", () => {
-    assert.throws(() => validateArg({ type: "path" }, "/tmp/$(whoami)"), /Injection/);
+    assert.throws(() => validateArg({ type: "path" }, "tmp/$(whoami)"), /Injection/);
   });
 });
 
