@@ -199,6 +199,39 @@ fn execute_mcp_proxy(
     })
 }
 
+/// Build an argv array from the manifest `exec` field and validated arguments.
+///
+/// Each element in `exec` is interpolated independently, preserving argument
+/// boundaries. This avoids the template→string→split round-trip that breaks
+/// when argument values contain spaces or quote characters.
+pub fn build_command_argv(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+) -> Result<Vec<String>, ToolCladError> {
+    let exec = manifest
+        .command
+        .exec
+        .as_ref()
+        .ok_or_else(|| {
+            ToolCladError::CommandError("no exec array in manifest".to_string())
+        })?;
+
+    let vars = resolve_vars(manifest, args)?;
+
+    let argv: Vec<String> = exec
+        .iter()
+        .map(|element| interpolate_template(element, &vars))
+        .collect();
+
+    if argv.is_empty() {
+        return Err(ToolCladError::CommandError(
+            "exec array produced empty argv".to_string(),
+        ));
+    }
+
+    Ok(argv)
+}
+
 /// Build the command string from a manifest template and validated arguments.
 ///
 /// Performs template interpolation including:
@@ -221,6 +254,22 @@ pub fn build_command(
         })?
         .clone();
 
+    let vars = resolve_vars(manifest, args)?;
+
+    // Perform final template interpolation.
+    let result = interpolate_template(&template, &vars);
+
+    // Clean up multiple spaces from empty interpolations.
+    let cleaned = result.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    Ok(cleaned)
+}
+
+/// Resolve all template variables: args, defaults, mappings, conditionals, executor vars.
+fn resolve_vars(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, ToolCladError> {
     // Start with provided args.
     let mut vars: HashMap<String, String> = args.clone();
 
@@ -289,13 +338,7 @@ pub fn build_command(
         }
     }
 
-    // Perform final template interpolation.
-    let result = interpolate_template(&template, &vars);
-
-    // Clean up multiple spaces from empty interpolations.
-    let cleaned = result.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    Ok(cleaned)
+    Ok(vars)
 }
 
 /// Interpolate `{placeholder}` references in a template string.
@@ -692,9 +735,18 @@ pub fn execute(
 
             let cmd_display = format!("{executor_path} (custom executor)");
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
+        } else if manifest.command.exec.is_some() {
+            // PREFERRED: Array-based command construction maps directly to execve.
+            // No string→split round-trip; values with spaces are safe.
+            let argv = build_command_argv(manifest, &validated)?;
+            let cmd_display = argv.join(" ");
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+
+            run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
         } else {
-            // SECURITY: Use array-based execution (execve) instead of sh -c
-            // to prevent shell injection attacks.
+            // LEGACY: String template → shlex split → execve.
+            // Use `exec` for new manifests to avoid quote/space edge cases.
             let cmd_string = build_command(manifest, &validated)?;
             let argv = shlex::split(&cmd_string).ok_or_else(|| {
                 ToolCladError::CommandError(
@@ -891,6 +943,8 @@ pub fn dry_run(
 
     let command = if let Some(ref exec) = manifest.command.executor {
         format!("{exec} (custom executor)")
+    } else if manifest.command.exec.is_some() {
+        build_command_argv(manifest, &validated)?.join(" ")
     } else {
         build_command(manifest, &validated)?
     };

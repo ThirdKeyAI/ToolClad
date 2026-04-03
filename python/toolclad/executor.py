@@ -65,11 +65,100 @@ def _evaluate_single(expr: str, resolved: Dict[str, str]) -> bool:
     return False
 
 
+def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
+    """Validate arguments and resolve all template variables into a single context."""
+    resolved: Dict[str, str] = {}
+
+    for arg_name, arg_def in manifest.args.items():
+        if arg_name in args:
+            resolved[arg_name] = validate_arg(arg_def, args[arg_name])
+        elif arg_def.default is not None:
+            resolved[arg_name] = str(arg_def.default)
+        elif arg_def.required:
+            raise ValidationError(
+                f"Missing required argument: '{arg_name}'"
+            )
+        else:
+            resolved[arg_name] = ""
+
+    for key, val in manifest.command.defaults.items():
+        if key not in resolved:
+            resolved[key] = str(val)
+
+    scan_id = _generate_scan_id()
+    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
+
+    output_dir = evidence_dir
+    if manifest.tool.evidence.output_dir:
+        output_dir = manifest.tool.evidence.output_dir.format(
+            evidence_dir=evidence_dir, scan_id=scan_id
+        )
+
+    ext_map = {"xml": "xml", "json": "json", "csv": "csv", "text": "txt", "jsonl": "jsonl"}
+    ext = ext_map.get(manifest.output.format, "txt")
+    output_file = os.path.join(output_dir, f"scan.{ext}")
+
+    resolved["_scan_id"] = scan_id
+    resolved["_evidence_dir"] = evidence_dir
+    resolved["_output_file"] = output_file
+
+    for map_arg, mapping_table in manifest.command.mappings.items():
+        arg_value = resolved.get(map_arg, "")
+        mapped = mapping_table.get(arg_value, "")
+        resolved[f"_{map_arg}_flags"] = mapped
+        resolved["_scan_flags"] = mapped
+
+    for cond_name, cond_def in manifest.command.conditionals.items():
+        if _evaluate_condition(cond_def.when, resolved):
+            fragment = cond_def.template
+            fragment = _interpolate(fragment, resolved)
+            resolved[f"_{cond_name}"] = fragment
+        else:
+            resolved[f"_{cond_name}"] = ""
+
+    return resolved
+
+
+def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> list:
+    """Build an argv list from the manifest's exec array and validated arguments.
+
+    Each element in exec is interpolated independently, preserving argument
+    boundaries. This avoids the template->string->split round-trip that breaks
+    when argument values contain spaces or quote characters.
+
+    Args:
+        manifest: The parsed manifest.
+        args: Mapping of argument name to raw string value.
+
+    Returns:
+        A list of strings ready for subprocess execution.
+
+    Raises:
+        ValidationError: If a required argument is missing or validation fails.
+        ValueError: If the manifest has no exec array.
+    """
+    if not manifest.command.exec:
+        raise ValueError(
+            f"Manifest '{manifest.tool.name}' has no exec array."
+        )
+
+    resolved = _resolve_vars(manifest, args)
+
+    argv = [_interpolate(element, resolved) for element in manifest.command.exec]
+
+    if not argv or not argv[0]:
+        raise ValueError("exec array produced empty argv")
+
+    return argv
+
+
 def build_command(manifest: Manifest, args: Dict[str, str]) -> str:
-    """Build the final command string from a manifest and validated arguments.
+    """Build the final command string from a manifest template and validated arguments.
 
     This resolves argument values, applies defaults, expands mappings and
     conditionals, and performs template interpolation.
+
+    For new manifests, prefer build_command_argv with the exec array format.
 
     Args:
         manifest: The parsed manifest.
@@ -88,65 +177,8 @@ def build_command(manifest: Manifest, args: Dict[str, str]) -> str:
             f"({manifest.command.executor}); cannot build a template command."
         )
 
-    # --- Validate and resolve all args ---
-    resolved: Dict[str, str] = {}
+    resolved = _resolve_vars(manifest, args)
 
-    for arg_name, arg_def in manifest.args.items():
-        if arg_name in args:
-            resolved[arg_name] = validate_arg(arg_def, args[arg_name])
-        elif arg_def.default is not None:
-            resolved[arg_name] = str(arg_def.default)
-        elif arg_def.required:
-            raise ValidationError(
-                f"Missing required argument: '{arg_name}'"
-            )
-        else:
-            resolved[arg_name] = ""
-
-    # Apply command defaults for template variables not in args.
-    for key, val in manifest.command.defaults.items():
-        if key not in resolved:
-            resolved[key] = str(val)
-
-    # --- Executor-injected variables ---
-    scan_id = _generate_scan_id()
-    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
-    tool_name = manifest.tool.name
-
-    output_dir = evidence_dir
-    if manifest.tool.evidence.output_dir:
-        output_dir = manifest.tool.evidence.output_dir.format(
-            evidence_dir=evidence_dir, scan_id=scan_id
-        )
-
-    ext_map = {"xml": "xml", "json": "json", "csv": "csv", "text": "txt", "jsonl": "jsonl"}
-    ext = ext_map.get(manifest.output.format, "txt")
-    output_file = os.path.join(output_dir, f"scan.{ext}")
-
-    resolved["_scan_id"] = scan_id
-    resolved["_evidence_dir"] = evidence_dir
-    resolved["_output_file"] = output_file
-
-    # --- Resolve mappings ---
-    for map_arg, mapping_table in manifest.command.mappings.items():
-        arg_value = resolved.get(map_arg, "")
-        mapped = mapping_table.get(arg_value, "")
-        # Convention: {_<arg_name>_flags} or detect from template.
-        resolved[f"_{map_arg}_flags"] = mapped
-        # Also support the bare {_scan_flags} shorthand.
-        resolved["_scan_flags"] = mapped
-
-    # --- Resolve conditionals ---
-    for cond_name, cond_def in manifest.command.conditionals.items():
-        if _evaluate_condition(cond_def.when, resolved):
-            fragment = cond_def.template
-            # Interpolate any {placeholders} in the conditional fragment.
-            fragment = _interpolate(fragment, resolved)
-            resolved[f"_{cond_name}"] = fragment
-        else:
-            resolved[f"_{cond_name}"] = ""
-
-    # --- Interpolate the main template ---
     command = _interpolate(manifest.command.template, resolved)
 
     # Collapse multiple spaces into one and strip.
@@ -551,8 +583,13 @@ def execute(
     tool_name = manifest.tool.name
     effective_timeout = timeout or manifest.tool.timeout_seconds
 
-    # Build command (also validates args).
-    command = build_command(manifest, args)
+    # Build command — prefer exec array over template string.
+    if manifest.command.exec:
+        args_list = build_command_argv(manifest, args)
+        command = " ".join(args_list)
+    else:
+        command = build_command(manifest, args)
+        args_list = shlex.split(command)
 
     envelope: Dict[str, Any] = {
         "status": "success",
@@ -584,9 +621,6 @@ def execute(
     ext = ext_map.get(manifest.output.format, "txt")
     output_file = os.path.join(out_dir, f"scan.{ext}")
     envelope["output_file"] = output_file
-
-    # Execute using array-based invocation to avoid shell interpretation.
-    args_list = shlex.split(command)
     start = time.monotonic()
     proc = None
     try:

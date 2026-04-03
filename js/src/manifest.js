@@ -30,9 +30,9 @@ export function loadManifest(path) {
     if (!manifest.command) {
       throw new Error(`Invalid manifest: missing [command] section`);
     }
-    if (!manifest.command.template && !manifest.command.executor) {
+    if (!manifest.command.template && !manifest.command.exec && !manifest.command.executor) {
       throw new Error(
-        `Invalid manifest: [command] must have template or executor`
+        `Invalid manifest: [command] must have template, exec, or executor`
       );
     }
     if (!manifest.output) {

@@ -413,7 +413,27 @@ type = "service_protocol"
 
 ## Command Construction
 
-The command template is the core mechanism that prevents LLMs from generating arbitrary shell commands. The template is a string with `{placeholder}` references that are interpolated with validated parameter values.
+The command construction layer is the core mechanism that prevents LLMs from generating arbitrary shell commands. Parameters are validated, then interpolated into a declared command structure.
+
+### Invocation Forms
+
+ToolClad supports two invocation forms for command construction:
+
+**Array form (preferred):** Each argument is a separate argv entry, passed directly to `execve`/`os/exec`/`subprocess` without shell interpretation. Values containing spaces, quotes, or special characters are safe because they are never re-split.
+
+```toml
+[command]
+exec = ["curl", "-H", "Authorization: {token}", "{target}"]
+```
+
+**String template form (legacy):** A single string that is split into argv via `shlex` (Rust/Python) or a quote-aware splitter (Go/JS) before execution. This works for simple cases but breaks when validated parameter values contain spaces (e.g., commit messages, custom HTTP headers).
+
+```toml
+[command]
+template = "whois {target}"
+```
+
+When both `exec` and `template` are present, `exec` takes precedence. New manifests SHOULD use `exec`. Executors MUST NOT route either form through a shell (`sh -c`, `bash -c`, `cmd /c`).
 
 ### Template Variables
 
@@ -459,6 +479,8 @@ single_user = { when = "username != '' and username_file == ''", template = "-l 
 single_pass = { when = "password != '' and password_file == ''", template = "-p {password}" }
 ```
 
+**SECURITY REQUIREMENT:** Conditional expressions MUST be evaluated using a closed-vocabulary parser that supports only: variable names, `==`, `!=`, string/numeric literals, and `and`/`or` conjunctions. Implementations MUST NOT use `eval()`, `Function()`, `exec()`, or any dynamic code execution mechanism to resolve conditions. Doing so creates a Remote Code Execution (RCE) vulnerability if an attacker can influence manifest content or argument values. All four reference implementations enforce this with a regex-based comparison parser.
+
 ### Escape Hatch
 
 When a tool's invocation logic exceeds what the template engine can express, the manifest can delegate to a custom executor:
@@ -477,6 +499,21 @@ The custom executor receives validated, typed arguments as environment variables
 - Cedar policy evaluation (before anything executes)
 
 The escape hatch is for command construction only. All other ToolClad guarantees still apply.
+
+### Process Lifecycle and Timeout Enforcement
+
+Tools like Metasploit, complex Python scanners, and shell wrappers frequently spawn child background workers. A naive `timeout_seconds` that only sends `SIGTERM` to the parent process leaves orphaned children consuming resources.
+
+**Requirement:** Executors MUST spawn tool processes in a **new process group** (PGID) and kill the entire group on timeout:
+
+| Platform | Create Group | Kill Group |
+|----------|-------------|------------|
+| Rust | `cmd.process_group(0)` | `libc::killpg(pid, SIGKILL)` |
+| Go | `SysProcAttr{Setpgid: true}` | `syscall.Kill(-pid, SIGKILL)` |
+| Python | `preexec_fn=os.setpgrp` | `os.killpg(os.getpgid(pid), SIGKILL)` |
+| Node.js | `detached: true` | `process.kill(-pid, 'SIGKILL')` |
+
+This prevents zombie process accumulation in long-running agent containers. All four reference implementations enforce process group kill.
 
 ---
 
@@ -760,6 +797,8 @@ When `envelope = true` (default), the executor wraps parsed output in a standard
   "scan_id": "1711929600-12345",
   "tool": "nmap_scan",
   "command": "nmap -sT -sV --max-rate 1000 -oX /evidence/... 10.0.1.0/24",
+  "exit_code": 0,
+  "stderr": "",
   "duration_ms": 4523,
   "timestamp": "2026-03-20T12:00:00Z",
   "output_file": "/evidence/1711929600-12345-nmap/scan.xml",
@@ -768,7 +807,18 @@ When `envelope = true` (default), the executor wraps parsed output in a standard
 }
 ```
 
-This is the JSON the agent receives. Every field is deterministic and machine-readable. The `output_hash` provides tamper detection for the evidence chain. The `results` field contains the parsed output, validated against the declared `[output.schema]`.
+On error, `exit_code` and `stderr` provide the debugging context an LLM agent needs to self-correct:
+
+```json
+{
+  "status": "error",
+  "exit_code": 1,
+  "stderr": "nmap: unrecognized option '--invalid-flag'\nSee nmap -h for help.",
+  "results": null
+}
+```
+
+This is the JSON the agent receives. Every field is deterministic and machine-readable. The `output_hash` provides tamper detection for the evidence chain. The `results` field contains the parsed output, validated against the declared `[output.schema]`. The `exit_code` and `stderr` fields MUST be present in all envelopes — they are critical for agent self-correction when tools fail due to bad flags, network errors, or misconfiguration.
 
 ---
 
@@ -1718,6 +1768,15 @@ Any parameter with type `scope_target`, `url` (with `scope_check = true`), `cidr
 
 The scope check runs in the executor, after Cedar authorization but before command execution. This is the defense-in-depth layer: even if a Cedar policy bug allows an out-of-scope target, the ToolClad type system catches it.
 
+#### Cross-Language Scope Validation Consistency
+
+Scope validation involves non-trivial logic: CIDR containment math, IPv4/IPv6 normalization, DNS wildcard suffix matching, and hostname resolution. Re-implementing this identically in Rust, Python, Go, and JavaScript creates a risk of **security drift** — an IP that passes the Python validator but fails the Rust one, or vice versa.
+
+To mitigate this:
+
+1. **Normative test vectors**: The `tests/scope_vectors.json` file contains a shared set of test cases (IP-in-CIDR, wildcard matching, edge cases) that all implementations MUST pass. Adding a new scope rule requires adding test vectors first.
+2. **Centralization path**: For production deployments where four independent validators are unacceptable, the Symbiont runtime provides a single scope validation endpoint (gRPC/HTTP) that client-side executors call. Alternatively, a single Rust-based scope library can be compiled to WebAssembly (Wasm) for use by Python/JS/Go implementations via FFI bindings.
+
 ---
 
 ## Migration Path from symbi-redteam
@@ -1980,6 +2039,15 @@ The 80/20 split from symbi-redteam confirms this: ~14 of 19 tools are pure templ
 ---
 
 ## Changelog
+
+### v0.5.3 (2026-04-03)
+
+- **`exec` array format**: Added `exec = ["cmd", "arg1", "{placeholder}"]` as preferred command construction form. Maps directly to `execve`/`os.exec` without shell interpretation or string splitting. Values with spaces/quotes are safe. All four implementations updated. Legacy `template` string form remains supported.
+- **Conditionals eval() ban**: Spec now explicitly requires closed-vocabulary parser for `[command.conditionals]`. Implementations MUST NOT use `eval()`, `Function()`, `exec()`, or dynamic code execution. All reference implementations already enforce this.
+- **Evidence envelope: exit_code + stderr**: `exit_code` (integer) and `stderr` (string) are now mandatory fields in the evidence envelope. Enables LLM agent self-correction on tool failures. All reference implementations already include these fields.
+- **Scope validation consistency**: Added cross-language scope validation test vectors (`tests/scope_vectors.json`) and documented centralization path (Wasm/gRPC) for production deployments where four independent validators are unacceptable.
+- **Process group kill semantics**: Documented requirement to spawn tools in new process groups (PGID) and kill the entire group on timeout. Prevents zombie process accumulation. All reference implementations already enforce this.
+- **Go quote-aware splitter**: Replaced `strings.Fields()` with a quote-aware `shellSplit()` for template string splitting, fixing breakage when mapped values contain spaces.
 
 ### v0.5.2 (2026-03-22)
 

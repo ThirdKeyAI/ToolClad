@@ -36,27 +36,16 @@ type EvidenceEnvelope struct {
 	Error      string         `json:"error,omitempty"`
 }
 
-// BuildCommand validates arguments and interpolates the command template.
-// It returns the fully constructed command string ready for execution.
-func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) {
-	// If there is a custom executor, we do not build a template command.
-	if m.Command.Executor != "" {
-		return m.Command.Executor, nil
-	}
-
-	if m.Command.Template == "" {
-		return "", fmt.Errorf("manifest %q has no command template or executor", m.Tool.Name)
-	}
-
-	// Validate all provided args and collect cleaned values.
+// resolveVars validates arguments and resolves all template variables (args,
+// defaults, mappings) into a single interpolation context.
+func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]string, error) {
 	cleaned := make(map[string]string)
 	for name, argDef := range m.Args {
 		val, provided := args[name]
 		if !provided {
 			if argDef.Required {
-				return "", fmt.Errorf("missing required argument: %q", name)
+				return nil, fmt.Errorf("missing required argument: %q", name)
 			}
-			// Use default value if available.
 			if argDef.Default != nil {
 				val = fmt.Sprintf("%v", argDef.Default)
 			} else {
@@ -66,19 +55,17 @@ func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) 
 
 		validated, err := validator.ValidateArg(argDef, val)
 		if err != nil {
-			return "", fmt.Errorf("argument %q: %w", name, err)
+			return nil, fmt.Errorf("argument %q: %w", name, err)
 		}
 		cleaned[name] = validated
 	}
 
-	// Apply command defaults for template variables not covered by args.
 	for k, v := range m.Command.Defaults {
 		if _, exists := cleaned[k]; !exists {
 			cleaned[k] = fmt.Sprintf("%v", v)
 		}
 	}
 
-	// Resolve mappings: e.g., scan_type -> _scan_flags.
 	for argName, mapping := range m.Command.Mappings {
 		val, ok := cleaned[argName]
 		if !ok {
@@ -86,10 +73,7 @@ func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) 
 		}
 		mapped, ok := mapping[val]
 		if ok {
-			// Convention: mapping result is stored as _{argName}_flags
-			// but we also check for _scan_flags style references in the template.
 			cleaned["_"+argName+"_flags"] = mapped
-			// Also store as _scan_flags if the arg name ends with _type.
 			if strings.HasSuffix(argName, "_type") {
 				prefix := strings.TrimSuffix(argName, "_type")
 				cleaned["_"+prefix+"_flags"] = mapped
@@ -97,20 +81,90 @@ func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) 
 		}
 	}
 
+	return cleaned, nil
+}
+
+// BuildCommandArgv builds an argv array from the manifest's exec field.
+// Each element is interpolated independently, preserving argument boundaries.
+// This avoids the template→string→split round-trip that breaks when values
+// contain spaces or quote characters.
+func BuildCommandArgv(m *manifest.Manifest, args map[string]string) ([]string, error) {
+	if len(m.Command.Exec) == 0 {
+		return nil, fmt.Errorf("manifest %q has no exec array", m.Tool.Name)
+	}
+
+	cleaned, err := resolveVars(m, args)
+	if err != nil {
+		return nil, err
+	}
+
+	argv := make([]string, len(m.Command.Exec))
+	for i, element := range m.Command.Exec {
+		argv[i] = interpolateString(element, cleaned)
+	}
+
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, fmt.Errorf("exec array produced empty argv")
+	}
+
+	return argv, nil
+}
+
+// BuildCommand validates arguments and interpolates the command template.
+// It returns the fully constructed command string ready for execution.
+// For new manifests, prefer BuildCommandArgv with the exec array format.
+func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) {
+	if m.Command.Executor != "" {
+		return m.Command.Executor, nil
+	}
+
+	if m.Command.Template == "" {
+		return "", fmt.Errorf("manifest %q has no command template or executor", m.Tool.Name)
+	}
+
+	cleaned, err := resolveVars(m, args)
+	if err != nil {
+		return "", err
+	}
+
 	// SECURITY: This evaluator uses a closed-vocabulary parser.
 	// Never use eval() or equivalent dynamic code execution for conditions.
 
-	// Interpolate the template.
 	result := m.Command.Template
 	for k, v := range cleaned {
 		result = strings.ReplaceAll(result, "{"+k+"}", v)
 	}
 
-	// Replace any remaining executor-injected variables with empty strings
-	// for variables that start with _ (internal variables like _output_file).
-	// In a real runtime these would be injected; for the reference impl we leave them.
-
 	return result, nil
+}
+
+// shellSplit splits a command string into arguments, respecting single and
+// double quotes. This replaces strings.Fields() which breaks on quoted args.
+func shellSplit(cmd string) []string {
+	var args []string
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+		case c == ' ' && !inSingle && !inDouble:
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteByte(c)
+		}
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args
 }
 
 // Execute validates arguments, builds the command, executes it with a timeout,
@@ -150,8 +204,26 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Use array-based execution to avoid shell interpretation.
-	cmdArgs := strings.Fields(cmdStr)
+	// Prefer exec array (shell-free) over template string (requires splitting).
+	var cmdArgs []string
+	if len(m.Command.Exec) > 0 {
+		argv, err := BuildCommandArgv(m, args)
+		if err != nil {
+			return &EvidenceEnvelope{
+				Status:    "error",
+				ScanID:    scanID,
+				Tool:      m.Tool.Name,
+				Timestamp: start.UTC().Format(time.RFC3339),
+				ExitCode:  -1,
+				Error:     err.Error(),
+			}, err
+		}
+		cmdArgs = argv
+		cmdStr = strings.Join(argv, " ")
+	} else {
+		// Legacy: split template string using quote-aware splitter.
+		cmdArgs = shellSplit(cmdStr)
+	}
 	if len(cmdArgs) == 0 {
 		return &EvidenceEnvelope{
 			Status:    "error",

@@ -76,9 +76,17 @@ class ConditionalDef:
 
 @dataclass
 class CommandDef:
-    """The [command] section: template, mappings, conditionals, or executor."""
+    """The [command] section: template/exec, mappings, conditionals, or executor.
+
+    Supports two invocation forms:
+    - ``exec = ["cmd", "arg1", "{placeholder}"]`` — preferred, shell-free array execution
+    - ``template = "cmd arg1 {placeholder}"`` — legacy string template (split via shlex)
+
+    When both are present, ``exec`` takes precedence.
+    """
 
     template: str = ""
+    exec: List[str] = field(default_factory=list)
     executor: str = ""
     defaults: Dict[str, Any] = field(default_factory=dict)
     mappings: Dict[str, Dict[str, str]] = field(default_factory=dict)
@@ -280,6 +288,7 @@ def _parse_command(data: Dict[str, Any]) -> CommandDef:
         )
     return CommandDef(
         template=data.get("template", ""),
+        exec=data.get("exec", []),
         executor=data.get("executor", ""),
         defaults=data.get("defaults", {}),
         mappings=data.get("mappings", {}),

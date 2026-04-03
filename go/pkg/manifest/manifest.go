@@ -60,8 +60,15 @@ type ConditionalDef struct {
 }
 
 // CommandDef holds the [command] section.
+//
+// Supports two invocation forms:
+//   - exec = ["cmd", "arg1", "{placeholder}"] — preferred, shell-free array execution
+//   - template = "cmd arg1 {placeholder}" — legacy string template (split via shlex)
+//
+// When both are present, exec takes precedence.
 type CommandDef struct {
 	Template     string                        `toml:"template"`
+	Exec         []string                      `toml:"exec"`
 	Executor     string                        `toml:"executor"`
 	Defaults     map[string]any                `toml:"defaults"`
 	Mappings     map[string]map[string]string  `toml:"mappings"`

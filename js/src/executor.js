@@ -82,27 +82,18 @@ function resolveArgs(manifest, args) {
 }
 
 /**
- * Build the final command string from a manifest template and validated args.
+ * Resolve all template variables: args, defaults, mappings, conditionals,
+ * and executor-injected variables into a single interpolation context.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {{ command: string, resolvedArgs: object }} The constructed command and resolved args
+ * @returns {{ resolvedArgs: object, context: object }}
  */
-export function buildCommand(manifest, args) {
+function resolveContext(manifest, args) {
   const resolvedArgs = resolveArgs(manifest, args);
   const command = manifest.command;
-
-  // If using an executor script, return that info
-  if (command.executor) {
-    return { command: command.executor, resolvedArgs, isExecutor: true };
-  }
-
-  let template = command.template;
-
-  // Build the interpolation context from resolved args + defaults
   const context = { ...resolvedArgs };
 
-  // Apply command.defaults
   if (command.defaults) {
     for (const [key, val] of Object.entries(command.defaults)) {
       if (context[key] === undefined) {
@@ -111,27 +102,21 @@ export function buildCommand(manifest, args) {
     }
   }
 
-  // Generate executor-injected variables
   const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
   context._scan_id = scanId;
   context._output_file = `/tmp/toolclad-${scanId}-output`;
   context._evidence_dir = process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
 
-  // Resolve mappings: e.g. scan_type -> _scan_flags
   if (command.mappings) {
     for (const [argName, mapping] of Object.entries(command.mappings)) {
       const argValue = context[argName];
       if (argValue !== undefined && mapping[argValue] !== undefined) {
-        // Convention: mapping resolves to _{argName}_flags or the first
-        // underscore-prefixed placeholder that references this mapping
         context[`_${argName}_flags`] = mapping[argValue];
-        // Also try the generic _scan_flags for backward compat
         context["_scan_flags"] = mapping[argValue];
       }
     }
   }
 
-  // Resolve conditionals
   if (command.conditionals) {
     for (const [name, cond] of Object.entries(command.conditionals)) {
       const result = evaluateCondition(cond.when, context);
@@ -139,10 +124,55 @@ export function buildCommand(manifest, args) {
     }
   }
 
-  // Interpolate the template
-  const result = interpolate(template, context);
+  return { resolvedArgs, context };
+}
 
-  // Clean up multiple spaces
+/**
+ * Build an argv array from the manifest's exec field and validated args.
+ * Each element is interpolated independently, preserving argument boundaries.
+ * This avoids the template→string→split round-trip that breaks when values
+ * contain spaces or quote characters.
+ *
+ * @param {object} manifest - Parsed manifest
+ * @param {object} args - User-supplied arguments (key=value)
+ * @returns {{ argv: string[], resolvedArgs: object }}
+ */
+export function buildCommandArgv(manifest, args) {
+  const execArray = manifest.command.exec;
+  if (!execArray || execArray.length === 0) {
+    throw new Error("Manifest has no exec array");
+  }
+
+  const { resolvedArgs, context } = resolveContext(manifest, args);
+  const argv = execArray.map((element) => interpolate(element, context));
+
+  if (argv.length === 0 || !argv[0]) {
+    throw new Error("exec array produced empty argv");
+  }
+
+  return { argv, resolvedArgs };
+}
+
+/**
+ * Build the final command string from a manifest template and validated args.
+ * For new manifests, prefer buildCommandArgv with the exec array format.
+ *
+ * @param {object} manifest - Parsed manifest
+ * @param {object} args - User-supplied arguments (key=value)
+ * @returns {{ command: string, resolvedArgs: object }} The constructed command and resolved args
+ */
+export function buildCommand(manifest, args) {
+  const command = manifest.command;
+
+  // If using an executor script, return that info
+  if (command.executor) {
+    const resolvedArgs = resolveArgs(manifest, args);
+    return { command: command.executor, resolvedArgs, isExecutor: true };
+  }
+
+  const { resolvedArgs, context } = resolveContext(manifest, args);
+  const result = interpolate(command.template, context);
+
   return {
     command: result.replace(/\s+/g, " ").trim(),
     resolvedArgs,
@@ -222,13 +252,31 @@ export function execute(manifest, args, options = {}) {
     return executeMcp(manifest, args);
   }
 
-  const { command, resolvedArgs, isExecutor } = buildCommand(manifest, args);
+  // Determine if we're using exec array, template, or custom executor.
+  let cmdParts;
+  let commandDisplay;
+  let resolvedArgs;
+  let isExecutor = false;
+
+  if (manifest.command.exec && manifest.command.exec.length > 0) {
+    // PREFERRED: Array-based command — maps directly to execve, no splitting.
+    const built = buildCommandArgv(manifest, args);
+    cmdParts = built.argv;
+    resolvedArgs = built.resolvedArgs;
+    commandDisplay = cmdParts.join(" ");
+  } else {
+    const built = buildCommand(manifest, args);
+    commandDisplay = built.command;
+    resolvedArgs = built.resolvedArgs;
+    isExecutor = built.isExecutor;
+    cmdParts = splitCommand(built.command);
+  }
 
   if (options.dryRun) {
     return {
       status: "dry_run",
       tool: manifest.tool.name,
-      command,
+      command: commandDisplay,
       resolvedArgs,
     };
   }
@@ -248,8 +296,6 @@ export function execute(manifest, args, options = {}) {
     env.TOOLCLAD_EVIDENCE_DIR =
       process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
 
-    // Use array-based execution to avoid shell interpretation.
-    const cmdParts = splitCommand(command);
     result = spawnSync(cmdParts[0], cmdParts.slice(1), {
       shell: false,
       timeout: timeoutMs,
@@ -259,8 +305,6 @@ export function execute(manifest, args, options = {}) {
       maxBuffer: 10 * 1024 * 1024,
     });
   } else {
-    // Use array-based execution to avoid shell interpretation.
-    const cmdParts = splitCommand(command);
     result = spawnSync(cmdParts[0], cmdParts.slice(1), {
       shell: false,
       timeout: timeoutMs,
@@ -292,7 +336,7 @@ export function execute(manifest, args, options = {}) {
     status: exitCode === 0 ? "success" : "error",
     scan_id: scanId,
     tool: manifest.tool.name,
-    command,
+    command: commandDisplay,
     exit_code: exitCode ?? -1,
     stderr,
     duration_ms: durationMs,

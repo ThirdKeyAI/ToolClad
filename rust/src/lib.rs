@@ -111,6 +111,7 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
     // Must have at least one execution backend.
     if manifest.command.template.is_none()
+        && manifest.command.exec.is_none()
         && manifest.command.executor.is_none()
         && manifest.http.is_none()
         && manifest.mcp.is_none()

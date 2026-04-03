@@ -101,9 +101,19 @@ pub struct ArgDef {
 }
 
 /// Command construction definition `[command]`.
+///
+/// Supports two invocation forms:
+/// - `exec = ["cmd", "arg1", "{placeholder}"]` — preferred, shell-free array execution
+/// - `template = "cmd arg1 {placeholder}"` — legacy string template (split via shlex)
+///
+/// When both are present, `exec` takes precedence.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandDef {
     pub template: Option<String>,
+    /// Preferred: array-based command construction that maps directly to execve.
+    /// Each element is a separate argv entry; `{placeholder}` tokens are interpolated
+    /// but the result is never re-split, so values containing spaces are safe.
+    pub exec: Option<Vec<String>>,
     pub executor: Option<String>,
     #[serde(default)]
     pub defaults: Option<HashMap<String, toml::Value>>,
