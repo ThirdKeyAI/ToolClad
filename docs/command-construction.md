@@ -1,12 +1,42 @@
 # Command Construction
 
-ToolClad command templates are the core mechanism that prevents LLMs from generating arbitrary shell commands. The template is a string with `{placeholder}` references that are interpolated with validated parameter values. Commands are dispatched via direct `execve` (no `sh -c`), so shell interpretation never occurs.
+ToolClad command construction is the core mechanism that prevents LLMs from generating arbitrary shell commands. Parameters are validated, then interpolated into a declared command structure. Commands are dispatched via direct `execve` (no `sh -c`), so shell interpretation never occurs.
 
-## Template Variables
+## Invocation Forms
+
+ToolClad supports two invocation forms:
+
+### Array Form (Preferred)
+
+Each argument is a separate argv entry, passed directly to `execve` without shell interpretation. Values containing spaces, quotes, or special characters are safe because they are never re-split.
 
 ```toml
 [command]
-template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} -v {extra_flags} {target}"
+exec = ["curl", "-H", "Authorization: {token}", "{target}"]
+```
+
+### String Template Form (Legacy)
+
+A single string that is split into argv via a quote-aware splitter before execution. Works for simple cases but can break when validated parameter values contain spaces.
+
+```toml
+[command]
+template = "whois {target}"
+```
+
+When both `exec` and `template` are present, `exec` takes precedence. New manifests **should** use `exec`.
+
+---
+
+## Template Variables
+
+Both `exec` array elements and `template` strings support `{placeholder}` interpolation:
+
+```toml
+[command]
+exec = ["nmap", "{_scan_flags}", "--max-rate", "{max_rate}", "-oX", "{_output_file}", "-v", "{extra_flags}", "{target}"]
+# Or equivalently (legacy):
+# template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} -v {extra_flags} {target}"
 ```
 
 | Variable Pattern | Source | Example |
@@ -156,12 +186,18 @@ Resolution: `{_secret:api_key}` -> `$TOOLCLAD_SECRET_API_KEY` environment variab
 
 ## Array-Based Execution
 
-Commands are split into an argv array and dispatched via direct `execve`. There is no `sh -c` shell interpretation:
+All commands are dispatched via direct `execve` with an argument array. There is no `sh -c` shell interpretation:
 
 ```
+# exec form — already an array, no splitting needed:
+exec = ["nmap", "-sT", "-sV", "--max-rate", "1000", "10.0.1.0/24"]
+
+# template form — split into array by quote-aware splitter:
 Template: "nmap -sT -sV --max-rate 1000 10.0.1.0/24"
 Argv:     ["nmap", "-sT", "-sV", "--max-rate", "1000", "10.0.1.0/24"]
 ```
+
+The `exec` form is preferred because it preserves argument boundaries exactly as declared — no splitting heuristics, no edge cases with quotes or spaces.
 
 This means:
 

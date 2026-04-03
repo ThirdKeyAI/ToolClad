@@ -4,7 +4,7 @@
 
 ToolClad is the tool execution layer of the [ThirdKey](https://thirdkey.ai) trust stack: [SchemaPin](https://schemapin.org) (tool integrity) / [AgentPin](https://agentpin.org) (agent identity) / **ToolClad** (tool contracts) / [Symbiont](https://symbiont.dev) (runtime).
 
-**Version**: 0.5.2 | **Status**: Release Candidate | **License**: MIT (spec), Apache 2.0 (Symbiont integration)
+**Version**: 0.5.3 | **Status**: Release Candidate | **License**: MIT (spec), Apache 2.0 (Symbiont integration)
 
 ---
 
@@ -23,7 +23,7 @@ A ToolClad manifest answers four questions:
 
 - **14 built-in type validators** -- all with shell injection sanitization, plus custom types via `toolclad.toml`
 - **Five execution backends** -- Shell command, HTTP API, MCP proxy, PTY session, CDP browser
-- **Command templates** -- `{arg_name}` interpolation with mappings, conditionals, and defaults; no `sh -c`
+- **Command construction** -- `exec` array (preferred) or `template` string with mappings, conditionals, defaults; no `sh -c`
 - **MCP schema generation** -- Auto-generate `inputSchema` + `outputSchema` from manifest declarations
 - **Evidence envelopes** -- Structured JSON with scan_id, timestamps, exit_code, output_hash (SHA-256)
 - **Cedar policy integration** -- Manifests declare Cedar resource/action for policy evaluation

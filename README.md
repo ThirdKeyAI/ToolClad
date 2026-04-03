@@ -46,6 +46,17 @@ type = "string"
 
 The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command. The `[command]` section is optional for HTTP-only or MCP-only manifests.
 
+### Array-Based Command Construction (v0.5.3)
+
+For commands where argument values may contain spaces or quotes, use the `exec` array format — it maps directly to `execve` with no shell interpretation or string splitting:
+
+```toml
+[command]
+exec = ["curl", "-H", "Authorization: {token}", "{target}"]
+```
+
+The legacy `template` string format remains supported. See [Command Construction](https://docs.toolclad.org/command-construction/) for details.
+
 ## Security Model
 
 ToolClad inverts the sandbox approach:

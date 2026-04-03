@@ -1,9 +1,9 @@
 # ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes
 
-**Version**: 0.5.2
+**Version**: 0.5.3
 **Status**: Release Candidate  
 **Author**: Jascha Wanger / ThirdKey AI  
-**Date**: 2026-03-21  
+**Date**: 2026-04-03  
 **License**: MIT (protocol specification), Apache 2.0 (Symbiont integration)  
 
 ---

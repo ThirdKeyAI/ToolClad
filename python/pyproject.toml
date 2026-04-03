@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toolclad"
-version = "0.5.2"
+version = "0.5.3"
 description = "Declarative tool interface contracts for agentic runtimes — typed parameters, command templates, evidence envelopes, session and browser modes"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -9,7 +9,7 @@
 |-------|-------|
 | Name | ToolClad |
 | Description | Declarative CLI tool interface contracts for agentic runtimes |
-| Version | 0.5.2 |
+| Version | 0.5.3 |
 | License | MIT (spec), Apache 2.0 (Symbiont integration) |
 | Repository | https://github.com/ThirdKeyAI/ToolClad |
 

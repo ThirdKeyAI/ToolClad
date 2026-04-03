@@ -1,6 +1,6 @@
 {
   "name": "toolclad",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Declarative tool interface contracts for agentic runtimes — typed parameters, command templates, evidence envelopes, session and browser modes",
   "main": "src/index.js",

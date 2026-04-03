@@ -34,11 +34,11 @@ Newline (`\n`) and carriage return (`\r`) are blocked across all string-based ty
 
 ## Array-Based Execution
 
-ToolClad never invokes `sh -c` with a command string. Commands are dispatched via direct `execve` with an argument array:
+ToolClad never invokes `sh -c` with a command string. Commands are dispatched via direct `execve` with an argument array. The preferred `exec` format declares the argv directly; the legacy `template` format is split via a quote-aware parser before dispatch:
 
 ```
-# What ToolClad does (safe):
-execve("/usr/bin/nmap", ["nmap", "-sT", "-sV", "--max-rate", "1000", "10.0.1.0/24"])
+# exec format (preferred) — maps directly to execve:
+exec = ["nmap", "-sT", "-sV", "--max-rate", "1000", "10.0.1.0/24"]
 
 # What ToolClad never does (unsafe):
 sh -c "nmap -sT -sV --max-rate 1000 10.0.1.0/24"
@@ -186,11 +186,20 @@ service_port = { when = "port != 0", template = "-s {port}" }
 The `when` expression supports only:
 
 - Variable references (declared parameter names)
-- Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`)
+- Comparison operators (`==`, `!=`)
 - Logical operators (`and`, `or`)
 - String literals and numeric literals
 
-There is no `eval()`, no expression language, no dynamic code execution. The parser recognizes a fixed grammar and rejects anything outside it. This prevents any form of code injection through conditional expressions.
+**SECURITY REQUIREMENT:** Implementations MUST NOT use `eval()`, `Function()`, `exec()`, or any dynamic code execution mechanism to resolve conditions. Doing so creates a Remote Code Execution (RCE) vulnerability if an attacker can influence manifest content or argument values. All four reference implementations enforce this with a regex-based comparison parser.
+
+## Cross-Language Scope Validation
+
+Scope validation involves non-trivial logic: CIDR containment math, IPv4/IPv6 normalization, DNS wildcard suffix matching. Re-implementing this in four languages creates a risk of security drift.
+
+To mitigate this, ToolClad provides:
+
+1. **Normative test vectors** (`tests/scope_vectors.json`) — a shared set of test cases that all implementations must pass
+2. **Centralization path** — production deployments can use a single scope validation endpoint (gRPC/HTTP) or compile a Rust-based validator to WebAssembly for cross-language use
 
 ## Static Analysis
 

@@ -2,7 +2,7 @@
 name: toolclad
 title: ToolClad
 description: Declarative tool interface contracts for agentic runtimes — oneshot CLI, interactive session (PTY), and browser (CDP/Playwright) modes with typed parameters, per-interaction Cedar gating, evidence envelopes
-version: 0.5.2
+version: 0.5.3
 ---
 
 # ToolClad Development Skills Guide
