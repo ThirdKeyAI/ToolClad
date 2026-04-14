@@ -109,6 +109,41 @@ let result = toolclad::executor::execute(&manifest, &args)?;
 println!("Status: {}, Duration: {}ms", result.status, result.duration_ms);
 ```
 
+##### Calling `execute` from async code
+
+`executor::execute` is **synchronous** and blocks the current thread for the lifetime of the child process. Tokio (and any other async runtime) callers must not invoke it directly from an `async fn`, or the call will stall the runtime worker for seconds to minutes.
+
+Wrap with `tokio::task::spawn_blocking` and, if you want an upper bound on the whole call (including argument validation and output parsing, which the manifest's `timeout_seconds` does *not* cover), add `tokio::time::timeout`:
+
+```rust
+use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+async fn run_tool(
+    manifest: Arc<toolclad::Manifest>,
+    args: HashMap<String, String>,
+) -> Result<toolclad::EvidenceEnvelope, String> {
+    const CALLER_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let handle = tokio::task::spawn_blocking(move || {
+        toolclad::executor::execute(&manifest, &args)
+    });
+
+    match tokio::time::timeout(CALLER_TIMEOUT, handle).await {
+        Ok(Ok(Ok(envelope))) => Ok(envelope),
+        Ok(Ok(Err(e)))       => Err(format!("toolclad: {e}")),
+        Ok(Err(join_err))    => Err(format!("task panicked: {join_err}")),
+        Err(_)               => Err(format!("timed out after {:?}", CALLER_TIMEOUT)),
+    }
+}
+```
+
+Notes:
+- **Two timeouts, two scopes.** The manifest's `timeout_seconds` kills the child process if it runs too long. The caller `tokio::time::timeout` bounds the *entire* sync call and is your safety net if spawn, argument validation, or output parsing hangs. Set it to `timeout_seconds + a small buffer`.
+- **`Arc` the manifest.** Cloning a full `Manifest` into each blocking task is wasteful; wrap it in `Arc` at load time and `Arc::clone` per invocation.
+- **Three nested `Result`s.** The outer one is the `tokio::time::timeout` verdict (`Err` = timed out). The middle is the `JoinHandle` (`Err` = task panicked). The inner is the ToolClad result. Handle all three.
+
 #### `executor::dry_run(manifest, args) -> Result<DryRunResult>`
 
 Validate arguments and construct the command without executing. Returns the command that would be run plus validation details.
