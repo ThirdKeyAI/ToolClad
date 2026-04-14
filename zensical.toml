@@ -17,6 +17,7 @@ nav = [
   {"Output & Evidence" = "output-evidence.md"},
   {"Security Model" = "security-model.md"},
   {"Symbiont Integration" = "symbiont-integration.md"},
+  {"LLM Integration" = "llm-integration.md"},
   {"CLI Reference" = "cli-reference.md"},
   {"API Reference" = "api-reference.md"},
   {"toolclad.org" = "https://github.com/ThirdKeyAI/ToolClad"},
