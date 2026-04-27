@@ -371,3 +371,67 @@ class TestUnknownType:
     def test_unknown_type_raises(self):
         with pytest.raises(ValidationError, match="Unknown type"):
             validate_arg(_arg("foobar"), "anything")
+
+
+# ---------------------------------------------------------------------------
+# number (float) — added alongside Rust validator
+# ---------------------------------------------------------------------------
+
+class TestNumberValidation:
+    def test_valid_float(self):
+        assert validate_arg(_arg("number"), "0.5") == "0.5"
+
+    def test_invalid_string(self):
+        with pytest.raises(ValidationError, match="Expected number"):
+            validate_arg(_arg("number"), "abc")
+
+    def test_rejects_nan_and_inf(self):
+        with pytest.raises(ValidationError, match="finite"):
+            validate_arg(_arg("number"), "NaN")
+        with pytest.raises(ValidationError, match="finite"):
+            validate_arg(_arg("number"), "inf")
+
+    def test_min_max_floats(self):
+        ad = _arg("number", min_float=0.0, max_float=1.0)
+        assert validate_arg(ad, "0.5") == "0.5"
+        with pytest.raises(ValidationError, match="below minimum"):
+            validate_arg(ad, "-0.1")
+        with pytest.raises(ValidationError, match="above maximum"):
+            validate_arg(ad, "1.5")
+
+    def test_min_max_falls_back_to_int_bounds(self):
+        ad = _arg("number", min=1, max=10)
+        assert validate_arg(ad, "5.5") == "5.5"
+        with pytest.raises(ValidationError):
+            validate_arg(ad, "0.5")
+
+
+# ---------------------------------------------------------------------------
+# scope_target hardening: punycode bypass + specific failure messages
+# ---------------------------------------------------------------------------
+
+class TestScopeTargetHardening:
+    def test_rejects_punycode_label(self):
+        # Defense-in-depth against IDN homoglyph bypass.
+        with pytest.raises(ValidationError, match="punycode"):
+            validate_arg(_arg("scope_target"), "xn--example-9c.com")
+
+    def test_rejects_mixed_case_punycode(self):
+        with pytest.raises(ValidationError, match="punycode"):
+            validate_arg(_arg("scope_target"), "XN--example-9c.com")
+
+    def test_rejects_non_ascii_homoglyph(self):
+        with pytest.raises(ValidationError, match="ASCII"):
+            validate_arg(_arg("scope_target"), "exаmple.com")  # Cyrillic а
+
+    def test_specific_traversal_message(self):
+        with pytest.raises(ValidationError, match="traversal"):
+            validate_arg(_arg("scope_target"), "../../etc/passwd")
+
+    def test_specific_slash_message(self):
+        with pytest.raises(ValidationError, match="'/'"):
+            validate_arg(_arg("scope_target"), "/etc/passwd")
+
+    def test_specific_backslash_message(self):
+        with pytest.raises(ValidationError, match="backslash"):
+            validate_arg(_arg("scope_target"), "example.com\\nINJECTED")

@@ -226,7 +226,7 @@ func TestGenerateMCPSchema(t *testing.T) {
 				Description: "Scan type",
 			},
 		},
-		Output: manifest.OutputDef{
+		Output: &manifest.OutputDef{
 			Schema: map[string]any{
 				"type": "object",
 			},
@@ -271,7 +271,7 @@ func TestExecuteEcho(t *testing.T) {
 		Command: manifest.CommandDef{
 			Template: "echo {msg}",
 		},
-		Output: manifest.OutputDef{
+		Output: &manifest.OutputDef{
 			Format: "text",
 		},
 	}

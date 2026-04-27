@@ -61,6 +61,37 @@ def _validate_integer(arg_def: ArgDef, value: str) -> str:
     return str(num)
 
 
+def _validate_number(arg_def: ArgDef, value: str) -> str:
+    import math
+    try:
+        num = float(value)
+    except (ValueError, TypeError):
+        raise ValidationError(f"Expected number, got: {value!r}")
+    if not math.isfinite(num):
+        raise ValidationError(
+            f"Number must be finite (no NaN or infinity), got: {value!r}"
+        )
+
+    lo = arg_def.min_float
+    if lo is None and arg_def.min is not None:
+        lo = float(arg_def.min)
+    hi = arg_def.max_float
+    if hi is None and arg_def.max is not None:
+        hi = float(arg_def.max)
+
+    if lo is not None or hi is not None:
+        bound_lo = lo if lo is not None else num
+        bound_hi = hi if hi is not None else num
+        if arg_def.clamp:
+            num = max(bound_lo, min(bound_hi, num))
+        else:
+            if num < bound_lo:
+                raise ValidationError(f"Value {num} is below minimum {bound_lo}")
+            if num > bound_hi:
+                raise ValidationError(f"Value {num} is above maximum {bound_hi}")
+    return str(num)
+
+
 def _validate_port(arg_def: ArgDef, value: str) -> str:
     try:
         port = int(value)
@@ -113,14 +144,50 @@ def _is_valid_cidr(value: str) -> bool:
         return False
 
 
+def _has_punycode_label(host: str) -> bool:
+    """Returns True if any DNS label in `host` is an A-label (case-insensitive xn--)."""
+    for label in host.split("."):
+        if len(label) >= 4 and label[:4].lower() == "xn--":
+            return True
+    return False
+
+
 def _validate_scope_target(arg_def: ArgDef, value: str) -> str:
     # Scope validation rules (aligned across Rust, Python, JS, Go):
     # 1. Reject shell metacharacters  2. Block * and ? wildcards
-    # 3. Accept valid IPv4, IPv6, CIDR, or hostname
+    # 3. Surface specific failure modes (traversal, slashes, escapes, IDN) before
+    #    falling through to the generic regex catch-all.
+    # 4. Accept valid IPv4, IPv6, CIDR, or hostname.
     _check_injection(value)
-    # Block wildcard targets.
     if "*" in value or "?" in value:
         raise ValidationError(f"Wildcard targets are not allowed: {value!r}")
+
+    if "../" in value or "..\\" in value or "/.." in value:
+        raise ValidationError(
+            f"scope_target must not contain path traversal sequences: {value!r}"
+        )
+    if "/" in value and not _is_valid_cidr(value) and not _is_valid_ip(value):
+        raise ValidationError(
+            f"scope_target must not contain '/' "
+            f"(use CIDR notation for ranges): {value!r}"
+        )
+    if "\\" in value:
+        raise ValidationError(
+            f"scope_target must not contain backslash escape sequences: {value!r}"
+        )
+    if not value.isascii():
+        raise ValidationError(
+            f"scope_target must be ASCII (non-ASCII hostnames including IDN "
+            f"homoglyphs are rejected; gate IDN registration upstream if needed): {value!r}"
+        )
+    # Defense-in-depth against IDN homoglyph bypass via punycode.
+    if _has_punycode_label(value):
+        raise ValidationError(
+            f"scope_target must not contain punycode (xn--) labels — IDN/IDNA "
+            f"hostnames are rejected to prevent homoglyph bypass; gate IDN "
+            f"registration upstream if needed: {value!r}"
+        )
+
     if not (_is_valid_ip(value) or _is_valid_cidr(value) or _is_valid_hostname(value)):
         raise ValidationError(
             f"Invalid scope target: {value!r} "
@@ -232,6 +299,7 @@ def _validate_regex_match(arg_def: ArgDef, value: str) -> str:
 _TYPE_HANDLERS = {
     "string": _validate_string,
     "integer": _validate_integer,
+    "number": _validate_number,
     "port": _validate_port,
     "boolean": _validate_boolean,
     "enum": _validate_enum,
@@ -301,6 +369,8 @@ def validate_arg_with_custom_types(
             pattern=custom.pattern or arg_def.pattern,
             min=custom.min if custom.min is not None else arg_def.min,
             max=custom.max if custom.max is not None else arg_def.max,
+            min_float=custom.min_float if custom.min_float is not None else arg_def.min_float,
+            max_float=custom.max_float if custom.max_float is not None else arg_def.max_float,
             clamp=arg_def.clamp,
             sanitize=arg_def.sanitize,
             schemes=arg_def.schemes,

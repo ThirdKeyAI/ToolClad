@@ -9,7 +9,10 @@ pub struct Manifest {
     pub args: HashMap<String, ArgDef>,
     #[serde(default)]
     pub command: CommandDef,
-    pub output: OutputDef,
+    /// Output schema. Required for execution-mode manifests; optional when
+    /// `tool.dispatch = "callback"` (validator-only embeddings).
+    #[serde(default)]
+    pub output: Option<OutputDef>,
     pub http: Option<HttpDef>,
     pub mcp: Option<McpProxyDef>,
     pub session: Option<SessionDef>,
@@ -29,8 +32,18 @@ pub struct ToolMeta {
     pub risk_tier: String,
     #[serde(default)]
     pub human_approval: bool,
+    /// Dispatch mode. `"exec"` (default) runs an execution backend; `"callback"`
+    /// declares the manifest as validator-only — no [output] or backend
+    /// required. Useful for in-process embeddings where ToolClad is the typed
+    /// argument fence and dispatch happens elsewhere.
+    #[serde(default = "default_dispatch")]
+    pub dispatch: String,
     pub cedar: Option<CedarMeta>,
     pub evidence: Option<EvidenceMeta>,
+}
+
+fn default_dispatch() -> String {
+    "exec".to_string()
 }
 
 fn default_timeout() -> u64 {
@@ -92,6 +105,12 @@ pub struct ArgDef {
     pub min: Option<i64>,
     #[serde(default)]
     pub max: Option<i64>,
+    /// Float bound for `number` type. Falls back to `min` cast to f64 when unset.
+    #[serde(default)]
+    pub min_float: Option<f64>,
+    /// Float bound for `number` type. Falls back to `max` cast to f64 when unset.
+    #[serde(default)]
+    pub max_float: Option<f64>,
     #[serde(default)]
     pub clamp: bool,
     #[serde(default)]
@@ -369,4 +388,8 @@ pub struct CustomTypeDef {
     pub min: Option<i64>,
     #[serde(default)]
     pub max: Option<i64>,
+    #[serde(default)]
+    pub min_float: Option<f64>,
+    #[serde(default)]
+    pub max_float: Option<f64>,
 }

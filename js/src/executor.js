@@ -806,7 +806,7 @@ export function generateMcpSchema(manifest) {
 
   const argDefs = manifest.args || {};
   for (const [name, def] of Object.entries(argDefs)) {
-    const typeInfo = mcpTypeAndConstraints(def.type);
+    const typeInfo = mcpTypeAndConstraints(def.type, def);
     const prop = {
       ...typeInfo,
       description: def.description || "",
@@ -841,10 +841,16 @@ export function generateMcpSchema(manifest) {
   return schema;
 }
 
-function mcpTypeAndConstraints(toolcladType) {
+function mcpTypeAndConstraints(toolcladType, argDef) {
   switch (toolcladType) {
     case "integer":
       return { type: "integer" };
+    case "number": {
+      const out = { type: "number" };
+      if (argDef && argDef.min_float !== undefined) out.minimum = argDef.min_float;
+      if (argDef && argDef.max_float !== undefined) out.maximum = argDef.max_float;
+      return out;
+    }
     case "port":
       return { type: "integer", minimum: 1, maximum: 65535 };
     case "boolean":

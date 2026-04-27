@@ -39,6 +39,7 @@ export function validateArg(argDef, value) {
 const TYPE_HANDLERS = {
   string: validateString,
   integer: validateInteger,
+  number: validateNumber,
   port: validatePort,
   boolean: validateBoolean,
   enum: validateEnum,
@@ -91,6 +92,27 @@ function validateInteger(argDef, value) {
   return num;
 }
 
+function validateNumber(argDef, value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    throw new Error(`Expected finite number, got: ${value}`);
+  }
+  const min = argDef.min_float ?? (argDef.min !== undefined ? Number(argDef.min) : undefined);
+  const max = argDef.max_float ?? (argDef.max !== undefined ? Number(argDef.max) : undefined);
+  if (argDef.clamp) {
+    const lo = min ?? -Infinity;
+    const hi = max ?? Infinity;
+    return Math.max(lo, Math.min(hi, num));
+  }
+  if (min !== undefined && num < min) {
+    throw new Error(`Number ${num} is below minimum ${min}`);
+  }
+  if (max !== undefined && num > max) {
+    throw new Error(`Number ${num} exceeds maximum ${max}`);
+  }
+  return num;
+}
+
 function validatePort(argDef, value) {
   const num = Number(value);
   if (!Number.isInteger(num) || num < 1 || num > 65535) {
@@ -117,20 +139,58 @@ function validateEnum(argDef, value) {
   return str;
 }
 
+function hasPunycodeLabel(host) {
+  return host.split(".").some(
+    (label) => label.length >= 4 && label.slice(0, 4).toLowerCase() === "xn--"
+  );
+}
+
 function validateScopeTarget(argDef, value) {
   // Scope validation rules (aligned across Rust, Python, JS, Go):
   // 1. Reject shell metacharacters  2. Block * and ? wildcards
-  // 3. Accept valid IPv4, IPv6, CIDR, or hostname
+  // 3. Surface specific failure modes (traversal, IDN, non-ASCII, slashes)
+  //    BEFORE the generic regex catch-all so forensic triage and per-fence
+  //    bite-rate analysis can distinguish attack shapes.
+  // 4. Accept valid IPv4, IPv6, CIDR, or hostname.
   const str = String(value);
   checkInjection(str);
   if (str.includes("*") || str.includes("?")) {
     throw new Error(`Wildcard not allowed in scope_target: ${str}`);
   }
+
   const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
   const ipv6Re = /^[0-9a-fA-F:]+$/;
   const cidrRe = /^[0-9a-fA-F.:]+\/\d{1,3}$/;
   const hostnameRe =
     /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/;
+
+  if (str.includes("../") || str.includes("..\\") || str.includes("/..")) {
+    throw new Error(
+      `scope_target must not contain path traversal sequences: ${str}`
+    );
+  }
+  if (str.includes("/") && !cidrRe.test(str) && !ipv4Re.test(str) && !ipv6Re.test(str)) {
+    throw new Error(
+      `scope_target must not contain '/' (use CIDR notation for ranges): ${str}`
+    );
+  }
+  // checkInjection already rejects backslashes, but keep an explicit message
+  // for forensic clarity if the upstream check ever loosens.
+  if (/[^\x00-\x7f]/.test(str)) {
+    throw new Error(
+      `scope_target must be ASCII (non-ASCII hostnames including IDN homoglyphs are rejected; gate IDN registration upstream if needed): ${str}`
+    );
+  }
+  // Defense-in-depth against IDN homoglyph bypass via punycode: an attacker
+  // who registers a Cyrillic-homoglyph domain (exаmple.com) and supplies its
+  // ASCII punycode form (xn--example-9c.com) would otherwise satisfy the
+  // ASCII-strict hostname regex below. Reject xn-- labels.
+  if (hasPunycodeLabel(str)) {
+    throw new Error(
+      `scope_target must not contain punycode (xn--) labels — IDN/IDNA hostnames are rejected to prevent homoglyph bypass; gate IDN registration upstream if needed: ${str}`
+    );
+  }
+
   if (
     !ipv4Re.test(str) &&
     !ipv6Re.test(str) &&
@@ -308,6 +368,8 @@ export function validateArgWithCustomTypes(argDef, value, customTypes) {
       pattern: custom.pattern || argDef.pattern,
       min: custom.min ?? argDef.min,
       max: custom.max ?? argDef.max,
+      min_float: custom.min_float ?? argDef.min_float,
+      max_float: custom.max_float ?? argDef.max_float,
     };
     return handler(synthetic, value);
   }

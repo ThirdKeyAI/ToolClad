@@ -31,8 +31,13 @@ type ToolMeta struct {
 	TimeoutSeconds int          `toml:"timeout_seconds"`
 	RiskTier       string       `toml:"risk_tier"`
 	HumanApproval  bool         `toml:"human_approval"`
-	Cedar          *CedarDef    `toml:"cedar"`
-	Evidence       *EvidenceDef `toml:"evidence"`
+	// Dispatch mode: "exec" (default) runs an execution backend; "callback"
+	// declares the manifest as validator-only — no [output] block or backend
+	// is required. Useful for in-process embeddings where ToolClad is the
+	// typed-argument fence and dispatch happens elsewhere.
+	Dispatch string       `toml:"dispatch"`
+	Cedar    *CedarDef    `toml:"cedar"`
+	Evidence *EvidenceDef `toml:"evidence"`
 }
 
 // ArgDef defines a single tool argument from [args.*].
@@ -47,6 +52,9 @@ type ArgDef struct {
 	Pattern     string   `toml:"pattern"`
 	Min         *int     `toml:"min"`
 	Max         *int     `toml:"max"`
+	// Float bounds for `number` type. Fall back to Min/Max cast to float64 when nil.
+	MinFloat    *float64 `toml:"min_float"`
+	MaxFloat    *float64 `toml:"max_float"`
 	Clamp       bool     `toml:"clamp"`
 	Sanitize    []string `toml:"sanitize"`
 	Schemes     []string `toml:"schemes"`
@@ -173,11 +181,13 @@ type BrowserStateDef struct {
 }
 
 // Manifest is a fully parsed .clad.toml file.
+//
+// Output is a pointer because callback-dispatch manifests may omit [output].
 type Manifest struct {
 	Tool       ToolMeta           `toml:"tool"`
 	Args       map[string]*ArgDef `toml:"args"`
 	Command    CommandDef         `toml:"command"`
-	Output     OutputDef          `toml:"output"`
+	Output     *OutputDef         `toml:"output"`
 	Http       *HttpDef           `toml:"http"`
 	Mcp        *McpProxyDef       `toml:"mcp"`
 	Session    *SessionDef        `toml:"session"`
@@ -234,12 +244,50 @@ func LoadManifest(path string) (*Manifest, error) {
 		m.Tool.RiskTier = "low"
 	}
 
+	// Set default dispatch mode.
+	if m.Tool.Dispatch == "" {
+		m.Tool.Dispatch = "exec"
+	}
+	if m.Tool.Dispatch != "exec" && m.Tool.Dispatch != "callback" {
+		return nil, fmt.Errorf(
+			"manifest %s: invalid dispatch '%s', must be 'exec' or 'callback'",
+			path, m.Tool.Dispatch,
+		)
+	}
+
 	// Populate arg names from map keys.
 	for name, arg := range m.Args {
 		arg.Name = name
 		// Default type to string.
 		if arg.Type == "" {
 			arg.Type = "string"
+		}
+	}
+
+	// Cross-section validation. Callback dispatch is for validator-only
+	// embeddings; no backend or [output] block is required.
+	if m.Tool.Dispatch != "callback" {
+		hasBackend := m.Command.Template != "" ||
+			len(m.Command.Exec) > 0 ||
+			m.Command.Executor != "" ||
+			m.Http != nil ||
+			m.Mcp != nil ||
+			m.Session != nil ||
+			m.Browser != nil
+		if !hasBackend {
+			return nil, fmt.Errorf(
+				"manifest %s: must define at least one execution backend: "+
+					"[command] template/executor, [http], [mcp], [session], or [browser] "+
+					"(or set tool.dispatch = \"callback\" for validator-only manifests)",
+				path,
+			)
+		}
+		if m.Output == nil {
+			return nil, fmt.Errorf(
+				"manifest %s: missing [output] block "+
+					"(or set tool.dispatch = \"callback\" for validator-only manifests)",
+				path,
+			)
 		}
 	}
 

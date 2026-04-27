@@ -56,7 +56,9 @@ def validate(manifest_path: str) -> None:
         click.echo(f"Template:     {manifest.command.template}")
     elif manifest.command.executor:
         click.echo(f"Executor:     {manifest.command.executor}")
-    click.echo(f"Output:       {manifest.output.format}")
+    out_format = manifest.output.format if manifest.output else "(none — callback dispatch)"
+    click.echo(f"Output:       {out_format}")
+    click.echo(f"Dispatch:     {manifest.tool.dispatch}")
     click.echo()
     click.echo("OK")
 
@@ -83,6 +85,12 @@ def _mcp_type_and_constraints(arg) -> Tuple[str, dict]:
     extra: dict = {}
     if t == "integer":
         return "integer", extra
+    if t == "number":
+        if arg.min_float is not None:
+            extra["minimum"] = arg.min_float
+        if arg.max_float is not None:
+            extra["maximum"] = arg.max_float
+        return "number", extra
     if t == "port":
         extra = {"minimum": 1, "maximum": 65535}
         return "integer", extra
@@ -133,26 +141,28 @@ def schema(manifest_path: str) -> None:
     }
 
     # Build outputSchema: wrap results schema in envelope if configured.
+    # Callback-only manifests have no [output] block — omit outputSchema entirely.
     output_schema: dict = {}
-    if manifest.output.envelope:
-        output_schema = {
-            "type": "object",
-            "properties": {
-                "status": {"type": "string", "enum": ["success", "error"]},
-                "scan_id": {"type": "string"},
-                "tool": {"type": "string"},
-                "command": {"type": "string"},
-                "duration_ms": {"type": "integer"},
-                "timestamp": {"type": "string", "format": "date-time"},
-                "output_file": {"type": "string"},
-                "output_hash": {"type": "string"},
-                "exit_code": {"type": "integer"},
-                "stderr": {"type": "string"},
-                "results": manifest.output.schema or {"type": "object"},
-            },
-        }
-    elif manifest.output.schema:
-        output_schema = manifest.output.schema
+    if manifest.output is not None:
+        if manifest.output.envelope:
+            output_schema = {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["success", "error"]},
+                    "scan_id": {"type": "string"},
+                    "tool": {"type": "string"},
+                    "command": {"type": "string"},
+                    "duration_ms": {"type": "integer"},
+                    "timestamp": {"type": "string", "format": "date-time"},
+                    "output_file": {"type": "string"},
+                    "output_hash": {"type": "string"},
+                    "exit_code": {"type": "integer"},
+                    "stderr": {"type": "string"},
+                    "results": manifest.output.schema or {"type": "object"},
+                },
+            }
+        elif manifest.output.schema:
+            output_schema = manifest.output.schema
 
     mcp_tool = {
         "name": manifest.tool.name,

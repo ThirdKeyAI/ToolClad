@@ -364,6 +364,9 @@ error_status = [500, 503]
 
 [http.headers]
 Authorization = "Bearer {_secret:token}"
+
+[output]
+format = "json"
 """
         p = tmp_path / "api.clad.toml"
         p.write_bytes(toml_content)
@@ -431,6 +434,54 @@ class TestMcpProxyExecution:
 # ---------------------------------------------------------------------------
 
 class TestMcpManifestParsing:
+    def test_callback_dispatch_allows_no_backend_or_output(self, tmp_path):
+        toml_content = b"""
+[tool]
+name = "store_knowledge"
+version = "1.0.0"
+binary = "callback"
+description = "Validator-only embedding"
+risk_tier = "low"
+dispatch = "callback"
+
+[args.confidence]
+position = 1
+required = true
+type = "number"
+min_float = 0.0
+max_float = 1.0
+description = "Confidence 0-1"
+"""
+        p = tmp_path / "store.clad.toml"
+        p.write_bytes(toml_content)
+        from toolclad.manifest import load_manifest
+        m = load_manifest(str(p))
+        assert m.tool.dispatch == "callback"
+        assert m.output is None
+        assert not m.command.exec
+        assert m.args["confidence"].min_float == 0.0
+        assert m.args["confidence"].max_float == 1.0
+
+    def test_invalid_dispatch_rejected(self, tmp_path):
+        toml_content = b"""
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "x"
+dispatch = "rocket"
+
+[command]
+exec = ["true"]
+
+[output]
+format = "text"
+"""
+        p = tmp_path / "bad.clad.toml"
+        p.write_bytes(toml_content)
+        from toolclad.manifest import load_manifest
+        with pytest.raises(ValueError, match="invalid dispatch"):
+            load_manifest(str(p))
+
     def test_load_mcp_manifest(self, tmp_path):
         toml_content = b"""
 [tool]
@@ -445,6 +496,9 @@ tool = "my-tool"
 [mcp.field_map]
 source = "input"
 dest = "output"
+
+[output]
+format = "json"
 """
         p = tmp_path / "mcp.clad.toml"
         p.write_bytes(toml_content)
