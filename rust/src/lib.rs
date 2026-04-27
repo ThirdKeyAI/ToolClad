@@ -24,6 +24,7 @@
 //! |------|-----------|
 //! | `string` | Non-empty, injection-safe, optional regex pattern |
 //! | `integer` | Numeric with optional min/max and clamping |
+//! | `number` | Float with optional `min_float`/`max_float` and clamping |
 //! | `port` | 1-65535 |
 //! | `boolean` | Exactly `"true"` or `"false"` |
 //! | `enum` | Value in declared `allowed` list |
@@ -109,19 +110,39 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 
 /// Validate internal consistency of a parsed manifest.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
-    // Must have at least one execution backend.
-    if manifest.command.template.is_none()
-        && manifest.command.exec.is_none()
-        && manifest.command.executor.is_none()
-        && manifest.http.is_none()
-        && manifest.mcp.is_none()
-        && manifest.session.is_none()
-        && manifest.browser.is_none()
-    {
-        return Err(ToolCladError::ManifestError(
-            "manifest must define at least one execution backend: [command] template/executor, [http], [mcp], [session], or [browser]"
-                .to_string(),
-        ));
+    // Validate dispatch mode.
+    let valid_dispatch = ["exec", "callback"];
+    if !valid_dispatch.contains(&manifest.tool.dispatch.as_str()) {
+        return Err(ToolCladError::ManifestError(format!(
+            "invalid dispatch '{}', must be one of: {}",
+            manifest.tool.dispatch,
+            valid_dispatch.join(", ")
+        )));
+    }
+
+    let is_callback = manifest.tool.dispatch == "callback";
+
+    // exec dispatch requires a backend and an [output] block.
+    if !is_callback {
+        if manifest.command.template.is_none()
+            && manifest.command.exec.is_none()
+            && manifest.command.executor.is_none()
+            && manifest.http.is_none()
+            && manifest.mcp.is_none()
+            && manifest.session.is_none()
+            && manifest.browser.is_none()
+        {
+            return Err(ToolCladError::ManifestError(
+                "manifest must define at least one execution backend: [command] template/executor, [http], [mcp], [session], or [browser] (or set tool.dispatch = \"callback\" for validator-only manifests)"
+                    .to_string(),
+            ));
+        }
+        if manifest.output.is_none() {
+            return Err(ToolCladError::ManifestError(
+                "manifest is missing [output] block (or set tool.dispatch = \"callback\" for validator-only manifests)"
+                    .to_string(),
+            ));
+        }
     }
 
     // Validate argument types and constraints.
@@ -193,6 +214,8 @@ pub fn load_custom_types<P: AsRef<Path>>(
                     .map(String::from),
                 min: def.get("min").and_then(|m| m.as_integer()),
                 max: def.get("max").and_then(|m| m.as_integer()),
+                min_float: def.get("min_float").and_then(|m| m.as_float()),
+                max_float: def.get("max_float").and_then(|m| m.as_float()),
             };
             types.insert(name.clone(), custom);
         }
@@ -216,6 +239,15 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
         match def.type_name.as_str() {
             "integer" => {
                 prop.insert("type".to_string(), serde_json::json!("integer"));
+            }
+            "number" => {
+                prop.insert("type".to_string(), serde_json::json!("number"));
+                if let Some(lo) = def.min_float {
+                    prop.insert("minimum".to_string(), serde_json::json!(lo));
+                }
+                if let Some(hi) = def.max_float {
+                    prop.insert("maximum".to_string(), serde_json::json!(hi));
+                }
             }
             "port" => {
                 prop.insert("type".to_string(), serde_json::json!("integer"));
@@ -307,8 +339,9 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
     });
 
     // Build the envelope output schema wrapping the declared results schema.
-    let output_schema = if manifest.output.envelope {
-        serde_json::json!({
+    // For callback-only manifests with no [output] block, omit the output schema.
+    let output_schema = match manifest.output.as_ref() {
+        Some(out) if out.envelope => serde_json::json!({
             "type": "object",
             "properties": {
                 "status": { "type": "string", "enum": ["success", "error", "timeout", "delegation_preview"] },
@@ -321,19 +354,24 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
                 "output_hash": { "type": "string" },
                 "exit_code": { "type": "integer" },
                 "stderr": { "type": "string" },
-                "results": manifest.output.schema,
+                "results": out.schema,
             }
-        })
-    } else {
-        manifest.output.schema.clone()
+        }),
+        Some(out) => out.schema.clone(),
+        None => serde_json::Value::Null,
     };
 
-    serde_json::json!({
-        "name": manifest.tool.name,
-        "description": manifest.tool.description,
-        "inputSchema": input_schema,
-        "outputSchema": output_schema,
-    })
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("name".to_string(), serde_json::json!(manifest.tool.name));
+    envelope.insert(
+        "description".to_string(),
+        serde_json::json!(manifest.tool.description),
+    );
+    envelope.insert("inputSchema".to_string(), input_schema);
+    if !output_schema.is_null() {
+        envelope.insert("outputSchema".to_string(), output_schema);
+    }
+    serde_json::Value::Object(envelope)
 }
 
 #[cfg(test)]
@@ -467,6 +505,33 @@ type = "object"
         assert_eq!(schema["name"], "whois_lookup");
         assert!(schema["inputSchema"]["properties"]["target"].is_object());
         assert!(schema["outputSchema"]["properties"]["results"].is_object());
+    }
+
+    #[test]
+    fn test_generate_mcp_schema_number_type() {
+        let toml_str = r#"
+[tool]
+name = "score"
+version = "1.0.0"
+binary = "callback"
+description = "x"
+risk_tier = "low"
+dispatch = "callback"
+
+[args.confidence]
+position = 1
+required = true
+type = "number"
+min_float = 0.0
+max_float = 1.0
+description = "Confidence"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        let schema = generate_mcp_schema(&m);
+        let prop = &schema["inputSchema"]["properties"]["confidence"];
+        assert_eq!(prop["type"], "number");
+        assert_eq!(prop["minimum"], 0.0);
+        assert_eq!(prop["maximum"], 1.0);
     }
 
     #[test]
@@ -821,6 +886,79 @@ type = "object"
         assert_eq!(browser.session_timeout_seconds, 600);
         assert_eq!(browser.idle_timeout_seconds, 120);
         assert_eq!(browser.max_interactions, 200);
+    }
+
+    #[test]
+    fn test_callback_dispatch_allows_no_backend_or_output() {
+        // Validator-only embedding: in-process dispatch, no [output] / no backend.
+        let toml_str = r#"
+[tool]
+name = "store_knowledge"
+version = "1.0.0"
+binary = "callback"
+description = "In-process callback dispatch"
+risk_tier = "low"
+dispatch = "callback"
+
+[args.confidence]
+position = 1
+required = true
+type = "number"
+min_float = 0.0
+max_float = 1.0
+description = "Confidence score 0–1"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        assert_eq!(m.tool.dispatch, "callback");
+        assert!(m.output.is_none());
+        assert!(m.command.exec.is_none());
+    }
+
+    #[test]
+    fn test_callback_dispatch_schema_omits_output() {
+        let toml_str = r#"
+[tool]
+name = "store_knowledge"
+version = "1.0.0"
+binary = "callback"
+description = "In-process callback dispatch"
+risk_tier = "low"
+dispatch = "callback"
+
+[args.note]
+position = 1
+required = true
+type = "string"
+description = "Note text"
+"#;
+        let m = parse_manifest(toml_str).unwrap();
+        let schema = generate_mcp_schema(&m);
+        assert_eq!(schema["name"], "store_knowledge");
+        assert!(schema.get("outputSchema").is_none());
+    }
+
+    #[test]
+    fn test_invalid_dispatch_rejected() {
+        let toml_str = r#"
+[tool]
+name = "bad"
+version = "1.0.0"
+binary = "x"
+description = "x"
+risk_tier = "low"
+dispatch = "rocket"
+
+[command]
+exec = ["true"]
+
+[output]
+format = "text"
+
+[output.schema]
+type = "object"
+"#;
+        let err = parse_manifest(toml_str).unwrap_err().to_string();
+        assert!(err.contains("invalid dispatch"));
     }
 
     #[test]

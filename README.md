@@ -133,10 +133,11 @@ cd go && go run ./cmd/toolclad test ../examples/whois_lookup.clad.toml --arg tar
 |------|-----------|---------|
 | `string` | Non-empty, injection-safe, optional regex `pattern` | General text |
 | `integer` | Numeric, optional `min`/`max` with `clamp` | Thread counts |
+| `number` | Float, optional `min_float`/`max_float` with `clamp`; rejects NaN/inf | Confidence scores, ratios |
 | `port` | 1-65535 | Network ports |
 | `boolean` | Exactly `"true"` or `"false"` | Feature flags |
 | `enum` | Value in declared `allowed` list | Scan types |
-| `scope_target` | Injection-safe, no wildcards, valid IP/CIDR/hostname | Targets |
+| `scope_target` | Injection-safe, ASCII-only, IDN/punycode rejected, no wildcards/traversal, valid IP/CIDR/hostname | Targets |
 | `url` | Valid URL, optional `schemes` restriction, `scope_check` | Web targets |
 | `path` | No traversal (`../`), no absolute paths | File paths |
 | `ip_address` | Valid IPv4 or IPv6 | Addresses |
@@ -166,6 +167,30 @@ allowed = ["info", "low", "medium", "high", "critical"]
 ```
 
 Reference in manifests: `type = "service_protocol"`
+
+### Dispatch Modes
+
+`tool.dispatch` selects the execution model:
+
+- `"exec"` (default) — manifest must declare a backend (`[command]`, `[http]`,
+  `[mcp]`, `[session]`, or `[browser]`) and an `[output]` block. ToolClad runs
+  the backend itself.
+- `"callback"` — validator-only embedding. Backend and `[output]` are
+  optional; in-process code dispatches the validated arguments however it
+  likes. Useful when ToolClad is just the typed-argument fence and execution
+  happens elsewhere (e.g. a runtime that maps tool calls to native functions).
+
+```toml
+[tool]
+name = "store_knowledge"
+dispatch = "callback"
+
+[args.confidence]
+type = "number"
+min_float = 0.0
+max_float = 1.0
+required = true
+```
 
 ## Output Handling
 

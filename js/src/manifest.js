@@ -14,29 +14,42 @@ export function loadManifest(path) {
     throw new Error(`Invalid manifest: missing [tool] section or tool.name`);
   }
 
-  // v0.5.0: http and mcp modes do not require binary or command sections
-  // v0.5.1: session and browser modes also exempt from binary/command
-  const hasHttp = !!manifest.http;
-  const hasMcp = !!manifest.mcp;
-  const hasSession = !!manifest.session;
-  const hasBrowser = !!manifest.browser;
+  // Default and validate dispatch mode.
+  const dispatch = manifest.tool.dispatch ?? "exec";
+  if (dispatch !== "exec" && dispatch !== "callback") {
+    throw new Error(
+      `Invalid manifest: invalid dispatch '${dispatch}', must be 'exec' or 'callback'`
+    );
+  }
+  manifest.tool.dispatch = dispatch;
 
-  if (!hasHttp && !hasMcp && !hasSession && !hasBrowser) {
-    if (!manifest.tool.binary && !(manifest.command && manifest.command.executor)) {
-      throw new Error(
-        `Invalid manifest: must specify tool.binary, command.executor, [http], [mcp], [session], or [browser]`
-      );
-    }
-    if (!manifest.command) {
-      throw new Error(`Invalid manifest: missing [command] section`);
-    }
-    if (!manifest.command.template && !manifest.command.exec && !manifest.command.executor) {
-      throw new Error(
-        `Invalid manifest: [command] must have template, exec, or executor`
-      );
-    }
-    if (!manifest.output) {
-      throw new Error(`Invalid manifest: missing [output] section`);
+  const isCallback = dispatch === "callback";
+
+  // Callback dispatch is for validator-only embeddings — no backend or
+  // [output] block is required because dispatch happens in-process.
+  if (!isCallback) {
+    const hasHttp = !!manifest.http;
+    const hasMcp = !!manifest.mcp;
+    const hasSession = !!manifest.session;
+    const hasBrowser = !!manifest.browser;
+
+    if (!hasHttp && !hasMcp && !hasSession && !hasBrowser) {
+      if (!manifest.tool.binary && !(manifest.command && manifest.command.executor)) {
+        throw new Error(
+          `Invalid manifest: must specify tool.binary, command.executor, [http], [mcp], [session], or [browser] (or set tool.dispatch = "callback" for validator-only manifests)`
+        );
+      }
+      if (!manifest.command) {
+        throw new Error(`Invalid manifest: missing [command] section`);
+      }
+      if (!manifest.command.template && !manifest.command.exec && !manifest.command.executor) {
+        throw new Error(
+          `Invalid manifest: [command] must have template, exec, or executor`
+        );
+      }
+      if (!manifest.output) {
+        throw new Error(`Invalid manifest: missing [output] section (or set tool.dispatch = "callback" for validator-only manifests)`);
+      }
     }
   }
 
@@ -64,6 +77,8 @@ export function loadCustomTypes(path) {
         pattern: def.pattern || undefined,
         min: def.min ?? undefined,
         max: def.max ?? undefined,
+        min_float: def.min_float ?? undefined,
+        max_float: def.max_float ?? undefined,
       };
     }
   }

@@ -41,6 +41,11 @@ class ToolMeta:
     timeout_seconds: int = 60
     risk_tier: str = "low"
     human_approval: bool = False
+    # Dispatch mode: "exec" (default) runs an execution backend; "callback"
+    # declares the manifest as validator-only — no [output] or backend
+    # required. Useful for in-process embeddings where ToolClad is the
+    # typed-argument fence and dispatch happens elsewhere.
+    dispatch: str = "exec"
     cedar: CedarDef = field(default_factory=CedarDef)
     evidence: EvidenceDef = field(default_factory=EvidenceDef)
 
@@ -59,6 +64,9 @@ class ArgDef:
     pattern: str = ""
     min: Optional[int] = None
     max: Optional[int] = None
+    # Float bounds for `number` type. Fall back to min/max cast to float when unset.
+    min_float: Optional[float] = None
+    max_float: Optional[float] = None
     clamp: bool = False
     sanitize: List[str] = field(default_factory=list)
     schemes: List[str] = field(default_factory=list)
@@ -209,7 +217,9 @@ class Manifest:
     tool: ToolMeta = field(default_factory=ToolMeta)
     args: Dict[str, ArgDef] = field(default_factory=dict)
     command: CommandDef = field(default_factory=CommandDef)
-    output: OutputDef = field(default_factory=OutputDef)
+    # Output is required for execution-mode manifests; optional when
+    # tool.dispatch == "callback" (validator-only embeddings).
+    output: Optional[OutputDef] = None
     http: Optional[HttpDef] = None
     mcp: Optional[McpProxyDef] = None
     session: Optional[SessionDef] = None
@@ -251,6 +261,7 @@ def _parse_tool(data: Dict[str, Any]) -> ToolMeta:
         timeout_seconds=data.get("timeout_seconds", 60),
         risk_tier=data.get("risk_tier", "low"),
         human_approval=data.get("human_approval", False),
+        dispatch=data.get("dispatch", "exec"),
     )
     if "cedar" in data:
         meta.cedar = _parse_cedar(data["cedar"])
@@ -271,6 +282,8 @@ def _parse_arg(name: str, data: Dict[str, Any]) -> ArgDef:
         pattern=data.get("pattern", ""),
         min=data.get("min"),
         max=data.get("max"),
+        min_float=data.get("min_float"),
+        max_float=data.get("max_float"),
         clamp=data.get("clamp", False),
         sanitize=data.get("sanitize", []),
         schemes=data.get("schemes", []),
@@ -423,6 +436,8 @@ class CustomTypeDef:
     pattern: str = ""
     min: Optional[int] = None
     max: Optional[int] = None
+    min_float: Optional[float] = None
+    max_float: Optional[float] = None
 
 
 def load_custom_types(path: str) -> Dict[str, CustomTypeDef]:
@@ -445,6 +460,8 @@ def load_custom_types(path: str) -> Dict[str, CustomTypeDef]:
             pattern=tdef.get("pattern", ""),
             min=tdef.get("min"),
             max=tdef.get("max"),
+            min_float=tdef.get("min_float"),
+            max_float=tdef.get("max_float"),
         )
     return types
 
@@ -499,4 +516,39 @@ def load_manifest(path: str) -> Manifest:
     if "browser" in data:
         manifest.browser = _parse_browser(data["browser"])
 
+    _validate_manifest(manifest)
     return manifest
+
+
+def _validate_manifest(manifest: Manifest) -> None:
+    """Cross-section consistency checks. Mirrors the Rust validator."""
+    valid_dispatch = ("exec", "callback")
+    if manifest.tool.dispatch not in valid_dispatch:
+        raise ValueError(
+            f"invalid dispatch '{manifest.tool.dispatch}', must be one of: "
+            f"{', '.join(valid_dispatch)}"
+        )
+
+    is_callback = manifest.tool.dispatch == "callback"
+    if not is_callback:
+        cmd = manifest.command
+        has_backend = bool(
+            cmd.template
+            or cmd.exec
+            or cmd.executor
+            or manifest.http
+            or manifest.mcp
+            or manifest.session
+            or manifest.browser
+        )
+        if not has_backend:
+            raise ValueError(
+                "manifest must define at least one execution backend: "
+                "[command] template/executor, [http], [mcp], [session], or [browser] "
+                "(or set tool.dispatch = \"callback\" for validator-only manifests)"
+            )
+        if manifest.output is None:
+            raise ValueError(
+                "manifest is missing [output] block "
+                "(or set tool.dispatch = \"callback\" for validator-only manifests)"
+            )

@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 pub const SUPPORTED_TYPES: &[&str] = &[
     "string",
     "integer",
+    "number",
     "port",
     "boolean",
     "enum",
@@ -50,6 +51,7 @@ pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, Too
     match def.type_name.as_str() {
         "string" => validate_string(name, def, val, true),
         "integer" => validate_integer(name, def, val),
+        "number" => validate_number(name, def, val),
         "port" => validate_port(name, val),
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
@@ -133,6 +135,44 @@ fn validate_integer(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolC
     Ok(n.to_string())
 }
 
+fn validate_number(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    let mut n: f64 = val.parse().map_err(|_| {
+        ToolCladError::ValidationError(format!("argument '{name}' is not a valid number"))
+    })?;
+    if !n.is_finite() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must be a finite number (no NaN or infinity)"
+        )));
+    }
+
+    let min = def.min_float.or_else(|| def.min.map(|m| m as f64));
+    let max = def.max_float.or_else(|| def.max.map(|m| m as f64));
+
+    if let Some(lo) = min {
+        if n < lo {
+            if def.clamp {
+                n = lo;
+            } else {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' value {n} is below minimum {lo}"
+                )));
+            }
+        }
+    }
+    if let Some(hi) = max {
+        if n > hi {
+            if def.clamp {
+                n = hi;
+            } else {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' value {n} is above maximum {hi}"
+                )));
+            }
+        }
+    }
+    Ok(n.to_string())
+}
+
 fn validate_port(name: &str, val: &str) -> Result<String, ToolCladError> {
     let n: u16 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid port number"))
@@ -177,6 +217,41 @@ fn validate_scope_target(name: &str, val: &str) -> Result<String, ToolCladError>
             "argument '{name}' scope_target must not contain wildcards"
         )));
     }
+
+    // Specific failure modes — surface before the generic regex catch-all so that
+    // forensic triage and per-fence bite-rate analysis can distinguish attack
+    // shapes (traversal vs. escape sequences vs. malformed hostnames vs. IDN bypass).
+    if val.contains("../") || val.contains("..\\") || val.contains("/..") {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not contain path traversal sequences"
+        )));
+    }
+    if val.contains('/') && !CIDR_V4_RE.is_match(val) && val.parse::<std::net::IpAddr>().is_err() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not contain '/' (use CIDR notation for ranges)"
+        )));
+    }
+    if val.contains('\\') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not contain backslash escape sequences"
+        )));
+    }
+    if !val.is_ascii() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must be ASCII (non-ASCII hostnames including IDN homoglyphs are rejected; gate IDN registration upstream if needed)"
+        )));
+    }
+
+    // Defense-in-depth against IDN homoglyph bypass via punycode: an attacker who
+    // registers a Cyrillic-homoglyph domain (e.g. exаmple.com) and supplies its
+    // ASCII punycode form (xn--example-9c.com) would otherwise satisfy the
+    // ASCII-strict hostname regex below. Reject any label starting with `xn--`.
+    if has_punycode_label(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not contain punycode (xn--) labels — IDN/IDNA hostnames are rejected to prevent homoglyph bypass; gate IDN registration upstream if needed"
+        )));
+    }
+
     // Accept valid IPs, CIDRs, or hostnames.
     if IPV4_RE.is_match(val)
         || val.parse::<Ipv6Addr>().is_ok()
@@ -189,6 +264,13 @@ fn validate_scope_target(name: &str, val: &str) -> Result<String, ToolCladError>
             "argument '{name}' is not a valid scope target (IP, CIDR, or hostname)"
         )))
     }
+}
+
+/// Returns true if any DNS label in `host` is an A-label (`xn--…`).
+/// Comparison is case-insensitive per IDNA: `XN--`, `Xn--`, `xN--` all count.
+fn has_punycode_label(host: &str) -> bool {
+    host.split('.')
+        .any(|label| label.len() >= 4 && label.as_bytes()[..4].eq_ignore_ascii_case(b"xn--"))
 }
 
 fn validate_url(name: &str, val: &str) -> Result<String, ToolCladError> {
@@ -376,6 +458,12 @@ pub fn validate_arg_with_custom_types(
         if let Some(max) = custom.max {
             synthetic.max = Some(max);
         }
+        if let Some(min_f) = custom.min_float {
+            synthetic.min_float = Some(min_f);
+        }
+        if let Some(max_f) = custom.max_float {
+            synthetic.max_float = Some(max_f);
+        }
         return validate_arg(name, &synthetic, value);
     }
 
@@ -532,6 +620,98 @@ mod tests {
     fn test_scope_target_rejects_injection() {
         let def = make_arg("scope_target");
         assert!(validate_arg("t", &def, "10.0.1.1; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_punycode() {
+        // Defense-in-depth against IDN homoglyph bypass: an attacker who
+        // registers exаmple.com (Cyrillic а) and supplies its punycode form
+        // xn--example-9c.com would otherwise satisfy the ASCII-only regex.
+        let def = make_arg("scope_target");
+        let err = validate_arg("t", &def, "xn--example-9c.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("punycode"));
+        // Mid-label and mixed-case forms are also caught.
+        assert!(validate_arg("t", &def, "sub.xn--80ak6aa92e.com").is_err());
+        assert!(validate_arg("t", &def, "XN--example-9c.com").is_err());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_non_ascii() {
+        let def = make_arg("scope_target");
+        let err = validate_arg("t", &def, "exаmple.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ASCII"));
+    }
+
+    #[test]
+    fn test_scope_target_specific_traversal_message() {
+        // ../../etc/passwd previously collapsed into the generic
+        // "is not a valid scope target" — make sure the specific reason wins.
+        let def = make_arg("scope_target");
+        let err = validate_arg("t", &def, "../../etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("traversal"));
+    }
+
+    #[test]
+    fn test_scope_target_specific_slash_message() {
+        let def = make_arg("scope_target");
+        let err = validate_arg("t", &def, "/etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'/'"));
+    }
+
+    #[test]
+    fn test_scope_target_specific_backslash_message() {
+        let def = make_arg("scope_target");
+        let err = validate_arg("t", &def, "example.com\\nINJECTED")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backslash"));
+    }
+
+    #[test]
+    fn test_number_basic() {
+        let def = make_arg("number");
+        assert_eq!(validate_arg("n", &def, "0.5").unwrap(), "0.5");
+        assert!(validate_arg("n", &def, "abc").is_err());
+        assert!(validate_arg("n", &def, "NaN").is_err());
+        assert!(validate_arg("n", &def, "inf").is_err());
+    }
+
+    #[test]
+    fn test_number_min_max() {
+        let mut def = make_arg("number");
+        def.min_float = Some(0.0);
+        def.max_float = Some(1.0);
+        assert!(validate_arg("conf", &def, "0.5").is_ok());
+        assert!(validate_arg("conf", &def, "-0.1").is_err());
+        assert!(validate_arg("conf", &def, "1.5").is_err());
+    }
+
+    #[test]
+    fn test_number_min_max_falls_back_to_int_bounds() {
+        let mut def = make_arg("number");
+        def.min = Some(1);
+        def.max = Some(10);
+        assert!(validate_arg("n", &def, "5.5").is_ok());
+        assert!(validate_arg("n", &def, "0.5").is_err());
+        assert!(validate_arg("n", &def, "11.0").is_err());
+    }
+
+    #[test]
+    fn test_number_clamp() {
+        let mut def = make_arg("number");
+        def.min_float = Some(0.0);
+        def.max_float = Some(1.0);
+        def.clamp = true;
+        assert_eq!(validate_arg("n", &def, "-5").unwrap(), "0");
+        assert_eq!(validate_arg("n", &def, "5").unwrap(), "1");
     }
 
     #[test]

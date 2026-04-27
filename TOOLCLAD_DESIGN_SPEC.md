@@ -333,10 +333,11 @@ Built-in validation types cover the patterns repeated across all existing wrappe
 |------|-----------|---------|
 | `string` | Non-empty, injection-safe | General text arguments |
 | `integer` | Numeric, optional `min`/`max` with clamping | Thread counts, retry limits |
+| `number` | Float, optional `min_float`/`max_float` with clamping; rejects NaN/inf | Confidence scores, ratios |
 | `port` | Numeric, 1-65535 | Network ports |
 | `boolean` | Exactly `"true"` or `"false"` | Feature flags |
 | `enum` | Value in declared `allowed` list | Scan types, protocols, severity levels |
-| `scope_target` | Injection-safe + scope validation + block wildcards | IPs, CIDRs, hostnames |
+| `scope_target` | Injection-safe + ASCII-only + reject IDN/punycode + block wildcards/traversal | IPs, CIDRs, ASCII hostnames |
 | `url` | Valid URL structure, host extracted for scope validation | Web application targets |
 | `path` | No traversal (`../`), optionally must exist | Wordlists, config files, output dirs |
 | `ip_address` | Valid IPv4 or IPv6 | Listener addresses, bind addresses |

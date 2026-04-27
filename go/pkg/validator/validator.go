@@ -3,6 +3,7 @@ package validator
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -62,20 +63,21 @@ func ValidateArg(def *manifest.ArgDef, value string) (string, error) {
 type typeHandler func(def *manifest.ArgDef, value string) (string, error)
 
 var typeHandlers = map[string]typeHandler{
-	"string":       validateString,
-	"integer":      validateInteger,
-	"port":         validatePort,
-	"boolean":      validateBoolean,
-	"enum":         validateEnum,
-	"scope_target":   validateScopeTarget,
-	"url":            validateURL,
-	"path":           validatePath,
-	"ip_address":     validateIPAddress,
-	"cidr":           validateCIDR,
-	"msf_options":    validateMsfOptions,
+	"string":          validateString,
+	"integer":         validateInteger,
+	"number":          validateNumber,
+	"port":            validatePort,
+	"boolean":         validateBoolean,
+	"enum":            validateEnum,
+	"scope_target":    validateScopeTarget,
+	"url":             validateURL,
+	"path":            validatePath,
+	"ip_address":      validateIPAddress,
+	"cidr":            validateCIDR,
+	"msf_options":     validateMsfOptions,
 	"credential_file": validateCredentialFile,
-	"duration":       validateDuration,
-	"regex_match":    validateRegexMatch,
+	"duration":        validateDuration,
+	"regex_match":     validateRegexMatch,
 }
 
 // SupportedTypes returns a sorted list of supported type names.
@@ -145,6 +147,47 @@ func validateInteger(def *manifest.ArgDef, value string) (string, error) {
 	return strconv.Itoa(num), nil
 }
 
+func validateNumber(def *manifest.ArgDef, value string) (string, error) {
+	num, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return "", newErr(def.Name, fmt.Sprintf("expected number, got: %q", value))
+	}
+	if math.IsNaN(num) || math.IsInf(num, 0) {
+		return "", newErr(def.Name, fmt.Sprintf("number must be finite (no NaN or infinity), got: %q", value))
+	}
+
+	var lo, hi *float64
+	if def.MinFloat != nil {
+		lo = def.MinFloat
+	} else if def.Min != nil {
+		v := float64(*def.Min)
+		lo = &v
+	}
+	if def.MaxFloat != nil {
+		hi = def.MaxFloat
+	} else if def.Max != nil {
+		v := float64(*def.Max)
+		hi = &v
+	}
+
+	if def.Clamp {
+		if lo != nil && num < *lo {
+			num = *lo
+		}
+		if hi != nil && num > *hi {
+			num = *hi
+		}
+	} else {
+		if lo != nil && num < *lo {
+			return "", newErr(def.Name, fmt.Sprintf("value %g is below minimum %g", num, *lo))
+		}
+		if hi != nil && num > *hi {
+			return "", newErr(def.Name, fmt.Sprintf("value %g is above maximum %g", num, *hi))
+		}
+	}
+	return strconv.FormatFloat(num, 'g', -1, 64), nil
+}
+
 func validatePort(def *manifest.ArgDef, value string) (string, error) {
 	port, err := strconv.Atoi(value)
 	if err != nil {
@@ -192,16 +235,58 @@ func isValidCIDR(value string) bool {
 	return err == nil
 }
 
+// hasPunycodeLabel returns true if any DNS label in `host` is an A-label
+// (xn-- prefix, case-insensitive). Used to defend against IDN homoglyph bypass.
+func hasPunycodeLabel(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		if len(label) >= 4 && strings.EqualFold(label[:4], "xn--") {
+			return true
+		}
+	}
+	return false
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
+}
+
 func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 	// Scope validation rules (aligned across Rust, Python, JS, Go):
 	// 1. Reject shell metacharacters  2. Block * and ? wildcards
-	// 3. Accept valid IPv4, IPv6, CIDR, or hostname
+	// 3. Surface specific failure modes (traversal, slashes, escape sequences,
+	//    non-ASCII, IDN/punycode) BEFORE the generic regex catch-all so that
+	//    forensic triage and per-fence bite-rate analysis can distinguish
+	//    attack shapes.
+	// 4. Accept valid IPv4, IPv6, CIDR, or hostname.
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
 	}
 	if strings.ContainsAny(value, "*?") {
 		return "", newErr(def.Name, fmt.Sprintf("wildcard targets are not allowed: %q", value))
 	}
+
+	if strings.Contains(value, "../") || strings.Contains(value, "..\\") || strings.Contains(value, "/..") {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain path traversal sequences: %q", value))
+	}
+	if strings.Contains(value, "/") && !isValidCIDR(value) && !isValidIP(value) {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain '/' (use CIDR notation for ranges): %q", value))
+	}
+	if strings.Contains(value, "\\") {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain backslash escape sequences: %q", value))
+	}
+	if !isASCII(value) {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target must be ASCII (non-ASCII hostnames including IDN homoglyphs are rejected; gate IDN registration upstream if needed): %q", value))
+	}
+	// Defense-in-depth against IDN homoglyph bypass via punycode.
+	if hasPunycodeLabel(value) {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain punycode (xn--) labels — IDN/IDNA hostnames are rejected to prevent homoglyph bypass; gate IDN registration upstream if needed: %q", value))
+	}
+
 	if !isValidIP(value) && !isValidCIDR(value) && !isValidHostname(value) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid scope target: %q (must be a valid IP, CIDR, or hostname)", value))
 	}
@@ -366,6 +451,12 @@ func ValidateArgWithCustomTypes(def *manifest.ArgDef, value string, customTypes 
 		}
 		if ct.Max != nil {
 			synthetic.Max = ct.Max
+		}
+		if ct.MinFloat != nil {
+			synthetic.MinFloat = ct.MinFloat
+		}
+		if ct.MaxFloat != nil {
+			synthetic.MaxFloat = ct.MaxFloat
 		}
 		return handler(&synthetic, value)
 	}

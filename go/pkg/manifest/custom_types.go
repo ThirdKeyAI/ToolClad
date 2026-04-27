@@ -9,11 +9,13 @@ import (
 
 // CustomTypeDef represents a custom type defined in toolclad.toml.
 type CustomTypeDef struct {
-	Base    string   `toml:"base"`
-	Allowed []string `toml:"allowed"`
-	Pattern string   `toml:"pattern"`
-	Min     *int     `toml:"min"`
-	Max     *int     `toml:"max"`
+	Base     string   `toml:"base"`
+	Allowed  []string `toml:"allowed"`
+	Pattern  string   `toml:"pattern"`
+	Min      *int     `toml:"min"`
+	Max      *int     `toml:"max"`
+	MinFloat *float64 `toml:"min_float"`
+	MaxFloat *float64 `toml:"max_float"`
 }
 
 // LoadCustomTypes reads custom type definitions from a toolclad.toml file.

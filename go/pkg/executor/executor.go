@@ -306,8 +306,13 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	hash := sha256.Sum256(stdoutBytes)
 	envelope.OutputHash = fmt.Sprintf("sha256:%x", hash)
 
-	// Parse output based on format.
-	results, parseErr := parseOutput(m.Output.Format, stdoutBytes)
+	// Parse output based on format. Callback-only manifests have no [output];
+	// for the execute path we always have one (validated at load).
+	outFormat := "text"
+	if m.Output != nil {
+		outFormat = m.Output.Format
+	}
+	results, parseErr := parseOutput(outFormat, stdoutBytes)
 	if parseErr != nil {
 		envelope.Results = map[string]any{
 			"raw_output": string(stdoutBytes),
@@ -806,6 +811,14 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 
 	for _, arg := range m.ArgsSorted() {
 		prop := mcpTypeConstraints(arg.Type)
+		if arg.Type == "number" {
+			if arg.MinFloat != nil {
+				prop["minimum"] = *arg.MinFloat
+			}
+			if arg.MaxFloat != nil {
+				prop["maximum"] = *arg.MaxFloat
+			}
+		}
 		prop["description"] = arg.Description
 		if len(arg.Allowed) > 0 {
 			prop["enum"] = arg.Allowed
@@ -833,7 +846,7 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 		"inputSchema": inputSchema,
 	}
 
-	if len(m.Output.Schema) > 0 {
+	if m.Output != nil && len(m.Output.Schema) > 0 {
 		schema["outputSchema"] = m.Output.Schema
 	}
 
@@ -860,6 +873,8 @@ func mcpTypeConstraints(t string) map[string]any {
 	switch t {
 	case "integer":
 		return map[string]any{"type": "integer"}
+	case "number":
+		return map[string]any{"type": "number"}
 	case "port":
 		return map[string]any{"type": "integer", "minimum": 1, "maximum": 65535}
 	case "boolean":

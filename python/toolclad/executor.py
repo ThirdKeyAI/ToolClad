@@ -95,7 +95,8 @@ def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
         )
 
     ext_map = {"xml": "xml", "json": "json", "csv": "csv", "text": "txt", "jsonl": "jsonl"}
-    ext = ext_map.get(manifest.output.format, "txt")
+    out_format = manifest.output.format if manifest.output else "text"
+    ext = ext_map.get(out_format, "txt")
     output_file = os.path.join(output_dir, f"scan.{ext}")
 
     resolved["_scan_id"] = scan_id
@@ -289,6 +290,8 @@ def _parse_csv(raw: str) -> list:
 
 def _parse_output(manifest: Manifest, raw: str) -> dict:
     """Parse raw output according to manifest output format/parser."""
+    if manifest.output is None:
+        return {"raw_output": raw}
     parser = manifest.output.parser or f"builtin:{manifest.output.format}"
 
     if parser == "builtin:json":
@@ -319,7 +322,7 @@ def _parse_output(manifest: Manifest, raw: str) -> dict:
 
 def _validate_output_schema(manifest: Manifest, parsed: Any) -> None:
     """Validate parsed output against manifest output schema, if jsonschema is available."""
-    if not manifest.output.schema:
+    if manifest.output is None or not manifest.output.schema:
         return
     try:
         import jsonschema
@@ -618,7 +621,8 @@ def execute(
     os.makedirs(out_dir, exist_ok=True)
 
     ext_map = {"xml": "xml", "json": "json", "csv": "csv", "text": "txt", "jsonl": "jsonl"}
-    ext = ext_map.get(manifest.output.format, "txt")
+    out_format = manifest.output.format if manifest.output else "text"
+    ext = ext_map.get(out_format, "txt")
     output_file = os.path.join(out_dir, f"scan.{ext}")
     envelope["output_file"] = output_file
     start = time.monotonic()

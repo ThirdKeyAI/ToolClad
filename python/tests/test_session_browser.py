@@ -72,6 +72,7 @@ class TestSessionMode:
             assert m.session.commands["drop"].human_approval is True
             assert m.session.commands["drop"].risk_tier == "high"
 
+            assert m.output is not None
             assert m.output.format == "text"
             assert m.output.schema["type"] == "object"
         finally:
@@ -84,6 +85,9 @@ class TestSessionMode:
 
             [session]
             startup_command = "bash"
+
+            [output]
+            format = "text"
         """)
         try:
             m = load_manifest(path)
@@ -145,6 +149,7 @@ class TestBrowserMode:
             assert "snapshot" in m.browser.commands
             assert m.browser.commands["snapshot"].risk_tier == "low"
 
+            assert m.output is not None
             assert m.output.format == "json"
         finally:
             os.unlink(path)
@@ -156,6 +161,9 @@ class TestBrowserMode:
 
             [browser]
             engine = "cdp"
+
+            [output]
+            format = "json"
         """)
         try:
             m = load_manifest(path)

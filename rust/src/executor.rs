@@ -212,9 +212,7 @@ pub fn build_command_argv(
         .command
         .exec
         .as_ref()
-        .ok_or_else(|| {
-            ToolCladError::CommandError("no exec array in manifest".to_string())
-        })?;
+        .ok_or_else(|| ToolCladError::CommandError("no exec array in manifest".to_string()))?;
 
     let vars = resolve_vars(manifest, args)?;
 
@@ -587,18 +585,18 @@ fn parse_xml_to_json(xml: &str) -> Result<serde_json::Value, ToolCladError> {
 
 /// Parse raw command output according to the manifest's output format/parser.
 fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, ToolCladError> {
-    let parser =
-        manifest
-            .output
-            .parser
-            .as_deref()
-            .unwrap_or(match manifest.output.format.as_str() {
-                "json" => "builtin:json",
-                "jsonl" => "builtin:jsonl",
-                "csv" => "builtin:csv",
-                "xml" => "builtin:xml",
-                _ => "builtin:text",
-            });
+    // Callback-mode manifests may omit [output]; treat as text in that case.
+    let (parser, format) = match manifest.output.as_ref() {
+        Some(o) => (o.parser.as_deref(), o.format.as_str()),
+        None => (None, "text"),
+    };
+    let parser = parser.unwrap_or(match format {
+        "json" => "builtin:json",
+        "jsonl" => "builtin:jsonl",
+        "csv" => "builtin:csv",
+        "xml" => "builtin:xml",
+        _ => "builtin:text",
+    });
 
     match parser {
         "builtin:json" => serde_json::from_str(raw)
@@ -778,7 +776,11 @@ pub fn execute(
 
     // Phase 3c: Validate against output schema if defined.
     // (basic type check — full JSON Schema validation would require a dedicated crate)
-    let results = if manifest.output.schema != serde_json::json!({"type": "object"}) {
+    let has_custom_schema = manifest
+        .output
+        .as_ref()
+        .is_some_and(|o| o.schema != serde_json::json!({"type": "object"}));
+    let results = if has_custom_schema {
         // Schema is declared, use parsed output.
         parsed
     } else {
@@ -985,6 +987,7 @@ mod tests {
                 timeout_seconds: 30,
                 risk_tier: "low".to_string(),
                 human_approval: false,
+                dispatch: "exec".to_string(),
                 cedar: None,
                 evidence: None,
             },
@@ -1002,12 +1005,12 @@ mod tests {
                 template: Some("echo {target}".to_string()),
                 ..Default::default()
             },
-            output: OutputDef {
+            output: Some(OutputDef {
                 format: "text".to_string(),
                 parser: None,
                 envelope: true,
                 schema: serde_json::json!({"type": "object"}),
-            },
+            }),
             http: None,
             mcp: None,
             session: None,

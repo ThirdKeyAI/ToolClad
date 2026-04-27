@@ -6,7 +6,8 @@ import (
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 )
 
-func intPtr(v int) *int { return &v }
+func intPtr(v int) *int         { return &v }
+func floatPtr(v float64) *float64 { return &v }
 
 func TestValidateArg(t *testing.T) {
 	tests := []struct {
@@ -506,6 +507,93 @@ func TestValidateArgWithCustomTypes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNumberType(t *testing.T) {
+	tests := []struct {
+		name    string
+		def     *manifest.ArgDef
+		value   string
+		wantErr bool
+	}{
+		{"valid float", &manifest.ArgDef{Name: "n", Type: "number"}, "0.5", false},
+		{"negative", &manifest.ArgDef{Name: "n", Type: "number"}, "-3.14", false},
+		{"NaN rejected", &manifest.ArgDef{Name: "n", Type: "number"}, "NaN", true},
+		{"Inf rejected", &manifest.ArgDef{Name: "n", Type: "number"}, "Inf", true},
+		{"non-numeric", &manifest.ArgDef{Name: "n", Type: "number"}, "abc", true},
+		{
+			"min_float ok",
+			&manifest.ArgDef{Name: "n", Type: "number", MinFloat: floatPtr(0.0), MaxFloat: floatPtr(1.0)},
+			"0.5",
+			false,
+		},
+		{
+			"min_float below",
+			&manifest.ArgDef{Name: "n", Type: "number", MinFloat: floatPtr(0.0)},
+			"-0.1",
+			true,
+		},
+		{
+			"max_float above",
+			&manifest.ArgDef{Name: "n", Type: "number", MaxFloat: floatPtr(1.0)},
+			"1.5",
+			true,
+		},
+		{
+			"falls back to int min/max",
+			&manifest.ArgDef{Name: "n", Type: "number", Min: intPtr(1), Max: intPtr(10)},
+			"5.5",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ValidateArg(tt.def, tt.value)
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestScopeTargetHardening(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantSub string // expected substring in error
+	}{
+		{"punycode rejected", "xn--example-9c.com", "punycode"},
+		{"mixed-case punycode rejected", "XN--example-9c.com", "punycode"},
+		{"non-ASCII rejected", "exаmple.com", "ASCII"}, // Cyrillic а
+		{"specific traversal message", "../../etc/passwd", "traversal"},
+		{"specific slash message", "etc/passwd", "'/'"},
+	}
+	def := &manifest.ArgDef{Name: "t", Type: "scope_target"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ValidateArg(def, tt.value)
+			if err == nil {
+				t.Fatalf("expected error for %q, got none", tt.value)
+			}
+			if !contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return len(haystack) >= len(needle) && (func() bool {
+		for i := 0; i+len(needle) <= len(haystack); i++ {
+			if haystack[i:i+len(needle)] == needle {
+				return true
+			}
+		}
+		return false
+	})()
 }
 
 func TestCheckInjection(t *testing.T) {

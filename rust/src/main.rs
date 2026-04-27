@@ -86,7 +86,15 @@ fn cmd_validate(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref cedar) = manifest.tool.cedar {
         println!("Cedar:        {} / {}", cedar.resource, cedar.action);
     }
-    println!("Output:       {}", manifest.output.format);
+    println!(
+        "Output:       {}",
+        manifest
+            .output
+            .as_ref()
+            .map(|o| o.format.as_str())
+            .unwrap_or("(none — callback dispatch)")
+    );
+    println!("Dispatch:     {}", manifest.tool.dispatch);
     println!("\nOK - manifest is valid");
     Ok(())
 }

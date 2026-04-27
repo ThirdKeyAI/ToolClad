@@ -184,3 +184,68 @@ describe("validateArg - cidr", () => {
     assert.throws(() => validateArg({ type: "cidr" }, "10.0.0.0/33"), /Invalid CIDR prefix/);
   });
 });
+
+describe("validateArg - number (float)", () => {
+  it("accepts valid floats", () => {
+    assert.equal(validateArg({ type: "number" }, "0.5"), 0.5);
+    assert.equal(validateArg({ type: "number" }, "-3.14"), -3.14);
+  });
+
+  it("rejects NaN and infinity", () => {
+    assert.throws(() => validateArg({ type: "number" }, "NaN"), /finite/);
+    assert.throws(() => validateArg({ type: "number" }, "Infinity"), /finite/);
+  });
+
+  it("respects min_float / max_float", () => {
+    const def = { type: "number", min_float: 0, max_float: 1 };
+    assert.equal(validateArg(def, "0.5"), 0.5);
+    assert.throws(() => validateArg(def, "-0.1"), /below minimum/);
+    assert.throws(() => validateArg(def, "1.5"), /exceeds maximum/);
+  });
+
+  it("falls back to int min/max bounds", () => {
+    const def = { type: "number", min: 1, max: 10 };
+    assert.equal(validateArg(def, "5.5"), 5.5);
+    assert.throws(() => validateArg(def, "0.5"), /below minimum/);
+  });
+
+  it("clamps when clamp=true", () => {
+    const def = { type: "number", min_float: 0, max_float: 1, clamp: true };
+    assert.equal(validateArg(def, "-5"), 0);
+    assert.equal(validateArg(def, "5"), 1);
+  });
+});
+
+describe("validateArg - scope_target hardening", () => {
+  it("rejects punycode (xn--) labels", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "xn--example-9c.com"),
+      /punycode/
+    );
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "sub.XN--example-9c.com"),
+      /punycode/
+    );
+  });
+
+  it("rejects non-ASCII (homoglyph IDN)", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "exаmple.com"),
+      /ASCII/
+    );
+  });
+
+  it("surfaces specific traversal failure message", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "../../etc/passwd"),
+      /traversal/
+    );
+  });
+
+  it("surfaces specific slash failure message", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "etc/passwd"),
+      /'\/'/
+    );
+  });
+});
