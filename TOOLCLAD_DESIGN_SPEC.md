@@ -221,6 +221,44 @@ type = "string"
 type = "string"
 ```
 
+### Dispatch Modes (added in v0.6.0)
+
+The `tool.dispatch` field selects the execution model. It accepts two values:
+
+| Value | Required sections | Use case |
+|-------|-------------------|----------|
+| `"exec"` *(default)* | At least one backend (`[command]` template/exec/executor, `[http]`, `[mcp]`, `[session]`, or `[browser]`) **and** an `[output]` block | ToolClad runs the backend itself and returns an evidence envelope. |
+| `"callback"` | None — both the backend and `[output]` are optional | Validator-only embedding. ToolClad parses the manifest, generates the MCP input schema, and validates LLM-supplied arguments; in-process code performs the actual dispatch. |
+
+`callback` mode exists for runtimes where ToolClad is the typed-argument fence rather than the executor. The Symbiont reasoning loop uses this pattern when a tool is implemented as a native Rust function: the manifest defines the contract, ToolClad enforces it, and the runtime maps the validated arguments onto a function call. No stub `[command]` or synthetic `[output]` block is required.
+
+```toml
+# tools/store_knowledge.clad.toml
+[tool]
+name = "store_knowledge"
+version = "1.0.0"
+binary = "callback"
+description = "Persist a key/value into the agent's knowledge store"
+risk_tier = "low"
+dispatch = "callback"
+
+[args.key]
+position = 1
+required = true
+type = "string"
+description = "Knowledge key"
+
+[args.confidence]
+position = 2
+required = true
+type = "number"
+min_float = 0.0
+max_float = 1.0
+description = "Confidence in the asserted value"
+```
+
+Manifests with `dispatch = "callback"` still pass through every other validation step (argument types, custom-type resolution, MCP schema generation). They are rejected if any declared argument uses an unknown type or violates structural rules.
+
 ### Complex Example with Escape Hatch
 
 ```toml
@@ -352,6 +390,15 @@ Built-in validation types cover the patterns repeated across all existing wrappe
 | `duration` | Integer with suffix (s/m/h) or bare seconds | Timeout overrides |
 | `regex_match` | Matches a declared `pattern` (PCRE) | Module paths, format strings |
 
+#### `scope_target` ASCII / IDN policy (since v0.6.0)
+
+`scope_target` is intentionally ASCII-strict. In addition to rejecting shell metacharacters, wildcards, and traversal sequences (`../`, leading `/`, backslashes), it refuses:
+
+- **Non-ASCII characters** in the hostname (e.g. Cyrillic homoglyphs such as `exаmple.com`).
+- **Punycode A-labels** of the form `xn--…` (case-insensitive), at any DNS label position.
+
+This is defense-in-depth against IDN homoglyph bypass: an attacker who registers a Cyrillic look-alike domain and supplies its punycode form (`xn--example-9c.com`) cannot get past the ASCII regex without this rejection. Refusal messages distinguish each failure shape (`traversal`, `'/'`, `backslash`, `ASCII`, `punycode`) so per-fence bite-rate analysis and forensic triage can separate attack categories rather than collapsing them into a single generic error. If your tool legitimately needs to accept IDN hostnames, gate IDN registration upstream and feed the resolved IPs (or pre-validated ASCII names) into the manifest.
+
 ### Type Composition
 
 Types can be extended with additional constraints:
@@ -364,6 +411,13 @@ max = 64
 clamp = true       # Values outside range are clamped, not rejected
 default = 4
 description = "Concurrent threads"
+
+[args.confidence]
+type = "number"
+min_float = 0.0    # Use min_float / max_float for `number`; min / max are integer-only.
+max_float = 1.0
+clamp = true       # Optional — clamp to [min_float, max_float] instead of rejecting
+description = "Confidence score"
 
 [args.service]
 type = "enum"
@@ -734,9 +788,9 @@ parser = "scripts/parse-outputs/parse-nmap-xml.py"
 
 Custom parsers receive the raw output file path as argv[1] and must emit JSON to stdout. The parser's output is validated against the declared `[output.schema]` before it reaches the agent.
 
-### Output Schema (Mandatory)
+### Output Schema
 
-Every manifest must declare the expected shape of its parsed results in `[output.schema]`. This serves two purposes:
+Every `dispatch = "exec"` manifest must declare the expected shape of its parsed results in `[output.schema]` (callback-dispatch manifests omit the `[output]` block — see [Dispatch Modes](#dispatch-modes-added-in-v060)). The schema serves two purposes:
 
 1. **MCP `outputSchema` generation**: The LLM sees what data shape it will receive *before* proposing a tool call. This enables more effective reasoning about whether and how to use a tool.
 2. **Parser output validation**: The executor validates parsed results against the schema. Malformed parser output is rejected before it reaches the agent, preventing corrupted state in the ORGA loop.
