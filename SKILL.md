@@ -2,7 +2,7 @@
 name: toolclad
 title: ToolClad
 description: Declarative tool interface contracts for agentic runtimes — oneshot CLI, interactive session (PTY), and browser (CDP/Playwright) modes with typed parameters, per-interaction Cedar gating, evidence envelopes
-version: 0.5.3
+version: 0.6.0
 ---
 
 # ToolClad Development Skills Guide
@@ -20,7 +20,7 @@ ToolClad is a declarative manifest format (`.clad.toml`) that defines the comple
 - **Browser**: Maintain a governed headless browser session where navigation, clicks, form submission, and JS execution are typed, scoped, and policy-gated via CDP/Playwright.
 
 All three modes share:
-- **Typed Parameters**: 14 built-in types (10 core + 4 extended) with injection sanitization, plus custom types via `toolclad.toml`
+- **Typed Parameters**: 15 built-in types (11 core + 4 extended) with injection sanitization, plus custom types via `toolclad.toml`
 - **Per-Interaction Cedar Gating**: Every command/action evaluated against policies
 - **Evidence Envelopes**: Every execution wrapped in JSON with scan_id, timestamps, SHA-256 hash
 - **Scope Enforcement**: URL/target scope checking against allow-lists
@@ -48,6 +48,7 @@ binary = "my-binary"
 description = "What this tool does"
 timeout_seconds = 30
 risk_tier = "low"          # low | medium | high | critical
+# dispatch = "callback"    # Optional: validator-only embedding (no backend / no [output] required)
 
 [tool.cedar]               # Optional: Cedar policy integration
 resource = "Tool::MyTool"
@@ -100,10 +101,11 @@ description = "Tool output"
 |------|-----------|----------------|
 | `string` | Non-empty, injection-safe | `pattern` for regex, `sanitize = ["injection"]` |
 | `integer` | Numeric | `min`, `max`, `clamp = true` |
+| `number` | Float, rejects NaN/inf | `min_float`, `max_float`, `clamp = true` |
 | `port` | 1-65535 | |
 | `boolean` | `"true"` or `"false"` only | |
 | `enum` | In `allowed` list | Must declare `allowed = [...]` |
-| `scope_target` | IP/CIDR/hostname, no wildcards | Auto scope-checked |
+| `scope_target` | ASCII-only IP/CIDR/hostname; rejects IDN/punycode and wildcards | Auto scope-checked; gate IDN registration upstream |
 | `url` | Valid URL | `schemes = ["http", "https"]`, `scope_check = true` |
 | `path` | No traversal (`../`) | |
 | `ip_address` | Valid IPv4/IPv6 | |
