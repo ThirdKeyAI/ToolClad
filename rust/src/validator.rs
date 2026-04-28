@@ -47,6 +47,20 @@ static URL_RE: LazyLock<Regex> =
 pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, ToolCladError> {
     let val = value.trim();
 
+    // Network-shaped types (hostname, URL, IP, CIDR) reject leading/trailing
+    // whitespace at the source: RFC 1035 / RFC 5891 don't permit terminal
+    // whitespace in labels, and silently trimming would let "example.com "
+    // through to validators that already passed structural checks.
+    let strict_no_whitespace = matches!(
+        def.type_name.as_str(),
+        "scope_target" | "url" | "ip_address" | "cidr"
+    );
+    if strict_no_whitespace && val.len() != value.len() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain leading or trailing whitespace"
+        )));
+    }
+
     // Apply injection sanitization if requested or for types that require it.
     match def.type_name.as_str() {
         "string" => validate_string(name, def, val, true),
@@ -210,8 +224,26 @@ fn validate_enum(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolClad
     }
 }
 
+/// RFC 1035 §2.3.4 caps a fully-qualified domain name at 253 octets
+/// (255 wire bytes minus the leading length byte and trailing root label).
+/// IPv6 textual form maxes out at 45 chars. We use 253 as the upper bound
+/// for any `scope_target` shape: hostnames, IPv4, IPv6, and CIDRs all fit
+/// well below it, and rejecting anything longer is defense-in-depth
+/// against buffer-pathological payloads.
+const SCOPE_TARGET_MAX_LEN: usize = 253;
+
 fn validate_scope_target(name: &str, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
+    if val.is_empty() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not be empty"
+        )));
+    }
+    if val.len() > SCOPE_TARGET_MAX_LEN {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target exceeds {SCOPE_TARGET_MAX_LEN}-character limit (RFC 1035 §2.3.4)"
+        )));
+    }
     if val.contains('*') {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' scope_target must not contain wildcards"
@@ -620,6 +652,38 @@ mod tests {
     fn test_scope_target_rejects_injection() {
         let def = make_arg("scope_target");
         assert!(validate_arg("t", &def, "10.0.1.1; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_trailing_whitespace() {
+        // RFC 1035 / RFC 5891 don't permit terminal whitespace in hostname
+        // labels. Trimming silently was hiding malformed input.
+        let def = make_arg("scope_target");
+        let err = validate_arg("t", &def, "example.com ")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whitespace"), "unexpected message: {}", err);
+        assert!(validate_arg("t", &def, " example.com").is_err());
+        assert!(validate_arg("t", &def, "\texample.com").is_err());
+        assert!(validate_arg("t", &def, "example.com\n").is_err());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_overlong() {
+        // RFC 1035 §2.3.4 caps FQDN length at 253 octets. 254+ should refuse.
+        let def = make_arg("scope_target");
+        let too_long = "a".repeat(254);
+        let err = validate_arg("t", &def, &too_long).unwrap_err().to_string();
+        assert!(err.contains("253"), "unexpected message: {}", err);
+        // 4096-char buffer-pathological payload from cross-impl test harness.
+        let pathological = "a".repeat(4096);
+        assert!(validate_arg("t", &def, &pathological).is_err());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_empty() {
+        let def = make_arg("scope_target");
+        assert!(validate_arg("t", &def, "").is_err());
     }
 
     #[test]

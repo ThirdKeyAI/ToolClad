@@ -255,6 +255,13 @@ func isASCII(s string) bool {
 	return true
 }
 
+// scopeTargetMaxLen is the RFC 1035 §2.3.4 fully-qualified domain name
+// length limit (253 octets). IPv6 textual form maxes out at 45 chars,
+// so 253 is a generous upper bound for any scope_target shape and
+// rejecting anything longer is defense-in-depth against buffer-
+// pathological payloads.
+const scopeTargetMaxLen = 253
+
 func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 	// Scope validation rules (aligned across Rust, Python, JS, Go):
 	// 1. Reject shell metacharacters  2. Block * and ? wildcards
@@ -263,6 +270,17 @@ func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 	//    forensic triage and per-fence bite-rate analysis can distinguish
 	//    attack shapes.
 	// 4. Accept valid IPv4, IPv6, CIDR, or hostname.
+	if value == "" {
+		return "", newErr(def.Name, "scope_target must not be empty")
+	}
+	if value != strings.TrimSpace(value) {
+		// RFC 1035 / RFC 5891 don't permit terminal whitespace in
+		// hostname labels.
+		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain leading or trailing whitespace: %q", value))
+	}
+	if len(value) > scopeTargetMaxLen {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target exceeds %d-character limit (RFC 1035 §2.3.4): length=%d", scopeTargetMaxLen, len(value)))
+	}
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
 	}

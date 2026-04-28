@@ -145,6 +145,13 @@ function hasPunycodeLabel(host) {
   );
 }
 
+// RFC 1035 §2.3.4 caps a fully-qualified domain name at 253 octets.
+// IPv6 textual form maxes out at 45 chars. We use 253 as the upper bound
+// for any scope_target shape — hostnames, IPv4, IPv6, and CIDRs all fit
+// well below it, and rejecting anything longer is defense-in-depth
+// against buffer-pathological payloads.
+const SCOPE_TARGET_MAX_LEN = 253;
+
 function validateScopeTarget(argDef, value) {
   // Scope validation rules (aligned across Rust, Python, JS, Go):
   // 1. Reject shell metacharacters  2. Block * and ? wildcards
@@ -153,6 +160,22 @@ function validateScopeTarget(argDef, value) {
   //    bite-rate analysis can distinguish attack shapes.
   // 4. Accept valid IPv4, IPv6, CIDR, or hostname.
   const str = String(value);
+  if (str.length === 0) {
+    throw new Error("scope_target must not be empty");
+  }
+  if (str !== str.trim()) {
+    // RFC 1035 / RFC 5891 don't permit terminal whitespace in hostname
+    // labels. Reject explicitly so any upstream CLI trimming can't mask
+    // malformed input.
+    throw new Error(
+      `scope_target must not contain leading or trailing whitespace: ${str}`
+    );
+  }
+  if (str.length > SCOPE_TARGET_MAX_LEN) {
+    throw new Error(
+      `scope_target exceeds ${SCOPE_TARGET_MAX_LEN}-character limit (RFC 1035 §2.3.4): length=${str.length}`
+    );
+  }
   checkInjection(str);
   if (str.includes("*") || str.includes("?")) {
     throw new Error(`Wildcard not allowed in scope_target: ${str}`);

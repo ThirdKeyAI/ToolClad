@@ -152,12 +152,34 @@ def _has_punycode_label(host: str) -> bool:
     return False
 
 
+# RFC 1035 §2.3.4 caps a fully-qualified domain name at 253 octets.
+# IPv6 textual form maxes out at 45 chars. We use 253 as the upper bound
+# for any scope_target shape — hostnames, IPv4, IPv6, and CIDRs all fit
+# well below it, and rejecting anything longer is defense-in-depth
+# against buffer-pathological payloads.
+_SCOPE_TARGET_MAX_LEN = 253
+
+
 def _validate_scope_target(arg_def: ArgDef, value: str) -> str:
     # Scope validation rules (aligned across Rust, Python, JS, Go):
     # 1. Reject shell metacharacters  2. Block * and ? wildcards
     # 3. Surface specific failure modes (traversal, slashes, escapes, IDN) before
     #    falling through to the generic regex catch-all.
     # 4. Accept valid IPv4, IPv6, CIDR, or hostname.
+    if not value:
+        raise ValidationError("scope_target must not be empty")
+    if value != value.strip():
+        # RFC 1035 / RFC 5891 don't permit terminal whitespace in hostname
+        # labels. Reject explicitly so silent CLI trimming can't mask
+        # malformed input.
+        raise ValidationError(
+            f"scope_target must not contain leading or trailing whitespace: {value!r}"
+        )
+    if len(value) > _SCOPE_TARGET_MAX_LEN:
+        raise ValidationError(
+            f"scope_target exceeds {_SCOPE_TARGET_MAX_LEN}-character limit "
+            f"(RFC 1035 §2.3.4): length={len(value)}"
+        )
     _check_injection(value)
     if "*" in value or "?" in value:
         raise ValidationError(f"Wildcard targets are not allowed: {value!r}")

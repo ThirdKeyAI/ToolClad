@@ -14,7 +14,14 @@ from toolclad.validator import ValidationError
 
 
 def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
-    """Parse key=value pairs from --arg options."""
+    """Parse key=value pairs from --arg options.
+
+    Keys are stripped (whitespace around `--arg key = value` is ergonomic),
+    but **values are passed through verbatim**. Trimming values silently
+    was hiding malformed input from validators — a hostname like
+    ``example.com `` (trailing space) is invalid per RFC 1035 and the
+    validator must see the raw bytes to refuse it.
+    """
     result: Dict[str, str] = {}
     for pair in arg_pairs:
         if "=" not in pair:
@@ -22,7 +29,7 @@ def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
                 f"Expected key=value format, got: {pair!r}"
             )
         key, _, value = pair.partition("=")
-        result[key.strip()] = value.strip()
+        result[key.strip()] = value
     return result
 
 

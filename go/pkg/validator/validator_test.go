@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
@@ -200,6 +201,47 @@ func TestValidateArg(t *testing.T) {
 			name:    "scope_target/invalid",
 			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
 			value:   "not a valid target!!!",
+			wantErr: true,
+		},
+		{
+			// RFC 1035 / RFC 5891 don't permit terminal whitespace in
+			// hostname labels. Must reject regardless of upstream
+			// trimming.
+			name:    "scope_target/trailing space",
+			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
+			value:   "example.com ",
+			wantErr: true,
+		},
+		{
+			name:    "scope_target/leading space",
+			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
+			value:   " example.com",
+			wantErr: true,
+		},
+		{
+			name:    "scope_target/tab",
+			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
+			value:   "\texample.com",
+			wantErr: true,
+		},
+		{
+			// RFC 1035 §2.3.4 caps FQDN length at 253 octets.
+			name:    "scope_target/over 253 chars",
+			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
+			value:   strings.Repeat("a", 254),
+			wantErr: true,
+		},
+		{
+			// 4096-char buffer-pathological payload from cross-impl harness.
+			name:    "scope_target/buffer pathological",
+			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
+			value:   strings.Repeat("a", 4096),
+			wantErr: true,
+		},
+		{
+			name:    "scope_target/empty",
+			def:     &manifest.ArgDef{Name: "t", Type: "scope_target"},
+			value:   "",
 			wantErr: true,
 		},
 
