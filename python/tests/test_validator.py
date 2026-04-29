@@ -176,6 +176,30 @@ class TestScopeTargetValidation:
         with pytest.raises(ValidationError, match="Invalid scope target"):
             validate_arg(_arg("scope_target"), "not a valid target")
 
+    def test_trailing_whitespace_rejected(self):
+        # RFC 1035 / RFC 5891 don't permit terminal whitespace in hostname
+        # labels. Trimming silently was hiding malformed input.
+        with pytest.raises(ValidationError, match="whitespace"):
+            validate_arg(_arg("scope_target"), "example.com ")
+        with pytest.raises(ValidationError, match="whitespace"):
+            validate_arg(_arg("scope_target"), " example.com")
+        with pytest.raises(ValidationError, match="whitespace"):
+            validate_arg(_arg("scope_target"), "\texample.com")
+        with pytest.raises(ValidationError, match="whitespace"):
+            validate_arg(_arg("scope_target"), "example.com\n")
+
+    def test_overlong_rejected(self):
+        # RFC 1035 §2.3.4 caps FQDN length at 253 octets.
+        with pytest.raises(ValidationError, match="253"):
+            validate_arg(_arg("scope_target"), "a" * 254)
+        # 4096-char buffer-pathological payload from cross-impl harness.
+        with pytest.raises(ValidationError):
+            validate_arg(_arg("scope_target"), "a" * 4096)
+
+    def test_empty_rejected(self):
+        with pytest.raises(ValidationError, match="empty"):
+            validate_arg(_arg("scope_target"), "")
+
 
 # ---------------------------------------------------------------------------
 # url

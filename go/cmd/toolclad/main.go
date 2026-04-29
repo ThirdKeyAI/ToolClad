@@ -150,9 +150,14 @@ func testCmd() *cobra.Command {
 
 			fmt.Printf("  Manifest:  %s\n", path)
 
-			// Validate each argument and display results.
+			// Validate each argument and display results. Track the first
+			// validation failure so we can return a non-zero exit code
+			// after the dry-run output is printed — CI consumers gate on
+			// this, and silently exiting 0 on a FAIL line was masking
+			// every validator refusal.
 			fmt.Printf("  Arguments: ")
 			first := true
+			var firstFailure error
 			for _, argDef := range m.ArgsSorted() {
 				val, provided := toolArgs[argDef.Name]
 				if !provided {
@@ -171,6 +176,9 @@ func testCmd() *cobra.Command {
 				status := "OK"
 				if vErr != nil {
 					status = fmt.Sprintf("FAIL: %v", vErr)
+					if firstFailure == nil {
+						firstFailure = fmt.Errorf("validation failed for %q: %w", argDef.Name, vErr)
+					}
 				}
 
 				if !first {
@@ -187,6 +195,9 @@ func testCmd() *cobra.Command {
 			cmdStr, buildErr := executor.BuildCommand(m, toolArgs)
 			if buildErr != nil {
 				fmt.Printf("  Command:   ERROR: %v\n", buildErr)
+				if firstFailure == nil {
+					firstFailure = buildErr
+				}
 			} else {
 				fmt.Printf("  Command:   %s\n", cmdStr)
 			}
@@ -198,7 +209,7 @@ func testCmd() *cobra.Command {
 			fmt.Printf("  Risk:      %s\n", m.Tool.RiskTier)
 			fmt.Println()
 			fmt.Println("  [dry run -- command not executed]")
-			return nil
+			return firstFailure
 		},
 	}
 

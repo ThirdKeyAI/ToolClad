@@ -118,6 +118,40 @@ describe("validateArg - scope_target", () => {
   it("rejects injection", () => {
     assert.throws(() => validateArg({ type: "scope_target" }, "10.0.1.1;whoami"), /Injection/);
   });
+
+  it("rejects leading or trailing whitespace", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "example.com "),
+      /whitespace/
+    );
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, " example.com"),
+      /whitespace/
+    );
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "\texample.com"),
+      /whitespace/
+    );
+  });
+
+  it("rejects values exceeding the 253-char RFC 1035 limit", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "a".repeat(254)),
+      /253/
+    );
+    // 4096-char buffer-pathological payload from cross-impl harness.
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, "a".repeat(4096)),
+      /253|exceeds/
+    );
+  });
+
+  it("rejects empty input", () => {
+    assert.throws(
+      () => validateArg({ type: "scope_target" }, ""),
+      /empty/
+    );
+  });
 });
 
 describe("validateArg - url", () => {

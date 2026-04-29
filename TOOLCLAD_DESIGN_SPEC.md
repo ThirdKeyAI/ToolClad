@@ -399,6 +399,17 @@ Built-in validation types cover the patterns repeated across all existing wrappe
 
 This is defense-in-depth against IDN homoglyph bypass: an attacker who registers a Cyrillic look-alike domain and supplies its punycode form (`xn--example-9c.com`) cannot get past the ASCII regex without this rejection. Refusal messages distinguish each failure shape (`traversal`, `'/'`, `backslash`, `ASCII`, `punycode`) so per-fence bite-rate analysis and forensic triage can separate attack categories rather than collapsing them into a single generic error. If your tool legitimately needs to accept IDN hostnames, gate IDN registration upstream and feed the resolved IPs (or pre-validated ASCII names) into the manifest.
 
+#### `scope_target` whitespace and length policy (since v0.6.1)
+
+All four reference impls (Rust, Python, JS, Go) enforce two additional invariants that earlier releases had drifted on:
+
+- **No leading or trailing whitespace.** `example.com ` (trailing space), ` example.com`, and `\texample.com` are all refused. Per RFC 1035 and RFC 5891, hostname labels do not permit terminal whitespace, and silent trimming was masking malformed input from validators downstream. Refusal message: `scope_target must not contain leading or trailing whitespace`.
+- **253-octet length cap (RFC 1035 §2.3.4).** Any value longer than 253 characters is refused regardless of shape (hostname / IPv4 / IPv6 / CIDR all fit comfortably). This is defense-in-depth against buffer-pathological payloads (e.g. a 4096-character `target=…`). Refusal message: `scope_target exceeds 253-character limit (RFC 1035 §2.3.4)`.
+
+Empty values are also refused with `scope_target must not be empty`. Implementations must apply these checks **before** the regex catch-all so the refusal message names the specific failure shape — collapsing them into "Invalid scope target" hides which fence fired and breaks forensic triage.
+
+CLIs must not silently strip whitespace from values before passing them to validators. The Python `toolclad` CLI previously did `value.strip()` in argument parsing, which masked the whitespace policy from cross-impl test harnesses; this was corrected in the same release that introduced the explicit whitespace check.
+
 ### Type Composition
 
 Types can be extended with additional constraints:
