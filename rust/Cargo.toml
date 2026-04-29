@@ -1,6 +1,6 @@
 [package]
 name = "toolclad"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 authors = ["Jascha Wanger / ThirdKey.ai"]
 description = "Declarative CLI tool interface contracts for agentic runtimes — manifest parser, argument validator, command executor"

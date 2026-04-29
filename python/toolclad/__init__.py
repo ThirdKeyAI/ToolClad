@@ -1,6 +1,6 @@
 """ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes."""
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 from toolclad.manifest import (
     Manifest,
