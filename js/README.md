@@ -224,6 +224,8 @@ schemapin-sign tools/nmap_scan.clad.toml
 
 The signature covers the entire behavioral contract. If anyone tampers with a command template, validation rule, scope constraint, or output schema, the hash changes and verification fails.
 
+For production manifests, opt into SchemaPin v1.4-alpha hardening — TTL, lineage chain, and DNS TXT cross-verification — via `--expires-in`, `--schema-version "$TOOL_VERSION"`, `--previous-hash $PREV_HASH`. See [SchemaPin v1.4 Features in ToolClad](https://github.com/ThirdKeyAI/ToolClad/blob/main/docs/schemapin-v1.4-features.md).
+
 See [TOOLCLAD_DESIGN_SPEC.md](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md) for the full specification.
 
 ## License

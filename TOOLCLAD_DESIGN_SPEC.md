@@ -2054,6 +2054,30 @@ SchemaPin verifies the manifest has not been modified
         -> Each layer trusts the one before it
 ```
 
+### SchemaPin v1.4 Hardening (alpha)
+
+SchemaPin v1.4-alpha (released 2026-04-30 / 2026-05-01 across all four reference languages) adds three additive optional fields and one cross-channel verification mechanism that ToolClad publishers SHOULD adopt for production. None of them require manifest changes — they are signing-time options on `schemapin-sign`. v1.3 verifiers ignore the new fields, so adoption is incremental.
+
+- **Signature expiration (`expires_at`)**: an optional RFC 3339 TTL on the signature. Verifiers past the expiry mark the result as `expired = true` and append a `signature_expired` warning, but `valid` stays true (degraded, not failed). Recommended: sign with `--expires-in 6mo` (or your release cadence). The runtime then has a policy signal — refuse `risk_tier = "high"` tools whose signature is stale, prompt on medium-risk, log on low-risk.
+
+- **Schema version binding (`schema_version` + `previous_hash`)**: the manifest's existing `[tool] version` semver flows directly into the signature as `schema_version`. Subsequent releases set `previous_hash` to the prior signed version's `skill_hash`, forming a hash chain. The runtime maintains a per-tool `latest_known_hash` next to the TOFU pin; on a mismatch (an attacker has substituted a tampered manifest with a different lineage), the runtime prompts the operator rather than silently rolling forward. Pure-metadata check; no extra crypto. Pair the chain check with monotonic version-progression policy to also refuse downgrades.
+
+- **DNS TXT cross-verification (`_schemapin.{vendor-domain}`)**: vendors SHOULD publish `_schemapin.{domain}. IN TXT "v=schemapin1; kid=...; fp=sha256:..."` alongside their `.well-known/schemapin.json`. DNS is administered through a separate credential chain (registrar, DNS provider, optionally DNSSEC), so a compromise of one channel doesn't automatically compromise the other. Runtimes that adopt the cross-check fail closed on mismatches between the HTTPS hosting key and the DNS-published fingerprint (`DOMAIN_MISMATCH`).
+
+Recommended sign command for a versioned production manifest:
+
+```bash
+TOOL_VERSION=$(awk -F\" '/^version[[:space:]]*=/ {print $2; exit}' tools/nmap_scan.clad.toml)
+PREV_HASH=$(jq -r '.skill_hash' tools/nmap_scan.clad.toml.sig.prior 2>/dev/null || true)
+
+ARGS=(--expires-in 6mo --schema-version "$TOOL_VERSION")
+[[ -n "$PREV_HASH" ]] && ARGS+=(--previous-hash "$PREV_HASH")
+
+schemapin-sign tools/nmap_scan.clad.toml "${ARGS[@]}"
+```
+
+See [`docs/schemapin-v1.4-features.md`](docs/schemapin-v1.4-features.md) for the full operational guide and the canonical SchemaPin docs at https://docs.schemapin.org for protocol detail.
+
 ---
 
 ## Design Decisions (Resolved)
