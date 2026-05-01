@@ -174,6 +174,49 @@ The signature covers more than an MCP JSON Schema would:
 | Output schema | Partial | Yes |
 | Risk tier and Cedar mappings | No | Yes |
 
+### SchemaPin v1.4 Hardening (alpha)
+
+SchemaPin v1.4-alpha (released 2026-04-30 / 2026-05-01) adds three additive optional fields and one cross-channel verification mechanism that ToolClad publishers SHOULD adopt for defense-in-depth. None of them require manifest changes — they are signing-time options on `schemapin-sign`.
+
+| Feature | What it adds | ToolClad use |
+|---------|-------------|--------------|
+| **Signature expiration** (`expires_at`) | Optional RFC 3339 TTL on the signature. Past the expiry, verifiers degrade (warn) rather than fail. | Sign with a 6-month TTL; runtime policy can refuse `risk_tier = "high"` tools whose signature is stale. |
+| **Schema version binding** (`schema_version` + `previous_hash`) | Optional semver tag plus a hash chain to the prior signed version. Defends against rug-pull substitutions. | Set `schema_version` to your manifest's `[tool] version`. Set `previous_hash` to the prior release's `skill_hash`. |
+| **DNS TXT cross-verification** (`_schemapin.{vendor-domain}`) | Optional second-channel trust signal independent of HTTPS hosting. | Publish the TXT record alongside `.well-known/schemapin.json`. A divergence between the two indicates compromise of one channel. |
+
+Recommended sign command for a versioned ToolClad release:
+
+```bash
+# Read [tool] version from the manifest (semver string already required)
+TOOL_VERSION=$(awk -F\" '/^version[[:space:]]*=/ {print $2; exit}' tools/nmap_scan.clad.toml)
+
+# For the first release of a tool: no previous_hash
+schemapin-sign tools/nmap_scan.clad.toml \
+    --expires-in 6mo \
+    --schema-version "$TOOL_VERSION"
+
+# For subsequent releases: chain to the prior signed version
+PREV_HASH=$(jq -r '.skill_hash' tools/nmap_scan.clad.toml.sig.prior)
+schemapin-sign tools/nmap_scan.clad.toml \
+    --expires-in 6mo \
+    --schema-version "$TOOL_VERSION" \
+    --previous-hash "$PREV_HASH"
+```
+
+Verifiers (Symbiont, custom runtimes) SHOULD:
+
+1. Treat `expired = true` as a policy signal — refuse high-risk tools, prompt on medium-risk, log on low-risk.
+2. Maintain a per-tool `latest_known_hash` next to the TOFU pin. On encountering a signature whose `previous_hash` doesn't match that pin, prompt the operator (similar to the TOFU key-rotation prompt) before rolling forward.
+3. When the vendor publishes a `_schemapin.{vendor-domain}` TXT record, fetch it and require the fingerprint to match the discovery-document key. Mismatch is a hard fail (`DOMAIN_MISMATCH`).
+
+See the canonical SchemaPin guides for protocol detail:
+
+- [Signature expiration](https://docs.schemapin.org/signature-expiration/)
+- [Schema version binding](https://docs.schemapin.org/schema-version-binding/)
+- [DNS TXT cross-verification](https://docs.schemapin.org/dns-txt/)
+
+Backward compatibility: all three are additive optional. SchemaPin v1.3 verifiers ignore the new fields entirely; ToolClad publishers can adopt them at their own pace without breaking older runtimes.
+
 ## No-Eval Guarantee
 
 Conditional evaluators in `[command.conditionals]` use closed-vocabulary parsers:

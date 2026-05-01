@@ -62,6 +62,28 @@ schemapin-sign tools/nmap_scan.clad.toml
 
 The signature and hash are published in the vendor's `.well-known/schemapin.json` discovery document. Verification happens at the runtime level, not the manifest level. See the [Design Specification](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md) for the full verification flow.
 
+### SchemaPin v1.4 (alpha) — Lifecycle, Lineage, DNS
+
+The signing command supports three additive optional features from SchemaPin v1.4-alpha. None of them require manifest changes — they are options on `schemapin-sign`. Recommended for any production manifest:
+
+```bash
+# Versioned release with TTL + lineage
+schemapin-sign tools/nmap_scan.clad.toml \
+    --expires-in 6mo \
+    --schema-version "$(awk -F\" '/^version[[:space:]]*=/ {print $2; exit}' tools/nmap_scan.clad.toml)" \
+    --previous-hash "$(jq -r '.skill_hash' tools/nmap_scan.clad.toml.sig.prior 2>/dev/null || true)"
+```
+
+What each flag does:
+
+- `--expires-in 6mo` — adds an `expires_at` field. Verifiers past the expiry emit a `signature_expired` warning rather than failing. Forces re-signing on a cadence; surfaces stale tooling for policy gating.
+- `--schema-version "$TOOL_VERSION"` — embeds the manifest's `[tool] version` semver into the signature. Surfaced on `VerificationResult.schema_version` for runtime version policy.
+- `--previous-hash "$PREV_HASH"` — claims this signature is the legitimate successor of the prior one. Pair with `verify_chain` at the runtime layer to fail closed on rug-pull substitutions.
+
+Vendors SHOULD also publish a `_schemapin.{vendor-domain}` TXT record pointing at the same key fingerprint as `.well-known/schemapin.json` — runtimes that adopt DNS TXT cross-verification then fail closed on mismatches between the HTTPS hosting channel and the DNS channel.
+
+See [SchemaPin v1.4 features in ToolClad](schemapin-v1.4-features.md) for the full operational guide and per-language verifier examples.
+
 ## `[args.*]` -- Parameter Definitions
 
 Each parameter is a TOML table under `[args]`:

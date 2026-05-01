@@ -1,4 +1,65 @@
 {
+  "$schema": "https://context7.com/schema/context7.json",
   "url": "https://context7.com/thirdkeyai/toolclad",
-  "public_key": "pk_Ehy7QXQTu2Keb0e5BNeyx"
+  "public_key": "pk_Ehy7QXQTu2Keb0e5BNeyx",
+  "projectTitle": "ToolClad",
+  "description": "Declarative tool interface contracts for agentic runtimes — manifest format (.clad.toml) defining typed parameters, validation rules, command templates, output schemas, Cedar policy mappings, risk tiers, and evidence envelopes. Three execution modes: oneshot CLI, interactive PTY session with per-interaction governance, and headless browser via CDP. Reference implementations in Rust, Python, JavaScript, and Go produce byte-identical evidence envelopes. Signs .clad.toml directly with SchemaPin (no [tool.schemapin] section needed); v1.4-alpha additive options recommended for production: --expires-in TTL, --schema-version derived from [tool] version, --previous-hash for lineage chain enforcement, plus _schemapin.{vendor-domain} DNS TXT cross-verification. Part of the ThirdKey trust stack: SchemaPin (tool integrity) → AgentPin (agent identity) → ToolClad (tool contracts) → Symbiont (runtime).",
+  "folders": [
+    "SKILL.md",
+    "README.md",
+    "AGENTS.md",
+    "TOOLCLAD_DESIGN_SPEC.md",
+    "docs/index.md",
+    "docs/getting-started.md",
+    "docs/manifest-format.md",
+    "docs/type-system.md",
+    "docs/command-construction.md",
+    "docs/security-model.md",
+    "docs/cli-reference.md",
+    "docs/api-reference.md",
+    "docs/output-evidence.md",
+    "docs/session-mode.md",
+    "docs/browser-mode.md",
+    "docs/http-mcp-backends.md",
+    "docs/llm-integration.md",
+    "docs/symbiont-integration.md",
+    "docs/schemapin-v1.4-features.md",
+    "rust/README.md",
+    "python/README.md",
+    "js/README.md",
+    "examples"
+  ],
+  "excludeFolders": [
+    "**/node_modules",
+    "**/dist",
+    "**/__pycache__",
+    "**/*.egg-info",
+    "**/target",
+    "**/build",
+    "**/coverage",
+    "**/tests",
+    "**/test",
+    "site",
+    "go-bin"
+  ],
+  "excludeFiles": [
+    "**/*.lock",
+    "**/*.toml",
+    "**/*.cfg",
+    "CHANGELOG.md"
+  ],
+  "rules": [
+    "ToolClad inverts the sandbox approach: LLM fills typed parameters constrained by the manifest, executor validates and constructs the command. The LLM never generates or sees shell commands.",
+    "All string-based types reject shell metacharacters by default (`;|&$\\`(){}[]<>!\\n\\r`). Array-based execution via execve, no `sh -c` interpretation.",
+    "Three dispatch modes: oneshot (default — single command execution), session (PTY with per-interaction Cedar gating), browser (CDP/Playwright with URL scope enforcement and page state policies).",
+    "14 built-in type validators: string, integer, number, port, boolean, enum, scope_target, cidr, ip, hostname, url, path, file, regex. All include injection sanitization.",
+    "Conditional evaluators in [command.conditionals] use closed-vocabulary parsers — NEVER eval(), Function(), exec(), or dynamic code execution. RCE prevention is a security requirement enforced across all four reference implementations.",
+    "Manifests are signed directly with `schemapin-sign tools/<name>.clad.toml`. No `[tool.schemapin]` section required — the manifest stays clean. Verification happens at the runtime layer via SchemaPin's .well-known/schemapin.json discovery.",
+    "Recommended SchemaPin v1.4-alpha signing for production manifests: pass `--expires-in 6mo` (forces re-signing cadence; verifiers degrade past expires_at), `--schema-version $TOOL_VERSION` (semver from [tool] version, surfaces as VerificationResult.schema_version for policy use), and `--previous-hash $PREV_SKILL_HASH` for subsequent releases (forms a lineage chain; verifiers pair with verify_chain to defend against rug-pull substitutions).",
+    "Recommended DNS TXT publication: vendors SHOULD publish `_schemapin.{vendor-domain}` IN TXT \"v=schemapin1; kid=...; fp=sha256:...\" alongside .well-known/schemapin.json. Runtimes that adopt cross-verification fail closed on mismatches between HTTPS hosting and DNS channels (DOMAIN_MISMATCH).",
+    "Evidence envelope is structured JSON with scan_id, timestamps, exit_code, stderr, output_hash (SHA-256), platform-aware temp directory paths. HTTP error semantics: 4xx → client_error, 5xx → server_error.",
+    "Output parsers: builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, plus custom scripts. [output.schema] validates parsed results before they reach the LLM.",
+    "Cross-language guarantee: Rust, Python, JavaScript, and Go reference implementations produce byte-identical evidence envelopes for the same manifest + arguments. Mandatory.",
+    "Part of the ThirdKey trust stack: SchemaPin (tool integrity) → AgentPin (agent identity) → ToolClad (tool contracts) → Symbiont (runtime). ToolClad is the layer that turns SchemaPin-verified contracts into safely dispatched commands."
+  ]
 }

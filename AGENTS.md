@@ -53,7 +53,7 @@ ToolClad is a framework for defining tools, not a tool itself. It provides a CLI
 
 - **Symbiont**: Auto-discovered from `tools/` directory, registered as MCP tools in the ORGA reasoning loop
 - **Cedar**: Manifests declare `[tool.cedar]` resource/action for policy evaluation
-- **SchemaPin**: Manifests can include `[tool.schemapin]` for cryptographic verification
+- **SchemaPin**: `.clad.toml` files are signed directly with `schemapin-sign` (no `[tool.schemapin]` section needed). v1.4-alpha additive options recommended for production: `--expires-in` (TTL), `--schema-version "$TOOL_VERSION"` (semver tag), `--previous-hash $PREV` (lineage chain), and a `_schemapin.{vendor-domain}` TXT record for second-channel cross-verification.
 - **MCP**: `inputSchema` and `outputSchema` auto-generated for any MCP-compatible runtime
 
 ## Security Model

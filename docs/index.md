@@ -116,6 +116,7 @@ All four implementations parse the same `.clad.toml` format, validate arguments 
 | [Command Construction](command-construction.md) | Templates, mappings, conditionals, array-based execution |
 | [HTTP and MCP Backends](http-mcp-backends.md) | HTTP API tools and governed MCP proxy passthrough |
 | [Session Mode](session-mode.md) | PTY sessions with per-interaction governance |
+| [SchemaPin v1.4 Features](schemapin-v1.4-features.md) | Sign with TTL, schema-version + previous-hash lineage, and `_schemapin.{domain}` DNS TXT cross-verification |
 
 ## Links
 

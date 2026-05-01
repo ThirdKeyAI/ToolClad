@@ -1,8 +1,8 @@
 ---
 name: toolclad
 title: ToolClad
-description: Declarative tool interface contracts for agentic runtimes — oneshot CLI, interactive session (PTY), and browser (CDP/Playwright) modes with typed parameters, per-interaction Cedar gating, evidence envelopes
-version: 0.6.1
+description: Declarative tool interface contracts for agentic runtimes — oneshot CLI, interactive session (PTY), and browser (CDP/Playwright) modes with typed parameters, per-interaction Cedar gating, evidence envelopes. Signs .clad.toml manifests with SchemaPin (recommended v1.4-alpha options: --expires-in for TTL, --schema-version for semver tagging, --previous-hash for lineage chain).
+version: 0.6.2
 ---
 
 # ToolClad Development Skills Guide
