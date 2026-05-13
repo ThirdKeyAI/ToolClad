@@ -1,5 +1,7 @@
 # ToolClad
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19957595.svg)](https://doi.org/10.5281/zenodo.19957595)
+
 Declarative tool interface contracts for agentic runtimes.
 
 ToolClad is a manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool: typed parameters, validation rules, invocation mechanism, output parsing, and policy metadata. Three execution modes share a common governance layer:
