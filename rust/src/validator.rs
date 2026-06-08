@@ -1,6 +1,6 @@
 use crate::types::{ArgDef, ToolCladError};
 use regex::Regex;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 
 /// Supported argument types for validation.
@@ -27,9 +27,8 @@ const SHELL_METACHARACTERS: &[char] = &[
     '\n', '\r', ';', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
 ];
 
-/// Compiled regex for IP address formats.
-static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$").unwrap());
+/// Compiled regex for IP address formats. Canonical IPv4/IPv6 are validated by
+/// strict `std::net` parsers; this regex only frames CIDR notation.
 static CIDR_V4_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$").unwrap());
 static HOSTNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -69,7 +68,7 @@ pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, Too
         "port" => validate_port(name, val),
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
-        "scope_target" => validate_scope_target(name, val),
+        "scope_target" => validate_scope_target(name, def, val),
         "url" => validate_url(name, val),
         "path" => validate_path(name, val),
         "ip_address" => validate_ip_address(name, val),
@@ -232,7 +231,7 @@ fn validate_enum(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolClad
 /// against buffer-pathological payloads.
 const SCOPE_TARGET_MAX_LEN: usize = 253;
 
-fn validate_scope_target(name: &str, val: &str) -> Result<String, ToolCladError> {
+fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
     if val.is_empty() {
         return Err(ToolCladError::ValidationError(format!(
@@ -284,18 +283,135 @@ fn validate_scope_target(name: &str, val: &str) -> Result<String, ToolCladError>
         )));
     }
 
-    // Accept valid IPs, CIDRs, or hostnames.
-    if IPV4_RE.is_match(val)
-        || val.parse::<Ipv6Addr>().is_ok()
-        || CIDR_V4_RE.is_match(val)
-        || HOSTNAME_RE.is_match(val)
-    {
+    // Per-label DNS length: RFC 1035 §2.3.4 caps each label at 63 octets. The
+    // total-length check above does not bound an individual label.
+    if val.split('.').any(|label| label.len() > 63) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target has a DNS label exceeding 63 octets (RFC 1035 §2.3.4)"
+        )));
+    }
+
+    // Canonical IP literals only. Rust's parsers accept ONLY dotted-quad IPv4
+    // and standard IPv6, so integer/hex/octal/shorthand encodings (2130706433,
+    // 0x7f000001, 0177.0.0.1, 127.1 — all of which a libc resolver would expand
+    // to 127.0.0.1) fail here and are rejected as non-canonical literals below.
+    if let Some(ip) = parse_canonical_ip(val) {
+        if def.block_internal {
+            if let Some(reason) = non_public_ip_reason(&ip) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' scope_target {reason} (blocked by block_internal policy)"
+                )));
+            }
+        }
+        return Ok(val.to_string());
+    }
+
+    // CIDR ranges. Range-check the base address under policy.
+    if let Some(caps) = CIDR_V4_RE.captures(val) {
+        if let Ok(base) = caps[1].parse::<Ipv4Addr>() {
+            if def.block_internal {
+                if let Some(reason) = non_public_ip_reason(&IpAddr::V4(base)) {
+                    return Err(ToolCladError::ValidationError(format!(
+                        "argument '{name}' scope_target CIDR base {reason} (blocked by block_internal policy)"
+                    )));
+                }
+            }
+            return Ok(val.to_string());
+        }
+    }
+
+    // A non-canonical IP-literal encoding must not slip through as a "hostname":
+    // a downstream resolver would expand it to an address. No legitimate hostname
+    // is all-numeric labels or a 0x-prefixed hex literal.
+    if looks_like_ip_literal(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target looks like a non-canonical IP literal; use dotted-quad IPv4 or standard IPv6"
+        )));
+    }
+
+    // Hostname: structural regex plus a non-numeric rightmost label — no valid
+    // TLD is all digits (RFC 3696 §2), which also rejects dotted-decimal IPs.
+    if HOSTNAME_RE.is_match(val) && tld_not_all_numeric(val) {
         Ok(val.to_string())
     } else {
         Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid scope target (IP, CIDR, or hostname)"
         )))
     }
+}
+
+/// Parse only canonical IP text (dotted-quad IPv4 / standard IPv6). Rejects
+/// integer, hex, octal, and shorthand encodings by construction.
+fn parse_canonical_ip(val: &str) -> Option<IpAddr> {
+    val.parse::<Ipv4Addr>()
+        .map(IpAddr::V4)
+        .or_else(|_| val.parse::<Ipv6Addr>().map(IpAddr::V6))
+        .ok()
+}
+
+/// True if `val` is an attempt at an IP literal in a non-canonical encoding:
+/// a `0x…` hex form, or every dot-separated label is all ASCII digits
+/// (integer / dotted-decimal / octal / shorthand). Canonical IPs are handled
+/// earlier and never reach here.
+fn looks_like_ip_literal(val: &str) -> bool {
+    let lower = val.to_ascii_lowercase();
+    if lower.starts_with("0x") {
+        return true;
+    }
+    val.split('.')
+        .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// True if the rightmost DNS label is not entirely numeric (a real TLD is never
+/// all digits). Rejects e.g. `example.123` and dotted-decimal IPs.
+fn tld_not_all_numeric(val: &str) -> bool {
+    match val.rsplit('.').next() {
+        Some(tld) => !tld.is_empty() && !tld.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// Returns a reason string if `ip` is a non-public address that SSRF defenses
+/// should block: loopback, private, link-local (incl. cloud metadata), etc.
+/// IPv6 v4-mapped addresses are unwrapped so `::ffff:127.0.0.1` is caught.
+fn non_public_ip_reason(ip: &IpAddr) -> Option<&'static str> {
+    let v4 = match ip {
+        IpAddr::V4(a) => Some(*a),
+        IpAddr::V6(a) => a.to_ipv4_mapped(),
+    };
+    if let Some(a) = v4 {
+        return if a.is_loopback() {
+            Some("resolves to a loopback address")
+        } else if a.is_private() {
+            Some("resolves to a private address")
+        } else if a.is_link_local() {
+            Some("resolves to a link-local address (e.g. cloud metadata 169.254.169.254)")
+        } else if a.is_unspecified() {
+            Some("is the unspecified address 0.0.0.0")
+        } else if a.is_broadcast() {
+            Some("is the broadcast address")
+        } else if a.is_documentation() {
+            Some("is a documentation-range address")
+        } else {
+            None
+        };
+    }
+    if let IpAddr::V6(a) = ip {
+        if a.is_loopback() {
+            return Some("resolves to the IPv6 loopback ::1");
+        }
+        if a.is_unspecified() {
+            return Some("is the IPv6 unspecified address ::");
+        }
+        let first = a.segments()[0];
+        if (first & 0xfe00) == 0xfc00 {
+            return Some("is an IPv6 unique-local address (fc00::/7)");
+        }
+        if (first & 0xffc0) == 0xfe80 {
+            return Some("is an IPv6 link-local address (fe80::/10)");
+        }
+    }
+    None
 }
 
 /// Returns true if any DNS label in `host` is an A-label (`xn--…`).
@@ -708,6 +824,88 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ASCII"));
+    }
+
+    #[test]
+    fn test_scope_target_rejects_obfuscated_ip_literals() {
+        // A libc resolver expands all of these to 127.0.0.1 — they must not
+        // pass as canonical IPs or sneak through as "hostnames".
+        let def = make_arg("scope_target");
+        for v in [
+            "2130706433",  // decimal integer
+            "0x7f000001",  // hex
+            "0177.0.0.1",  // octal-leading
+            "127.1",       // shorthand
+            "010.0.0.1",   // leading-zero octet
+        ] {
+            assert!(validate_arg("t", &def, v).is_err(), "should reject {v}");
+        }
+        // Canonical forms still pass (no block_internal policy here).
+        assert!(validate_arg("t", &def, "127.0.0.1").is_ok());
+        assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
+        assert!(validate_arg("t", &def, "::1").is_ok());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_overlong_label() {
+        // RFC 1035 §2.3.4: a single label may not exceed 63 octets, even when
+        // the whole name is under the 253-octet cap.
+        let def = make_arg("scope_target");
+        let label64 = format!("{}.com", "a".repeat(64));
+        let err = validate_arg("t", &def, &label64).unwrap_err().to_string();
+        assert!(err.contains("63"), "unexpected message: {err}");
+        // 63 is allowed.
+        assert!(validate_arg("t", &def, &format!("{}.com", "a".repeat(63))).is_ok());
+    }
+
+    #[test]
+    fn test_scope_target_rejects_numeric_tld() {
+        let def = make_arg("scope_target");
+        assert!(validate_arg("t", &def, "example.123").is_err());
+    }
+
+    fn blocking_arg() -> ArgDef {
+        ArgDef {
+            type_name: "scope_target".to_string(),
+            block_internal: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_scope_target_block_internal_off_allows_internal_by_default() {
+        // Default policy is permissive: tools that legitimately target internal
+        // hosts keep working. block_internal must be opted into.
+        let def = make_arg("scope_target");
+        assert!(validate_arg("t", &def, "127.0.0.1").is_ok());
+        assert!(validate_arg("t", &def, "169.254.169.254").is_ok());
+        assert!(validate_arg("t", &def, "10.0.0.5").is_ok());
+        assert!(validate_arg("t", &def, "::1").is_ok());
+    }
+
+    #[test]
+    fn test_scope_target_block_internal_on_rejects_non_public() {
+        let def = blocking_arg();
+        // loopback / private / link-local (cloud metadata) / unspecified
+        for v in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "169.254.169.254",  // IMDS
+            "0.0.0.0",
+            "::1",
+            "::ffff:127.0.0.1", // v4-mapped loopback must be unwrapped
+            "fe80::1",          // IPv6 link-local
+            "fc00::1",          // IPv6 unique-local
+        ] {
+            let err = validate_arg("t", &def, v).unwrap_err().to_string();
+            assert!(err.contains("block_internal"), "{v} -> {err}");
+        }
+        // Public addresses and hostnames still pass under the policy.
+        assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
+        assert!(validate_arg("t", &def, "example.com").is_ok());
+        // CIDR with an internal base is blocked too.
+        assert!(validate_arg("t", &def, "10.0.0.0/24").is_err());
     }
 
     #[test]
