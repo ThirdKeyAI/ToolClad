@@ -19,6 +19,9 @@ required = true
 type = "url"
 schemes = ["http", "https"]
 scope_check = true
+# curl fetches this URL — default-deny internal/SSRF hosts (loopback, private,
+# cloud metadata). Use an allowlist if internal fetches are genuinely required.
+block_internal = true
 description = "URL to fetch"
 
 [args.method]

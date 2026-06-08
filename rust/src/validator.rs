@@ -69,7 +69,7 @@ pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, Too
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
         "scope_target" => validate_scope_target(name, def, val),
-        "url" => validate_url(name, val),
+        "url" => validate_url(name, def, val),
         "path" => validate_path(name, val),
         "ip_address" => validate_ip_address(name, val),
         "cidr" => validate_cidr(name, val),
@@ -296,26 +296,14 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
     // 0x7f000001, 0177.0.0.1, 127.1 — all of which a libc resolver would expand
     // to 127.0.0.1) fail here and are rejected as non-canonical literals below.
     if let Some(ip) = parse_canonical_ip(val) {
-        if def.block_internal {
-            if let Some(reason) = non_public_ip_reason(&ip) {
-                return Err(ToolCladError::ValidationError(format!(
-                    "argument '{name}' scope_target {reason} (blocked by block_internal policy)"
-                )));
-            }
-        }
+        enforce_ip_policy(name, &ip, def.block_internal)?;
         return Ok(val.to_string());
     }
 
     // CIDR ranges. Range-check the base address under policy.
     if let Some(caps) = CIDR_V4_RE.captures(val) {
         if let Ok(base) = caps[1].parse::<Ipv4Addr>() {
-            if def.block_internal {
-                if let Some(reason) = non_public_ip_reason(&IpAddr::V4(base)) {
-                    return Err(ToolCladError::ValidationError(format!(
-                        "argument '{name}' scope_target CIDR base {reason} (blocked by block_internal policy)"
-                    )));
-                }
-            }
+            enforce_ip_policy(name, &IpAddr::V4(base), def.block_internal)?;
             return Ok(val.to_string());
         }
     }
@@ -371,6 +359,48 @@ fn tld_not_all_numeric(val: &str) -> bool {
     }
 }
 
+/// Reason if `ip` must be blocked regardless of policy: link-local
+/// (169.254.0.0/16, fe80::/10), which includes the cloud-metadata endpoint
+/// 169.254.169.254. No agent tool has a legitimate reason to reach these, and
+/// the blast radius (instance-credential theft) is maximal — so block always,
+/// even when `block_internal` is off. v4-mapped IPv6 is unwrapped.
+fn always_blocked_ip_reason(ip: &IpAddr) -> Option<&'static str> {
+    let v4 = match ip {
+        IpAddr::V4(a) => Some(*a),
+        IpAddr::V6(a) => a.to_ipv4_mapped(),
+    };
+    if let Some(a) = v4 {
+        return a
+            .is_link_local()
+            .then_some("is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked");
+    }
+    if let IpAddr::V6(a) = ip {
+        if (a.segments()[0] & 0xffc0) == 0xfe80 {
+            return Some("is an IPv6 link-local address (fe80::/10) — always blocked");
+        }
+    }
+    None
+}
+
+/// Enforce the egress policy for a resolved target IP: link-local / metadata is
+/// always blocked; the remaining non-public ranges are blocked only under the
+/// opt-in `block_internal` policy.
+fn enforce_ip_policy(name: &str, ip: &IpAddr, block_internal: bool) -> Result<(), ToolCladError> {
+    if let Some(reason) = always_blocked_ip_reason(ip) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' target {reason}"
+        )));
+    }
+    if block_internal {
+        if let Some(reason) = non_public_ip_reason(ip) {
+            return Err(ToolCladError::ValidationError(format!(
+                "argument '{name}' target {reason} (blocked by block_internal policy)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Returns a reason string if `ip` is a non-public address that SSRF defenses
 /// should block: loopback, private, link-local (incl. cloud metadata), etc.
 /// IPv6 v4-mapped addresses are unwrapped so `::ffff:127.0.0.1` is caught.
@@ -421,15 +451,34 @@ fn has_punycode_label(host: &str) -> bool {
         .any(|label| label.len() >= 4 && label.as_bytes()[..4].eq_ignore_ascii_case(b"xn--"))
 }
 
-fn validate_url(name: &str, val: &str) -> Result<String, ToolCladError> {
+fn validate_url(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
-    if URL_RE.is_match(val) {
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
+    if !URL_RE.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid URL"
-        )))
+        )));
     }
+    // Apply the same host hygiene as scope_target — curl/wget-style fetchers are
+    // the prime SSRF vector. URL_RE guarantees `scheme://host[/path]` with a
+    // simple host (no port/userinfo/brackets), so the host is everything between
+    // "://" and the first "/".
+    let host = val
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if has_punycode_label(host) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL host must not contain punycode (xn--) labels"
+        )));
+    }
+    if let Some(ip) = parse_canonical_ip(host) {
+        enforce_ip_policy(name, &ip, def.block_internal)?;
+    } else if looks_like_ip_literal(host) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname"
+        )));
+    }
+    Ok(val.to_string())
 }
 
 fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
@@ -874,38 +923,66 @@ mod tests {
 
     #[test]
     fn test_scope_target_block_internal_off_allows_internal_by_default() {
-        // Default policy is permissive: tools that legitimately target internal
-        // hosts keep working. block_internal must be opted into.
+        // Default policy is permissive for loopback/private — tools that
+        // legitimately target internal hosts keep working without opt-in.
         let def = make_arg("scope_target");
         assert!(validate_arg("t", &def, "127.0.0.1").is_ok());
-        assert!(validate_arg("t", &def, "169.254.169.254").is_ok());
         assert!(validate_arg("t", &def, "10.0.0.5").is_ok());
         assert!(validate_arg("t", &def, "::1").is_ok());
+        // ...but link-local / cloud metadata is blocked UNCONDITIONALLY.
+        assert!(validate_arg("t", &def, "169.254.169.254").is_err());
+    }
+
+    #[test]
+    fn test_scope_target_blocks_metadata_unconditionally() {
+        let def = make_arg("scope_target"); // block_internal = false
+        for v in ["169.254.169.254", "169.254.0.1", "::ffff:169.254.169.254", "fe80::1"] {
+            let err = validate_arg("t", &def, v).unwrap_err().to_string();
+            assert!(err.contains("always blocked"), "{v} -> {err}");
+        }
     }
 
     #[test]
     fn test_scope_target_block_internal_on_rejects_non_public() {
         let def = blocking_arg();
-        // loopback / private / link-local (cloud metadata) / unspecified
         for v in [
             "127.0.0.1",
             "10.0.0.5",
             "192.168.1.1",
-            "169.254.169.254",  // IMDS
+            "169.254.169.254",  // IMDS (always-block path)
             "0.0.0.0",
             "::1",
             "::ffff:127.0.0.1", // v4-mapped loopback must be unwrapped
             "fe80::1",          // IPv6 link-local
             "fc00::1",          // IPv6 unique-local
         ] {
-            let err = validate_arg("t", &def, v).unwrap_err().to_string();
-            assert!(err.contains("block_internal"), "{v} -> {err}");
+            assert!(validate_arg("t", &def, v).is_err(), "{v} should be blocked");
         }
         // Public addresses and hostnames still pass under the policy.
         assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
         assert!(validate_arg("t", &def, "example.com").is_ok());
         // CIDR with an internal base is blocked too.
         assert!(validate_arg("t", &def, "10.0.0.0/24").is_err());
+    }
+
+    #[test]
+    fn test_url_host_hardening() {
+        let public = make_arg("url");
+        // valid public URL passes
+        assert!(validate_arg("u", &public, "https://example.com/path").is_ok());
+        assert!(validate_arg("u", &public, "http://93.184.216.34/x").is_ok());
+        // cloud metadata blocked unconditionally, even without block_internal
+        assert!(validate_arg("u", &public, "http://169.254.169.254/latest/meta-data/").is_err());
+        // obfuscated IP hosts rejected
+        assert!(validate_arg("u", &public, "http://0x7f000001/").is_err());
+        assert!(validate_arg("u", &public, "http://2130706433/").is_err());
+        // punycode host rejected
+        assert!(validate_arg("u", &public, "http://xn--example-9c.com/").is_err());
+        // loopback allowed only when block_internal is off
+        assert!(validate_arg("u", &public, "http://127.0.0.1/").is_ok());
+        let blocking = ArgDef { type_name: "url".to_string(), block_internal: true, ..Default::default() };
+        assert!(validate_arg("u", &blocking, "http://127.0.0.1/").is_err());
+        assert!(validate_arg("u", &blocking, "http://10.0.0.5/x").is_err());
     }
 
     #[test]
