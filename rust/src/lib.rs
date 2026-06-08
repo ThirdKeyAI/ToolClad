@@ -108,6 +108,38 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
     Ok(manifest)
 }
 
+/// Binaries that connect to a network destination derived from their arguments
+/// — the ones for which an unconstrained `scope_target`/`url` is an SSRF surface.
+const EGRESS_BINARIES: &[&str] = &[
+    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh",
+    "ping", "fping", "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
+];
+
+fn command_basename(s: &str) -> String {
+    s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase()
+}
+
+/// True if the manifest's command dispatches one of the known egress binaries
+/// (checked across `tool.binary`, `command.exec[0]`, and `command.template`).
+fn command_invokes_egress_binary(m: &Manifest) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    if !m.tool.binary.is_empty() {
+        names.push(command_basename(&m.tool.binary));
+    }
+    if let Some(first) = m.command.exec.as_ref().and_then(|e| e.first()) {
+        names.push(command_basename(first));
+    }
+    if let Some(first) = m
+        .command
+        .template
+        .as_ref()
+        .and_then(|t| t.split_whitespace().next())
+    {
+        names.push(command_basename(first));
+    }
+    names.iter().any(|n| EGRESS_BINARIES.contains(&n.as_str()))
+}
+
 /// Validate internal consistency of a parsed manifest.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
     // Validate dispatch mode.
@@ -157,6 +189,21 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
             return Err(ToolCladError::ManifestError(format!(
                 "argument '{name}' is type 'enum' but has no 'allowed' list"
             )));
+        }
+    }
+
+    // Egress safety: a tool that connects to a network target must default-deny
+    // internal/SSRF addresses. If the command invokes a known network-egress
+    // binary and a scope_target/url arg does not set block_internal, refuse the
+    // manifest. (HTTP/MCP/browser backends are separate egress surfaces.)
+    if command_invokes_egress_binary(manifest) {
+        for (name, def) in &manifest.args {
+            if matches!(def.type_name.as_str(), "scope_target" | "url") && !def.block_internal {
+                return Err(ToolCladError::ManifestError(format!(
+                    "argument '{name}' is a network target for an egress binary but block_internal is not set; \
+                     set block_internal = true to default-deny internal/SSRF targets"
+                )));
+            }
         }
     }
 
@@ -438,6 +485,7 @@ risk_tier = "low"
 position = 1
 required = true
 type = "scope_target"
+block_internal = true
 description = "Target"
 
 [args.scan_type]
@@ -474,6 +522,50 @@ type = "object"
         assert!(m.command.mappings.is_some());
         let mappings = m.command.mappings.as_ref().unwrap();
         assert_eq!(mappings["scan_type"]["ping"], "-sn -PE");
+    }
+
+    #[test]
+    fn test_egress_binary_requires_block_internal() {
+        // curl on a url arg WITHOUT block_internal must be refused at load.
+        let bad = r#"
+[tool]
+name = "fetch"
+version = "1.0.0"
+binary = "curl"
+description = "x"
+[args.url]
+position = 1
+required = true
+type = "url"
+[command]
+template = "curl {url}"
+[output]
+format = "text"
+"#;
+        let err = parse_manifest(bad).unwrap_err().to_string();
+        assert!(err.contains("block_internal"), "unexpected: {err}");
+
+        // Same manifest WITH block_internal loads fine.
+        let good = bad.replace("type = \"url\"", "type = \"url\"\nblock_internal = true");
+        assert!(parse_manifest(&good).is_ok());
+
+        // Non-egress binary (whois) does not require the flag.
+        let whois = r#"
+[tool]
+name = "whois"
+version = "1.0.0"
+binary = "whois"
+description = "x"
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+[command]
+template = "whois {target}"
+[output]
+format = "text"
+"#;
+        assert!(parse_manifest(whois).is_ok());
     }
 
     #[test]

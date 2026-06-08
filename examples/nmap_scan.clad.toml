@@ -24,6 +24,9 @@ hash = "sha256"
 position = 1
 required = true
 type = "scope_target"
+# nmap connects to this target — default-deny internal/SSRF ranges (loopback,
+# private, cloud metadata). Use an allowlist for legitimate internal scans.
+block_internal = true
 description = "Target CIDR, IP, or hostname"
 
 [args.scan_type]
