@@ -117,6 +117,13 @@ pub struct ArgDef {
     pub schemes: Vec<String>,
     #[serde(default)]
     pub scope_check: bool,
+    /// `scope_target` only: when true, reject targets that resolve to a
+    /// non-public address — loopback, private, link-local (incl. cloud-metadata
+    /// 169.254.0.0/16), unspecified, broadcast, documentation, and the IPv6
+    /// equivalents (incl. v4-mapped). SSRF defense-in-depth, opt-in per arg so
+    /// tools that legitimately target internal hosts are unaffected.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 
 /// Command construction definition `[command]`.
