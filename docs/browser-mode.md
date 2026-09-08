@@ -5,6 +5,8 @@ description: CDP browser mode for governed browser automation
 
 # Browser Mode
 
+**Implementation scope:** This chapter describes embedding-runtime contracts. The standalone reference runners do not execute sessions or browsers or supply Symbiont governance services. Confirm support in the deployed runtime; see [Reference Execution](reference-execution.md).
+
 Browser mode manages browser sessions through direct CDP (Chrome DevTools Protocol) WebSocket connections. The governance model is identical to CLI session mode: typed commands, per-interaction Cedar gating, scope enforcement, state-aware policies, output schema validation, evidence capture. The transport is a browser engine instead of a PTY.
 
 ---

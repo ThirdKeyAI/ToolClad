@@ -9,14 +9,11 @@
 //!
 //! ## Security Model
 //!
-//! ToolClad inverts the sandbox approach. Instead of letting an LLM generate
-//! arbitrary shell commands and intercepting dangerous ones (deny-list),
-//! ToolClad constrains the LLM to fill typed parameters that are validated
-//! against a manifest (allow-list). The dangerous action cannot be expressed
-//! because the interface doesn't permit it.
-//!
-//! All string-based types reject shell metacharacters (`;|&$\`(){}[]<>!`)
-//! by default.
+//! ToolClad validates declared arguments and preserves command argument boundaries.
+//! It does not provide OS isolation. Standalone execution refuses declarations
+//! requiring approval, Cedar or explicit scope enforcement; those controls belong
+//! to an embedding runtime. Output hashes are diagnostic digests, not signed audit
+//! receipts. See the repository's reference-execution guide for limits.
 //!
 //! ## Core Types
 //!
@@ -83,6 +80,7 @@
 //! See the [ToolClad Design Spec](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md)
 //! for the full `.clad.toml` format specification.
 
+pub mod contracts;
 pub mod executor;
 pub mod types;
 pub mod validator;
@@ -111,12 +109,15 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 /// Binaries that connect to a network destination derived from their arguments
 /// — the ones for which an unconstrained `scope_target`/`url` is an SSRF surface.
 const EGRESS_BINARIES: &[&str] = &[
-    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh",
-    "ping", "fping", "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
+    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh", "ping", "fping",
+    "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
 ];
 
 fn command_basename(s: &str) -> String {
-    s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase()
+    s.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase()
 }
 
 /// True if the manifest's command dispatches one of the known egress binaries
@@ -382,6 +383,7 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
     let input_schema = serde_json::json!({
         "type": "object",
         "properties": properties,
+        "additionalProperties": false,
         "required": required,
     });
 

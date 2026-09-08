@@ -58,12 +58,6 @@ func validateCmd() *cobra.Command {
 				}
 			}
 
-			// Validate command has template or executor.
-			if m.Command.Template == "" && m.Command.Executor == "" {
-				fmt.Fprintf(os.Stderr, "%s  ERROR: no command template or executor\n", path)
-				return fmt.Errorf("no command template or executor")
-			}
-
 			fmt.Printf("%s  OK\n", path)
 			fmt.Printf("  Tool:    %s v%s\n", m.Tool.Name, m.Tool.Version)
 			fmt.Printf("  Binary:  %s\n", m.Tool.Binary)
@@ -102,6 +96,9 @@ func runCmd() *cobra.Command {
 			}
 
 			printJSON(envelope)
+			if envelope.Status != "success" {
+				return fmt.Errorf("execution status: %s", envelope.Status)
+			}
 			return nil
 		},
 	}
@@ -150,57 +147,11 @@ func testCmd() *cobra.Command {
 
 			fmt.Printf("  Manifest:  %s\n", path)
 
-			// Validate each argument and display results. Track the first
-			// validation failure so we can return a non-zero exit code
-			// after the dry-run output is printed — CI consumers gate on
-			// this, and silently exiting 0 on a FAIL line was masking
-			// every validator refusal.
-			fmt.Printf("  Arguments: ")
-			first := true
-			var firstFailure error
-			for _, argDef := range m.ArgsSorted() {
-				val, provided := toolArgs[argDef.Name]
-				if !provided {
-					if argDef.Required {
-						fmt.Printf("\n  ERROR: missing required argument %q\n", argDef.Name)
-						return fmt.Errorf("missing required argument: %q", argDef.Name)
-					}
-					if argDef.Default != nil {
-						val = fmt.Sprintf("%v", argDef.Default)
-					} else {
-						continue
-					}
-				}
-
-				validated, vErr := validator.ValidateArg(argDef, val)
-				status := "OK"
-				if vErr != nil {
-					status = fmt.Sprintf("FAIL: %v", vErr)
-					if firstFailure == nil {
-						firstFailure = fmt.Errorf("validation failed for %q: %w", argDef.Name, vErr)
-					}
-				}
-
-				if !first {
-					fmt.Printf("             ")
-				}
-				fmt.Printf("%s=%s (%s: %s)\n", argDef.Name, validated, argDef.Type, status)
-				first = false
+			command, err := executor.DryRun(m, toolArgs)
+			if err != nil {
+				return err
 			}
-			if first {
-				fmt.Println("(none)")
-			}
-
-			// Build command.
-			cmdStr, buildErr := executor.BuildCommand(m, toolArgs)
-			if buildErr != nil {
-				fmt.Printf("  Command:   ERROR: %v\n", buildErr)
-				if firstFailure == nil {
-					firstFailure = buildErr
-				}
-			} else {
-				fmt.Printf("  Command:   %s\n", cmdStr)
-			}
+			fmt.Printf("  Command:   %s\n", command)
 
 			if m.Tool.Cedar != nil {
 				fmt.Printf("  Cedar:     %s / %s\n", m.Tool.Cedar.Resource, m.Tool.Cedar.Action)
@@ -209,7 +160,7 @@ func testCmd() *cobra.Command {
 			fmt.Printf("  Risk:      %s\n", m.Tool.RiskTier)
 			fmt.Println()
 			fmt.Println("  [dry run -- command not executed]")
-			return firstFailure
+			return nil
 		},
 	}
 
@@ -225,7 +176,10 @@ func parseArgFlags(flags []string) (map[string]string, error) {
 		if idx < 1 {
 			return nil, fmt.Errorf("invalid --arg format %q: expected key=value", f)
 		}
-		key := f[:idx]
+		key := strings.TrimSpace(f[:idx])
+		if _, exists := result[key]; key == "" || exists {
+			return nil, fmt.Errorf("argument names must be nonempty and unique")
+		}
 		val := f[idx+1:]
 		result[key] = val
 	}

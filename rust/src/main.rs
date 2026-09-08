@@ -49,6 +49,10 @@ fn parse_arg_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> 
         let (key, value) = pair
             .split_once('=')
             .ok_or_else(|| format!("invalid argument format '{pair}', expected KEY=VALUE"))?;
+        let key = key.trim();
+        if key.is_empty() || map.contains_key(key) {
+            return Err("argument names must be nonempty and unique".into());
+        }
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
@@ -105,6 +109,9 @@ fn cmd_run(path: &str, arg_pairs: &[String]) -> Result<(), Box<dyn std::error::E
     let envelope = toolclad::executor::execute(&manifest, &args)?;
     let json = serde_json::to_string_pretty(&envelope)?;
     println!("{json}");
+    if envelope.status != "success" {
+        return Err(format!("execution status: {}", envelope.status).into());
+    }
     Ok(())
 }
 

@@ -1,0 +1,183 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "literal_space",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"string\"\nrequired=true",
+      "args": {
+        "value": "alpha --extra"
+      },
+      "expected_argv": [
+        "echo",
+        "alpha --extra"
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_quote",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"enum\"\nallowed=['alpha \"beta\"']\nrequired=true",
+      "args": {
+        "value": "alpha \"beta\""
+      },
+      "expected_argv": [
+        "echo",
+        "alpha \"beta\""
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_backslash",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"enum\"\nallowed=['alpha\\beta']",
+      "args": {
+        "value": "alpha\\beta"
+      },
+      "expected_argv": [
+        "echo",
+        "alpha\\beta"
+      ],
+      "error": false
+    },
+    {
+      "name": "exec_literal_space",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\nexec=[\"echo\",\"{value}\"]\n[args.value]\ntype=\"string\"",
+      "args": {
+        "value": "alpha beta"
+      },
+      "expected_argv": [
+        "echo",
+        "alpha beta"
+      ],
+      "error": false
+    },
+    {
+      "name": "validated_required_default",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"port\"\nrequired=true\ndefault=443",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        "443"
+      ],
+      "error": false
+    },
+    {
+      "name": "invalid_default",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"port\"\ndefault=0",
+      "args": {},
+      "expected_argv": [],
+      "error": true
+    },
+    {
+      "name": "clamped_default",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"integer\"\nmax=10\nclamp=true\ndefault=99",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        "10"
+      ],
+      "error": false
+    },
+    {
+      "name": "command_default",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[command.defaults]\nvalue=99\n[args.value]\ntype=\"integer\"\nmax=10\nclamp=true",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        "10"
+      ],
+      "error": false
+    },
+    {
+      "name": "unknown_argument",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"string\"",
+      "args": {
+        "value": "ok",
+        "extra": "no"
+      },
+      "expected_argv": [],
+      "error": true
+    },
+    {
+      "name": "missing_required",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"string\"\nrequired=true",
+      "args": {},
+      "expected_argv": [],
+      "error": true
+    },
+    {
+      "name": "empty_required",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"string\"\nrequired=true",
+      "args": {
+        "value": ""
+      },
+      "expected_argv": [],
+      "error": true
+    },
+    {
+      "name": "optional_missing",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype=\"port\"",
+      "args": {},
+      "expected_argv": [
+        "echo"
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_template_token",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo {value}\"\n[args.value]\ntype='enum'\nallowed=['{other}']\n[args.other]\ntype='string'",
+      "args": {
+        "value": "{other}",
+        "other": "expanded"
+      },
+      "expected_argv": [
+        "echo",
+        "{other}"
+      ],
+      "error": false
+    },
+    {
+      "name": "mapping_and_literal",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {_scan_flags} {value}\"\n[command.mappings.scan_type]\nservice='-sT -sV'\n[args.scan_type]\ntype='enum'\nallowed=['service']\n[args.value]\ntype='string'\n",
+      "args": {
+        "scan_type": "service",
+        "value": "alpha --extra"
+      },
+      "expected_argv": [
+        "echo",
+        "-sT",
+        "-sV",
+        "alpha --extra"
+      ],
+      "error": false
+    },
+    {
+      "name": "conditional_literal",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {_flag}\"\n[command.conditionals.flag]\nwhen=\"value != ''\"\ntemplate='--label {value}'\n[args.value]\ntype='string'\n",
+      "args": {
+        "value": "alpha --extra"
+      },
+      "expected_argv": [
+        "echo",
+        "--label",
+        "alpha --extra"
+      ],
+      "error": false
+    },
+    {
+      "name": "quoted_empty",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo ''\"\n",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": false
+    },
+    {
+      "name": "unclosed_template",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate = \"echo 'unfinished\"\n",
+      "args": {},
+      "expected_argv": [],
+      "error": true
+    }
+  ]
+}

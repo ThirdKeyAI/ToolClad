@@ -173,7 +173,7 @@ class TestConditionals:
             "tool {_port_flag} {target}",
             args={
                 "target": ArgDef(name="target", position=1, required=True, type="string"),
-                "port": ArgDef(name="port", position=2, required=False, type="port", default="0"),
+                "port": ArgDef(name="port", position=2, required=False, type="integer", min=0, max=65535, default="0"),
             },
             conditionals={
                 "port_flag": {"when": "port != 0", "template": "-p {port}"},
@@ -389,6 +389,7 @@ class TestMcpProxyExecution:
     def _mcp_manifest(self) -> Manifest:
         return Manifest(
             tool=ToolMeta(name="mcp_tool", version="1.0.0", binary=""),
+            args={"target": ArgDef(name="target", type="string"), "port": ArgDef(name="port", type="port"), "extra": ArgDef(name="extra", type="string")},
             mcp=McpProxyDef(
                 server="security-scanner",
                 tool="run_scan",

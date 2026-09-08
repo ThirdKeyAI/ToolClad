@@ -5,7 +5,7 @@ description: Output parsers, evidence envelopes, and SHA-256 hashing
 
 # Output & Evidence
 
-Every ToolClad execution produces structured, validated, hash-protected output. The output pipeline has three stages: parsing raw tool output into structured data, validating it against a declared schema, and wrapping it in an evidence envelope.
+Reference runners return structured execution results and may hash captured output. Hashes are unsigned integrity digests, not authenticated or durably committed audit receipts. Parsing, output-schema validation and evidence-file handling differ across implementations. See [Reference Execution](reference-execution.md#processes-and-evidence).
 
 ---
 
@@ -35,6 +35,8 @@ envelope = true
 When no parser is specified, `builtin:text` is the default.
 
 ### Custom Parsers
+
+Custom parser scripts require an embedding runtime. The standalone runners refuse them before effects.
 
 For tools whose output requires domain-specific parsing, declare an external script:
 

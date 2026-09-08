@@ -1,5 +1,7 @@
 # Type System
 
+For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
+
 ToolClad provides 14 built-in types (10 core + 4 extended) that cover the validation patterns repeated across tool wrappers. Every type includes injection sanitization by default. Types are designed so that "valid according to the type" means "safe to interpolate into a command."
 
 ## Injection Sanitization
@@ -160,7 +162,7 @@ Valid URL structure. Must start with `http://` or `https://`. Optional `schemes`
 - Reject shell metacharacters
 - Must match URL pattern: `^https?://[a-zA-Z0-9\-\.]+(/[^\s]*)?$`
 - If `schemes` is set, the URL scheme must be in the list
-- If `scope_check = true`, the host is extracted and validated against the project scope
+- If `scope_check = true`, standalone execution is refused; the embedding runtime must enforce project scope
 
 ```toml
 [args.target_url]

@@ -1,5 +1,7 @@
 # Manifest Format
 
+For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
+
 Complete reference for the `.clad.toml` manifest format. Every section is annotated with field types, defaults, and examples.
 
 ---

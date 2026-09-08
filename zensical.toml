@@ -16,6 +16,7 @@ nav = [
   {"Browser Mode" = "browser-mode.md"},
   {"Output & Evidence" = "output-evidence.md"},
   {"Security Model" = "security-model.md"},
+  {"Reference Execution" = "reference-execution.md"},
   {"Symbiont Integration" = "symbiont-integration.md"},
   {"LLM Integration" = "llm-integration.md"},
   {"CLI Reference" = "cli-reference.md"},

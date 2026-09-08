@@ -52,7 +52,8 @@ def _validate_integer(arg_def: ArgDef, value: str) -> str:
         lo = arg_def.min if arg_def.min is not None else num
         hi = arg_def.max if arg_def.max is not None else num
         if arg_def.clamp:
-            num = max(lo, min(hi, num))
+            num = min(hi, num) if arg_def.max is not None else num
+            num = max(arg_def.min, num) if arg_def.min is not None else num
         else:
             if num < lo:
                 raise ValidationError(f"Value {num} is below minimum {lo}")
@@ -83,7 +84,8 @@ def _validate_number(arg_def: ArgDef, value: str) -> str:
         bound_lo = lo if lo is not None else num
         bound_hi = hi if hi is not None else num
         if arg_def.clamp:
-            num = max(bound_lo, min(bound_hi, num))
+            num = min(hi, num) if hi is not None else num
+            num = max(lo, num) if lo is not None else num
         else:
             if num < bound_lo:
                 raise ValidationError(f"Value {num} is below minimum {bound_lo}")

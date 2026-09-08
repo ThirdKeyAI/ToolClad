@@ -2,7 +2,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
-	"github.com/thirdkeyai/toolclad/pkg/validator"
 )
 
 // EvidenceEnvelope wraps tool execution results in a standard envelope.
@@ -39,25 +38,14 @@ type EvidenceEnvelope struct {
 // resolveVars validates arguments and resolves all template variables (args,
 // defaults, mappings) into a single interpolation context.
 func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]string, error) {
-	cleaned := make(map[string]string)
-	for name, argDef := range m.Args {
-		val, provided := args[name]
-		if !provided {
-			if argDef.Required {
-				return nil, fmt.Errorf("missing required argument: %q", name)
-			}
-			if argDef.Default != nil {
-				val = fmt.Sprintf("%v", argDef.Default)
-			} else {
-				val = ""
-			}
+	cleaned, err := ValidateArguments(m, args)
+	if err != nil {
+		return nil, err
+	}
+	for name := range m.Args {
+		if _, ok := cleaned[name]; !ok {
+			cleaned[name] = ""
 		}
-
-		validated, err := validator.ValidateArg(argDef, val)
-		if err != nil {
-			return nil, fmt.Errorf("argument %q: %w", name, err)
-		}
-		cleaned[name] = validated
 	}
 
 	for k, v := range m.Command.Defaults {
@@ -66,21 +54,18 @@ func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]strin
 		}
 	}
 
-	for argName, mapping := range m.Command.Mappings {
-		val, ok := cleaned[argName]
-		if !ok {
-			continue
-		}
-		mapped, ok := mapping[val]
-		if ok {
-			cleaned["_"+argName+"_flags"] = mapped
-			if strings.HasSuffix(argName, "_type") {
-				prefix := strings.TrimSuffix(argName, "_type")
-				cleaned["_"+prefix+"_flags"] = mapped
-			}
-		}
+	for name, fragment := range commandFragments(m, cleaned) {
+		cleaned[name] = interpolateString(fragment, cleaned)
 	}
 
+	scanID := newScanID()
+	evidenceDir := os.Getenv("TOOLCLAD_EVIDENCE_DIR")
+	if evidenceDir == "" {
+		evidenceDir = filepath.Join(os.TempDir(), "toolclad-evidence")
+	}
+	cleaned["_scan_id"] = scanID
+	cleaned["_evidence_dir"] = evidenceDir
+	cleaned["_output_file"] = filepath.Join(evidenceDir, scanID+"-output")
 	return cleaned, nil
 }
 
@@ -114,62 +99,44 @@ func BuildCommandArgv(m *manifest.Manifest, args map[string]string) ([]string, e
 // It returns the fully constructed command string ready for execution.
 // For new manifests, prefer BuildCommandArgv with the exec array format.
 func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) {
-	if m.Command.Executor != "" {
-		return m.Command.Executor, nil
-	}
-
-	if m.Command.Template == "" {
-		return "", fmt.Errorf("manifest %q has no command template or executor", m.Tool.Name)
-	}
-
 	cleaned, err := resolveVars(m, args)
 	if err != nil {
 		return "", err
 	}
-
-	// SECURITY: This evaluator uses a closed-vocabulary parser.
-	// Never use eval() or equivalent dynamic code execution for conditions.
-
-	result := m.Command.Template
-	for k, v := range cleaned {
-		result = strings.ReplaceAll(result, "{"+k+"}", v)
-	}
-
-	return result, nil
+	argv, err := preparedArgv(m, cleaned)
+	return displayArgv(argv), err
 }
 
-// shellSplit splits a command string into arguments, respecting single and
-// double quotes. This replaces strings.Fields() which breaks on quoted args.
-func shellSplit(cmd string) []string {
-	var args []string
-	var current strings.Builder
-	inSingle := false
-	inDouble := false
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
-		switch {
-		case c == '\'' && !inDouble:
-			inSingle = !inSingle
-		case c == '"' && !inSingle:
-			inDouble = !inDouble
-		case c == ' ' && !inSingle && !inDouble:
-			if current.Len() > 0 {
-				args = append(args, current.String())
-				current.Reset()
-			}
-		default:
-			current.WriteByte(c)
+func preparedArgv(m *manifest.Manifest, vars map[string]string) ([]string, error) {
+	if m.Command.Executor != "" {
+		return []string{m.Command.Executor}, nil
+	}
+	if len(m.Command.Exec) > 0 {
+		argv := make([]string, len(m.Command.Exec))
+		for i, v := range m.Command.Exec {
+			argv[i] = interpolateString(v, vars)
 		}
+		if argv[0] == "" {
+			return nil, fmt.Errorf("empty executable")
+		}
+		return argv, nil
 	}
-	if current.Len() > 0 {
-		args = append(args, current.String())
-	}
-	return args
+	return templateArgv(m.Command.Template, vars, commandFragments(m, vars))
 }
+
+func shellSplit(command string) []string { argv, _ := splitTemplate(command); return argv }
 
 // Execute validates arguments, builds the command, executes it with a timeout,
 // captures output, and returns an EvidenceEnvelope.
 func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	clean, err := ValidateArguments(m, args)
+	if err != nil {
+		return nil, err
+	}
+	args = clean
+	if err = checkExecution(m, false); err != nil {
+		return nil, err
+	}
 	// Route to HTTP backend
 	if m.Http != nil {
 		return ExecuteHTTP(m, args)
@@ -187,80 +154,43 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	}
 
 	start := time.Now()
-	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
-
-	cmdStr, err := BuildCommand(m, args)
+	vars, err := resolveVars(m, args)
 	if err != nil {
-		return &EvidenceEnvelope{
-			Status:    "error",
-			ScanID:    scanID,
-			Tool:      m.Tool.Name,
-			Timestamp: start.UTC().Format(time.RFC3339),
-			Error:     err.Error(),
-		}, err
+		return nil, err
 	}
-
-	timeout := time.Duration(m.Tool.TimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	scanID := vars["_scan_id"]
+	cmdArgs, err := preparedArgv(m, vars)
+	if err != nil {
+		return nil, err
+	}
+	cmdStr := displayArgv(cmdArgs)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.Tool.TimeoutSeconds)*time.Second)
 	defer cancel()
-
-	// Prefer exec array (shell-free) over template string (requires splitting).
-	var cmdArgs []string
-	if len(m.Command.Exec) > 0 {
-		argv, err := BuildCommandArgv(m, args)
-		if err != nil {
-			return &EvidenceEnvelope{
-				Status:    "error",
-				ScanID:    scanID,
-				Tool:      m.Tool.Name,
-				Timestamp: start.UTC().Format(time.RFC3339),
-				ExitCode:  -1,
-				Error:     err.Error(),
-			}, err
-		}
-		cmdArgs = argv
-		cmdStr = strings.Join(argv, " ")
-	} else {
-		// Legacy: split template string using quote-aware splitter.
-		cmdArgs = shellSplit(cmdStr)
-	}
-	if len(cmdArgs) == 0 {
-		return &EvidenceEnvelope{
-			Status:    "error",
-			ScanID:    scanID,
-			Tool:      m.Tool.Name,
-			Timestamp: start.UTC().Format(time.RFC3339),
-			ExitCode:  -1,
-			Error:     "empty command after splitting",
-		}, fmt.Errorf("empty command after splitting")
-	}
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 
 	// Set process group so we can kill the entire group on timeout.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = childEnvironment()
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 200 * time.Millisecond
 
 	// If using a custom executor, pass validated args as env vars.
 	if m.Command.Executor != "" {
-		for name, argDef := range m.Args {
-			val, provided := args[name]
-			if !provided {
-				if argDef.Default != nil {
-					val = fmt.Sprintf("%v", argDef.Default)
-				} else {
-					val = ""
-				}
-			}
-			validated, vErr := validator.ValidateArg(argDef, val)
-			if vErr != nil {
-				return nil, fmt.Errorf("argument %q: %w", name, vErr)
-			}
-			envKey := "TOOLCLAD_ARG_" + strings.ToUpper(name)
-			cmd.Env = append(cmd.Env, envKey+"="+validated)
+		for name, value := range args {
+			cmd.Env = append(cmd.Env, "TOOLCLAD_ARG_"+strings.ToUpper(name)+"="+value)
 		}
+
 		cmd.Env = append(cmd.Env, "TOOLCLAD_SCAN_ID="+scanID)
 	}
 
-	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutBuf := cappedBuffer{stop: cmd.Cancel}
+	stderrBuf := cappedBuffer{stop: cmd.Cancel}
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
@@ -268,7 +198,7 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	duration := time.Since(start)
 
 	// On context deadline exceeded, kill the entire process group.
-	if ctx.Err() != nil && cmd.Process != nil {
+	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
@@ -605,11 +535,12 @@ func injectTemplateVars(template string) (string, error) {
 
 // interpolateString replaces {key} placeholders with values from the context map.
 func interpolateString(template string, ctx map[string]string) string {
-	result := template
-	for k, v := range ctx {
-		result = strings.ReplaceAll(result, "{"+k+"}", v)
-	}
-	return result
+	return tokenPattern.ReplaceAllStringFunc(template, func(token string) string {
+		if value, ok := ctx[token[1:len(token)-1]]; ok {
+			return value
+		}
+		return token
+	})
 }
 
 // ExecuteHTTP performs an HTTP request based on the manifest's [http] section.
@@ -621,57 +552,41 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
 
-	// Validate args
-	cleaned := make(map[string]string)
-	for name, argDef := range m.Args {
-		val, provided := args[name]
-		if !provided {
-			if argDef.Required {
-				return nil, fmt.Errorf("missing required argument: %q", name)
-			}
-			if argDef.Default != nil {
-				val = fmt.Sprintf("%v", argDef.Default)
-			} else {
-				continue
-			}
-		}
-		validated, err := validator.ValidateArg(argDef, val)
-		if err != nil {
-			return nil, fmt.Errorf("argument %q: %w", name, err)
-		}
-		cleaned[name] = validated
-	}
-
-	// Interpolate URL
-	url := interpolateString(m.Http.URL, cleaned)
-	url, err := injectTemplateVars(url)
+	cleaned, err := ValidateArguments(m, args)
 	if err != nil {
 		return nil, err
 	}
-
-	// Interpolate headers
-	headers := make(map[string]string)
-	for k, v := range m.Http.Headers {
-		hv := interpolateString(v, cleaned)
-		hv, err := injectTemplateVars(hv)
+	if err = checkExecution(m, false); err != nil {
+		return nil, err
+	}
+	url, err := httpURL(m.Http.URL, cleaned)
+	if err != nil {
+		return nil, err
+	}
+	headers := map[string]string{}
+	requestSize := len(url)
+	for key, template := range m.Http.Headers {
+		value, err := httpTemplate(template, cleaned, false, false)
 		if err != nil {
 			return nil, err
 		}
-		headers[k] = hv
+		headers[key] = value
+		requestSize += len(key) + len(value)
 	}
-
-	// Interpolate body
 	method := strings.ToUpper(m.Http.Method)
 	if method == "" {
 		method = "GET"
 	}
+	body, err := httpTemplate(m.Http.BodyTemplate, cleaned, false, true)
+	if err != nil {
+		return nil, err
+	}
+	requestSize += len(body)
+	if requestSize > maxRequestBytes {
+		return nil, fmt.Errorf("HTTP request exceeds 1 MiB")
+	}
 	var bodyReader io.Reader
-	if m.Http.BodyTemplate != "" && method != "GET" && method != "HEAD" {
-		body := interpolateString(m.Http.BodyTemplate, cleaned)
-		body, err = injectTemplateVars(body)
-		if err != nil {
-			return nil, err
-		}
+	if body != "" {
 		bodyReader = strings.NewReader(body)
 	}
 
@@ -687,7 +602,9 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	if timeout == 0 {
 		timeout = 60 * time.Second
 	}
-	client := &http.Client{Timeout: timeout}
+	transport := &http.Transport{Proxy: nil, TLSHandshakeTimeout: timeout, ResponseHeaderTimeout: timeout}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -701,26 +618,32 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
+	if len(respBody) > maxResponseBytes {
+		return nil, fmt.Errorf("HTTP response exceeds 4 MiB")
+	}
 	duration := time.Since(start)
 	hash := sha256.Sum256(respBody)
 
-	successStatus := m.Http.SuccessStatus
-	if len(successStatus) == 0 {
-		successStatus = []int{200, 201, 202, 204}
-	}
-	isSuccess := false
-	for _, s := range successStatus {
-		if resp.StatusCode == s {
-			isSuccess = true
-			break
+	isSuccess := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if len(m.Http.SuccessStatus) > 0 {
+		isSuccess = false
+		for _, code := range m.Http.SuccessStatus {
+			if code == resp.StatusCode {
+				isSuccess = true
+			}
 		}
 	}
 
+	for _, status := range m.Http.ErrorStatus {
+		if status == resp.StatusCode {
+			isSuccess = false
+		}
+	}
 	envelope := &EvidenceEnvelope{
 		ScanID:     scanID,
 		Tool:       m.Tool.Name,
@@ -756,25 +679,9 @@ func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
 
-	// Validate args
-	cleaned := make(map[string]string)
-	for name, argDef := range m.Args {
-		val, provided := args[name]
-		if !provided {
-			if argDef.Required {
-				return nil, fmt.Errorf("missing required argument: %q", name)
-			}
-			if argDef.Default != nil {
-				val = fmt.Sprintf("%v", argDef.Default)
-			} else {
-				continue
-			}
-		}
-		validated, err := validator.ValidateArg(argDef, val)
-		if err != nil {
-			return nil, fmt.Errorf("argument %q: %w", name, err)
-		}
-		cleaned[name] = validated
+	cleaned, err := ValidateArguments(m, args)
+	if err != nil {
+		return nil, err
 	}
 
 	// Apply field_map
@@ -833,8 +740,9 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 	}
 
 	inputSchema := map[string]any{
-		"type":       "object",
-		"properties": properties,
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": false,
 	}
 	if len(required) > 0 {
 		inputSchema["required"] = required

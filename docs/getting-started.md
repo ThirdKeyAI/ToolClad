@@ -1,5 +1,7 @@
 # Getting Started
 
+For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
+
 Create, validate, and run your first ToolClad manifest in under 5 minutes.
 
 ## Install

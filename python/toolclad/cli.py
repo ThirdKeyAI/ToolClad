@@ -29,7 +29,10 @@ def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
                 f"Expected key=value format, got: {pair!r}"
             )
         key, _, value = pair.partition("=")
-        result[key.strip()] = value
+        key = key.strip()
+        if not key or key in result:
+            raise click.BadParameter("Argument names must be nonempty and unique")
+        result[key] = value
     return result
 
 
@@ -79,11 +82,13 @@ def run(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
         manifest = load_manifest(manifest_path)
         args = _parse_args(arg_pairs)
         envelope = execute(manifest, args)
-    except (ValueError, FileNotFoundError, ValidationError) as e:
+    except (ValueError, FileNotFoundError, ValidationError, RuntimeError) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 
     click.echo(json.dumps(envelope, indent=2))
+    if envelope["status"] != "success":
+        sys.exit(1)
 
 
 def _mcp_type_and_constraints(arg) -> Tuple[str, dict]:
@@ -143,6 +148,7 @@ def schema(manifest_path: str) -> None:
 
     input_schema = {
         "type": "object",
+        "additionalProperties": False,
         "properties": properties,
         "required": required,
     }
@@ -191,27 +197,9 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
         manifest = load_manifest(manifest_path)
         args = _parse_args(arg_pairs)
 
-        # Validate each arg individually for nice reporting.
-        from toolclad.validator import validate_arg
-
+        envelope = execute(manifest, args, dry_run=True)
         click.echo(f"  Manifest:  {manifest.source_path}")
-        click.echo(f"  Arguments:")
-        for arg_name, arg_def in manifest.args.items():
-            if arg_name in args:
-                try:
-                    cleaned = validate_arg(arg_def, args[arg_name])
-                    click.echo(f"    {arg_name}={cleaned} ({arg_def.type}: OK)")
-                except ValidationError as ve:
-                    click.echo(f"    {arg_name}={args[arg_name]} ({arg_def.type}: FAIL - {ve})")
-                    sys.exit(1)
-            elif arg_def.default is not None:
-                click.echo(f"    {arg_name}={arg_def.default} (default)")
-            elif arg_def.required:
-                click.echo(f"    {arg_name}=??? (MISSING - required)")
-                sys.exit(1)
-
-        command = build_command(manifest, args)
-        click.echo(f"  Command:   {command}")
+        click.echo(f"  Command:   {envelope['command']}")
         if manifest.tool.cedar.resource:
             click.echo(
                 f"  Cedar:     {manifest.tool.cedar.resource} / "
@@ -221,7 +209,7 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
         click.echo()
         click.echo("  [dry run -- command not executed]")
 
-    except (ValueError, FileNotFoundError, ValidationError) as e:
+    except (ValueError, FileNotFoundError, ValidationError, RuntimeError) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 

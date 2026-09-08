@@ -5,6 +5,8 @@ description: ToolClad and Symbiont CLI command reference
 
 # CLI Reference
 
+For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
+
 ToolClad provides a standalone CLI for working with manifests outside of Symbiont. The Symbiont runtime extends this with additional subcommands under `symbi tools`.
 
 ## ToolClad CLI

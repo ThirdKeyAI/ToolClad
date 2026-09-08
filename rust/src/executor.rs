@@ -1,28 +1,17 @@
+use crate::contracts::{
+    check_execution, child_environment, http_template, http_url, validate_arguments,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+};
 use crate::types::{EvidenceEnvelope, Manifest, ToolCladError};
-use crate::validator::validate_arg;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-
-/// Replace `{_secret:name}` with `TOOLCLAD_SECRET_{NAME}` env var.
-fn inject_template_vars(template: &str) -> Result<String, ToolCladError> {
-    let re = Regex::new(r"\{_secret:([a-zA-Z0-9_]+)\}").unwrap();
-    let mut result = template.to_string();
-    for cap in re.captures_iter(template) {
-        let name = &cap[1];
-        let env_key = format!("TOOLCLAD_SECRET_{}", name.to_uppercase());
-        let val = std::env::var(&env_key).map_err(|_| {
-            ToolCladError::ExecutionError(format!("Secret '{}' not found (set {})", name, env_key))
-        })?;
-        result = result.replace(&cap[0], &val);
-    }
-    Ok(result)
-}
 
 /// Execute an HTTP backend tool, returning an evidence envelope.
 fn execute_http(
@@ -38,42 +27,36 @@ fn execute_http(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
 
-    // Interpolate URL with args and secrets.
-    let mut url = http.url.clone();
-    for (k, v) in validated {
-        url = url.replace(&format!("{{{k}}}"), v);
+    let url = http_url(&http.url, validated)?;
+    let mut headers = Vec::new();
+    for (key, template) in &http.headers {
+        headers.push((
+            key.clone(),
+            http_template(template, validated, false, false)?,
+        ));
     }
-    url = inject_template_vars(&url)?;
-
-    // Build headers with interpolation.
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for (hk, hv) in &http.headers {
-        let mut val = hv.clone();
-        for (k, v) in validated {
-            val = val.replace(&format!("{{{k}}}"), v);
-        }
-        val = inject_template_vars(&val)?;
-        headers.push((hk.clone(), val));
+    let body = http
+        .body_template
+        .as_ref()
+        .map(|template| http_template(template, validated, false, true))
+        .transpose()?;
+    if url.len()
+        + body.as_ref().map_or(0, String::len)
+        + headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+        > MAX_REQUEST_BYTES
+    {
+        return Err(ToolCladError::ExecutionError(
+            "HTTP request exceeds 1 MiB".into(),
+        ));
     }
-
-    // Build body from template if present, with JSON-safe escaping.
-    let body = if let Some(ref body_tmpl) = http.body_template {
-        let mut b = body_tmpl.clone();
-        for (k, v) in validated {
-            // JSON-escape the value to prevent injection into JSON body.
-            let escaped = serde_json::to_string(v)
-                .unwrap_or_else(|_| format!("\"{}\"", v))
-                .trim_matches('"')
-                .to_string();
-            b = b.replace(&format!("{{{k}}}"), &escaped);
-        }
-        Some(inject_template_vars(&b)?)
-    } else {
-        None
-    };
 
     // Execute the HTTP request with timeout.
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(
             manifest.tool.timeout_seconds,
         ))
@@ -106,17 +89,24 @@ fn execute_http(
         .map_err(|e| ToolCladError::ExecutionError(format!("HTTP request failed: {e}")))?;
 
     let status_code = resp.status().as_u16();
-    let resp_body = resp
-        .text()
+    let mut response_bytes = Vec::new();
+    resp.take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response_bytes)
         .map_err(|e| ToolCladError::ExecutionError(format!("failed to read response: {e}")))?;
+    if response_bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(ToolCladError::ExecutionError(
+            "HTTP response exceeds 4 MiB".into(),
+        ));
+    }
+    let resp_body = String::from_utf8_lossy(&response_bytes).into_owned();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Determine success/error based on configured status codes.
-    let is_success = if !http.success_status.is_empty() {
+    let is_success = if http.error_status.contains(&status_code) {
+        false
+    } else if !http.success_status.is_empty() {
         http.success_status.contains(&status_code)
-    } else if !http.error_status.is_empty() {
-        !http.error_status.contains(&status_code)
     } else {
         (200..300).contains(&status_code)
     };
@@ -221,7 +211,7 @@ pub fn build_command_argv(
         .map(|element| interpolate_template(element, &vars))
         .collect();
 
-    if argv.is_empty() {
+    if argv.is_empty() || argv[0].is_empty() {
         return Err(ToolCladError::CommandError(
             "exec array produced empty argv".to_string(),
         ));
@@ -241,26 +231,100 @@ pub fn build_command(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<String, ToolCladError> {
+    let vars = resolve_vars(manifest, args)?;
+    let argv = if manifest.command.exec.is_some() {
+        build_command_argv(manifest, args)?
+    } else {
+        template_argv(manifest, &vars)?
+    };
+    Ok(display_argv(&argv))
+}
+
+fn display_argv(argv: &[String]) -> String {
+    let safe = Regex::new(r"^[A-Za-z0-9_@%+=:,./-]+$").unwrap();
+    argv.iter()
+        .map(|v| {
+            if safe.is_match(v) {
+                v.clone()
+            } else {
+                format!("'{}'", v.replace('\'', "'\"'\"'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_fragments(
+    manifest: &Manifest,
+    vars: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut fragments = HashMap::new();
+    if let Some(mappings) = &manifest.command.mappings {
+        for (name, table) in mappings {
+            let value = vars
+                .get(name)
+                .and_then(|v| table.get(v))
+                .cloned()
+                .unwrap_or_default();
+            fragments.insert(format!("_{name}_flags"), value.clone());
+            fragments.insert(format!("_{name}"), value.clone());
+            if let Some(prefix) = name.strip_suffix("_type") {
+                fragments.insert(format!("_{prefix}_flags"), value);
+            }
+        }
+    }
+    if let Some(conditionals) = &manifest.command.conditionals {
+        for (name, cond) in conditionals {
+            fragments.insert(
+                format!("_{name}"),
+                if evaluate_condition(&cond.when, vars) {
+                    cond.template.clone()
+                } else {
+                    String::new()
+                },
+            );
+        }
+    }
+    fragments
+}
+
+fn template_argv(
+    manifest: &Manifest,
+    vars: &HashMap<String, String>,
+) -> Result<Vec<String>, ToolCladError> {
     let template = manifest
         .command
         .template
         .as_ref()
-        .ok_or_else(|| {
-            ToolCladError::CommandError(
-                "no command template (use executor for custom wrappers)".to_string(),
-            )
-        })?
-        .clone();
-
-    let vars = resolve_vars(manifest, args)?;
-
-    // Perform final template interpolation.
-    let result = interpolate_template(&template, &vars);
-
-    // Clean up multiple spaces from empty interpolations.
-    let cleaned = result.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    Ok(cleaned)
+        .ok_or_else(|| ToolCladError::CommandError("no command template".into()))?;
+    let fragments = command_fragments(manifest, vars);
+    let split = |s: &str| {
+        shlex::split(s)
+            .ok_or_else(|| ToolCladError::CommandError("unclosed command quote or escape".into()))
+    };
+    let mut argv = Vec::new();
+    for token in split(template)? {
+        if let Some(fragment) = token
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .and_then(|key| fragments.get(key))
+        {
+            for part in split(fragment)? {
+                argv.push(interpolate_template(&part, vars));
+            }
+        } else {
+            let value = interpolate_template(&token, vars);
+            if !value.is_empty() || token.is_empty() {
+                argv.push(value);
+            }
+        }
+    }
+    if argv.is_empty() || argv[0].is_empty() {
+        return Err(ToolCladError::CommandError(
+            "command produced empty argv".into(),
+        ));
+    }
+    Ok(argv)
 }
 
 /// Resolve all template variables: args, defaults, mappings, conditionals, executor vars.
@@ -268,43 +332,16 @@ fn resolve_vars(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, ToolCladError> {
-    // Start with provided args.
-    let mut vars: HashMap<String, String> = args.clone();
-
-    // Inject defaults for missing args.
-    if let Some(ref defaults) = manifest.command.defaults {
-        for (key, val) in defaults {
+    let mut vars = validate_arguments(manifest, args)?;
+    for name in manifest.args.keys() {
+        vars.entry(name.clone()).or_default();
+    }
+    if let Some(defaults) = &manifest.command.defaults {
+        for (key, value) in defaults {
             vars.entry(key.clone())
-                .or_insert_with(|| toml_value_to_string(val));
+                .or_insert_with(|| toml_value_to_string(value));
         }
     }
-
-    // Inject defaults from arg definitions for missing args.
-    for (key, def) in &manifest.args {
-        if !vars.contains_key(key) {
-            if let Some(ref default_val) = def.default {
-                vars.insert(key.clone(), toml_value_to_string(default_val));
-            }
-        }
-    }
-
-    // Resolve mappings: for each mapping `[command.mappings.<arg_name>]`, look up
-    // the arg value and produce a `_{arg_name}_flags` variable.
-    if let Some(ref mappings) = manifest.command.mappings {
-        for (arg_name, mapping) in mappings {
-            if let Some(arg_val) = vars.get(arg_name) {
-                if let Some(mapped) = mapping.get(arg_val) {
-                    // Convention: the mapped variable is `_<arg_name>_flags`
-                    // but manifests may reference it as `_{arg_name}_flags` or
-                    // `_scan_flags` etc. We insert both forms.
-                    vars.insert(format!("_{arg_name}_flags"), mapped.clone());
-                    // Also insert the shorter form in case the template uses it.
-                    vars.insert(format!("_{arg_name}"), mapped.clone());
-                }
-            }
-        }
-    }
-
     // Auto-generate executor-injected variables.
     let scan_id = format!(
         "{}-{}",
@@ -323,17 +360,10 @@ fn resolve_vars(
     let output_file = format!("{evidence_dir}/{scan_id}-output");
     vars.insert("_output_file".to_string(), output_file);
 
-    // Resolve conditionals.
-    if let Some(ref conditionals) = manifest.command.conditionals {
-        for (cond_name, cond_def) in conditionals {
-            let include = evaluate_condition(&cond_def.when, &vars);
-            if include {
-                let fragment = interpolate_template(&cond_def.template, &vars);
-                vars.insert(format!("_{cond_name}"), fragment);
-            } else {
-                vars.insert(format!("_{cond_name}"), String::new());
-            }
-        }
+    let fragments = command_fragments(manifest, &vars);
+    for (key, value) in fragments {
+        let fragment = interpolate_template(&value, &vars);
+        vars.insert(key, fragment);
     }
 
     Ok(vars)
@@ -341,11 +371,7 @@ fn resolve_vars(
 
 /// Interpolate `{placeholder}` references in a template string.
 fn interpolate_template(template: &str, vars: &HashMap<String, String>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in vars {
-        result = result.replace(&format!("{{{key}}}"), value);
-    }
-    result
+    crate::contracts::interpolate(template, vars)
 }
 
 /// Evaluate a simple condition expression against variables.
@@ -674,24 +700,8 @@ pub fn execute(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<EvidenceEnvelope, ToolCladError> {
-    // Phase 1: Validate all arguments.
-    let mut validated = HashMap::new();
-    for (name, def) in &manifest.args {
-        if let Some(val) = args.get(name) {
-            let clean = validate_arg(name, def, val)?;
-            validated.insert(name.clone(), clean);
-        } else if def.required {
-            if let Some(ref default_val) = def.default {
-                validated.insert(name.clone(), toml_value_to_string(default_val));
-            } else {
-                return Err(ToolCladError::ValidationError(format!(
-                    "missing required argument '{name}'"
-                )));
-            }
-        } else if let Some(ref default_val) = def.default {
-            validated.insert(name.clone(), toml_value_to_string(default_val));
-        }
-    }
+    let validated = validate_arguments(manifest, args)?;
+    check_execution(manifest, false)?;
 
     // Route to HTTP or MCP backend if configured.
     if manifest.http.is_some() {
@@ -711,11 +721,8 @@ pub fn execute(
         ));
     }
 
-    let scan_id = format!(
-        "{}-{}",
-        chrono::Utc::now().timestamp(),
-        &uuid::Uuid::new_v4().to_string()[..5]
-    );
+    let vars = resolve_vars(manifest, &validated)?;
+    let scan_id = vars["_scan_id"].clone();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
 
@@ -725,6 +732,7 @@ pub fn execute(
             // Escape hatch: run custom executor with env vars.
             // SECURITY: Args are passed as env vars, not interpolated into shell command.
             let mut cmd = Command::new(executor_path);
+            child_environment(&mut cmd);
             for (k, v) in &validated {
                 cmd.env(format!("TOOLCLAD_ARG_{}", k.to_uppercase()), v);
             }
@@ -733,30 +741,27 @@ pub fn execute(
 
             let cmd_display = format!("{executor_path} (custom executor)");
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
-        } else if manifest.command.exec.is_some() {
+        } else if let Some(exec) = &manifest.command.exec {
             // PREFERRED: Array-based command construction maps directly to execve.
             // No string→split round-trip; values with spaces are safe.
-            let argv = build_command_argv(manifest, &validated)?;
+            let argv: Vec<String> = exec
+                .iter()
+                .map(|v| interpolate_template(v, &vars))
+                .collect();
+            if argv.is_empty() || argv[0].is_empty() {
+                return Err(ToolCladError::CommandError("empty exec array".into()));
+            }
             let cmd_display = argv.join(" ");
             let mut cmd = Command::new(&argv[0]);
+            child_environment(&mut cmd);
             cmd.args(&argv[1..]);
 
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
         } else {
-            // LEGACY: String template → shlex split → execve.
-            // Use `exec` for new manifests to avoid quote/space edge cases.
-            let cmd_string = build_command(manifest, &validated)?;
-            let argv = shlex::split(&cmd_string).ok_or_else(|| {
-                ToolCladError::CommandError(
-                    "failed to parse command string (mismatched quotes)".to_string(),
-                )
-            })?;
-            if argv.is_empty() {
-                return Err(ToolCladError::CommandError(
-                    "command template produced empty command".to_string(),
-                ));
-            }
+            let argv = template_argv(manifest, &vars)?;
+            let cmd_string = display_argv(&argv);
             let mut cmd = Command::new(&argv[0]);
+            child_environment(&mut cmd);
             cmd.args(&argv[1..]);
 
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_string)?
@@ -811,97 +816,119 @@ fn run_command_with_timeout(
     timeout_seconds: u64,
     cmd_display: &str,
 ) -> Result<(String, String, String, i32, String), ToolCladError> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    // SECURITY: Create a new process group so we can kill all children on timeout.
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| ToolCladError::ExecutionError(format!("failed to spawn process: {e}")))?;
-
-    if timeout_seconds > 0 {
-        let pid = child.id();
-
-        // Take stdout/stderr handles before polling to avoid deadlock.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-
-        // Read stdout/stderr in separate threads to avoid pipe buffer deadlock.
-        let stdout_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(mut pipe) = stdout_pipe {
-                use std::io::Read;
-                let _ = pipe.read_to_string(&mut buf);
-            }
-            buf
-        });
-        let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(mut pipe) = stderr_pipe {
-                use std::io::Read;
-                let _ = pipe.read_to_string(&mut buf);
-            }
-            buf
-        });
-
-        // Poll child with timeout.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        // Timeout! Kill the entire process group.
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGKILL);
-                        }
-                        #[cfg(not(unix))]
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(ToolCladError::ExecutionError(format!(
-                            "process timed out after {timeout_seconds}s"
-                        )));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => return Err(ToolCladError::ExecutionError(format!("wait error: {e}"))),
-            }
-        };
-
-        let stdout = stdout_handle.join().unwrap_or_default();
-        let stderr = stderr_handle.join().unwrap_or_default();
-        let exit_code = status.code().unwrap_or(-1);
-        let status_str = if status.success() {
-            "success".to_string()
-        } else {
-            format!("error (exit code: {exit_code}): {stderr}")
-        };
-        Ok((
-            cmd_display.to_string(),
-            stdout,
-            stderr,
-            exit_code,
-            status_str,
+    #[cfg(not(unix))]
+    {
+        let _ = (&mut cmd, timeout_seconds, cmd_display);
+        Err(ToolCladError::ExecutionError(
+            "reference command supervision requires Unix".into(),
         ))
-    } else {
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ToolCladError::ExecutionError(format!("process error: {e}")))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolCladError::ExecutionError(format!("failed to spawn process: {e}")))?;
+        let pid = child.id() as i32;
+        let result = (|| {
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+                // Nonblocking pipes keep descendants that retain an output fd from hanging the supervisor.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+                {
+                    return Err(ToolCladError::ExecutionError(
+                        "failed to configure output pipe".into(),
+                    ));
+                }
+            }
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut out_done = false;
+            let mut err_done = false;
+            let mut status = None;
+            let deadline = Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(ToolCladError::ExecutionError(format!(
+                        "process timed out after {timeout_seconds}s"
+                    )));
+                }
+                if status.is_none() {
+                    status = child
+                        .try_wait()
+                        .map_err(|e| ToolCladError::ExecutionError(format!("wait error: {e}")))?;
+                    if status.is_some() {
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+                if !out_done {
+                    out_done = read_available(&mut stdout, &mut out)?;
+                }
+                if !err_done {
+                    err_done = read_available(&mut stderr, &mut err)?;
+                }
+                if let Some(status) = status {
+                    if out_done && err_done {
+                        let exit_code = status.code().unwrap_or(-1);
+                        return Ok((
+                            cmd_display.to_string(),
+                            String::from_utf8_lossy(&out).into_owned(),
+                            String::from_utf8_lossy(&err).into_owned(),
+                            exit_code,
+                            if status.success() {
+                                "success".into()
+                            } else {
+                                "error".into()
+                            },
+                        ));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })();
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        result
+    }
+}
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        let status = if output.status.success() {
-            "success".to_string()
-        } else {
-            format!("error (exit code: {exit_code}): {stderr}")
-        };
-
-        Ok((cmd_display.to_string(), stdout, stderr, exit_code, status))
+#[cfg(unix)]
+fn read_available(pipe: &mut impl Read, buffer: &mut Vec<u8>) -> Result<bool, ToolCladError> {
+    // Bound work per poll as well as stored output so a busy stream cannot starve the deadline.
+    let mut chunk = [0u8; 65536];
+    match pipe.read(&mut chunk) {
+        Ok(0) => Ok(true),
+        Ok(count) => {
+            if buffer.len() + count > MAX_RESPONSE_BYTES {
+                return Err(ToolCladError::ExecutionError(
+                    "process output exceeds 4 MiB per stream".into(),
+                ));
+            }
+            buffer.extend_from_slice(&chunk[..count]);
+            Ok(false)
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(ToolCladError::ExecutionError(format!(
+            "failed to read process output: {e}"
+        ))),
     }
 }
 
@@ -910,40 +937,27 @@ pub fn dry_run(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<DryRunResult, ToolCladError> {
-    // Validate all arguments.
-    let mut validated = HashMap::new();
-    let mut validations = Vec::new();
+    let validated = validate_arguments(manifest, args)?;
+    check_execution(manifest, true)?;
+    let validations = validated
+        .iter()
+        .map(|(name, value)| format!("{name}={value} (validated)"))
+        .collect();
 
-    for (name, def) in &manifest.args {
-        if let Some(val) = args.get(name) {
-            match validate_arg(name, def, val) {
-                Ok(clean) => {
-                    validations.push(format!("{name}={clean} ({}: OK)", def.type_name));
-                    validated.insert(name.clone(), clean);
-                }
-                Err(e) => {
-                    validations.push(format!("{name}={val} ({}: FAIL: {e})", def.type_name));
-                    return Err(e);
-                }
-            }
-        } else if def.required {
-            if let Some(ref default_val) = def.default {
-                let dv = toml_value_to_string(default_val);
-                validated.insert(name.clone(), dv.clone());
-                validations.push(format!("{name}={dv} (default)"));
-            } else {
-                return Err(ToolCladError::ValidationError(format!(
-                    "missing required argument '{name}'"
-                )));
-            }
-        } else if let Some(ref default_val) = def.default {
-            let dv = toml_value_to_string(default_val);
-            validated.insert(name.clone(), dv.clone());
-            validations.push(format!("{name}={dv} (default)"));
+    let command = if manifest.tool.dispatch == "callback" {
+        "callback (embedding runtime required)".into()
+    } else if let Some(http) = &manifest.http {
+        let url = http_url(&http.url, &validated)?;
+        for value in http.headers.values() {
+            http_template(value, &validated, true, false)?;
         }
-    }
-
-    let command = if let Some(ref exec) = manifest.command.executor {
+        if let Some(body) = &http.body_template {
+            http_template(body, &validated, true, true)?;
+        }
+        format!("{} {}", http.method, url)
+    } else if let Some(mcp) = &manifest.mcp {
+        format!("mcp://{}/{}", mcp.server, mcp.tool)
+    } else if let Some(ref exec) = manifest.command.executor {
         format!("{exec} (custom executor)")
     } else if manifest.command.exec.is_some() {
         build_command_argv(manifest, &validated)?.join(" ")
@@ -1112,7 +1126,8 @@ mod tests {
     #[test]
     fn test_inject_template_vars_with_env() {
         std::env::set_var("TOOLCLAD_SECRET_API_KEY", "test-key-123");
-        let result = inject_template_vars("Bearer {_secret:api_key}").unwrap();
+        let result =
+            http_template("Bearer {_secret:api_key}", &HashMap::new(), false, false).unwrap();
         assert_eq!(result, "Bearer test-key-123");
         std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
     }
@@ -1120,7 +1135,7 @@ mod tests {
     #[test]
     fn test_inject_template_vars_missing_secret() {
         std::env::remove_var("TOOLCLAD_SECRET_MISSING");
-        let result = inject_template_vars("token={_secret:missing}");
+        let result = http_template("token={_secret:missing}", &HashMap::new(), false, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("TOOLCLAD_SECRET_MISSING"));
@@ -1128,7 +1143,13 @@ mod tests {
 
     #[test]
     fn test_inject_template_vars_no_secrets() {
-        let result = inject_template_vars("plain text with {normal} placeholders").unwrap();
+        let result = http_template(
+            "plain text with {normal} placeholders",
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(result, "plain text with {normal} placeholders");
     }
 
@@ -1137,6 +1158,7 @@ mod tests {
         use crate::types::McpProxyDef;
 
         let mut m = minimal_manifest();
+        m.command = CommandDef::default();
         m.mcp = Some(McpProxyDef {
             server: "code-review-server".to_string(),
             tool: "analyze_pr".to_string(),

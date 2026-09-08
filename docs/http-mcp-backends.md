@@ -1,6 +1,6 @@
 # HTTP & MCP Backends
 
-ToolClad oneshot mode supports three backends: shell commands (`[command]`), HTTP requests (`[http]`), and MCP proxy calls (`[mcp]`). All three share the same governance layer: argument validation, Cedar policy evaluation, output schema validation, and evidence envelopes. The backend determines how the request is dispatched.
+ToolClad oneshot mode supports three backends: shell commands (`[command]`), HTTP requests (`[http]`), and MCP proxy calls (`[mcp]`). Reference backends validate arguments and return envelopes. Cedar, approvals, scope enforcement and upstream MCP dispatch require an embedding runtime. Standalone MCP calls produce previews. See [Reference Execution](reference-execution.md).
 
 ## HTTP Backend
 
@@ -63,7 +63,7 @@ description = "Message timestamp (Slack message ID)"
 | Field | Type | Description |
 |-------|------|-------------|
 | `method` | string | HTTP method: `GET`, `POST`, `PUT`, `PATCH`, `DELETE` |
-| `url` | string | URL template with `{arg}` and `{_secret:name}` placeholders |
+| `url` | string | Fixed http(s) origin; `{arg}` placeholders only in path/query; no URL credentials/secrets |
 | `headers` | table | Header key-value pairs, supports `{_secret:name}` |
 | `body_template` | string | Request body template with `{arg}` placeholders |
 | `success_status` | array | HTTP status codes that indicate success |
@@ -73,31 +73,25 @@ description = "Message timestamp (Slack message ID)"
 
 The executor follows this sequence:
 
-1. Interpolate `{arg_name}` placeholders in `url`, `headers`, and `body_template` with validated parameter values
-2. Resolve `{_secret:name}` references from secrets management
-3. Set method, headers, and body
-4. Execute with `timeout_seconds`
-5. Check response status against `success_status` / `error_status`
-6. Parse response body with the declared parser
-7. Validate against `[output.schema]`
-8. Wrap in evidence envelope
+1. Validate declared arguments and defaults; refuse unmet standalone runtime requirements.
+2. Check the fixed URL authority and expand arguments/secrets in one pass over trusted templates. JSON-escape body string slots.
+3. Bound request size, then send with redirects and ambient proxies disabled.
+4. Bound response size and classify the HTTP result. A non-success result makes `run` exit nonzero.
+5. Return an evidence envelope. Full output-schema enforcement is an embedding responsibility; reference parsing differs by language.
 
 ### Secrets Injection
 
-The `{_secret:name}` syntax references secrets that are resolved at invocation time. Secrets never appear in the manifest, MCP schema, or LLM context.
+The `{_secret:name}` syntax references secrets that are resolved at invocation time. Dry runs never fetch secret values. Endpoints may echo credentials into responses, so callers still need output confidentiality controls.
 
 ```toml
 [http]
-url = "https://api.example.com/v1/{endpoint}?key={_secret:api_key}"
+url = "https://api.example.com/v1/{endpoint}"
 headers = { "Authorization" = "Bearer {_secret:bearer_token}" }
 ```
 
-Resolution order:
+Standalone execution reads `TOOLCLAD_SECRET_<NAME>` for trusted header/body placeholders. Secret-store selection in an embedding runtime is separate. URLs cannot contain secret placeholders.
 
-1. `TOOLCLAD_SECRET_<NAME>` environment variable (standalone use)
-2. Vault/OpenBao path (Symbiont integration)
-
-The agent proposes `slack_post_message(channel="C01234", message="hello")`. The executor injects the bearer token from the secret store. The agent never sees the token.
+The agent proposes `slack_post_message(channel="C01234", message="hello")`. The executor injects the bearer token from the secret store. The agent need not supply the token.
 
 ### Status Code Validation
 

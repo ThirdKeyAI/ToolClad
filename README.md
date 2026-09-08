@@ -4,11 +4,9 @@
 
 Declarative tool interface contracts for agentic runtimes.
 
-ToolClad is a manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool: typed parameters, validation rules, invocation mechanism, output parsing, and policy metadata. Three execution modes share a common governance layer:
+ToolClad is a manifest format (`.clad.toml`) for typed tool arguments, invocation structure, output parsing and policy metadata. The Rust, Python, JavaScript and Go reference runners execute standalone commands and HTTP requests. MCP produces a delegation preview; session and browser formats require an embedding runtime for execution.
 
-- **Oneshot** (default): Single CLI command execution
-- **Session**: Interactive CLI tools via PTY (msfconsole, psql, redis-cli) with per-interaction Cedar gating
-- **Browser**: Governed headless browser via CDP/Playwright with URL scope enforcement and page state policies
+This branch hardens argument validation, command construction, secret handling, HTTP transport and execution failure reporting. See [Reference Execution and Migration](docs/reference-execution.md) for caller-visible changes and limits.
 
 ## The Problem
 
@@ -46,7 +44,7 @@ type = "object"
 type = "string"
 ```
 
-The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command. The `[command]` section is optional for HTTP-only or MCP-only manifests.
+The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The application presents typed parameters to the agent. The `[command]` section is optional for HTTP-only or MCP-only manifests.
 
 ### Array-Based Command Construction (v0.5.3)
 
@@ -61,24 +59,9 @@ The legacy `template` string format remains supported. See [Command Construction
 
 ## Security Model
 
-ToolClad inverts the sandbox approach:
+ToolClad constrains the invocation interface; it does not provide OS isolation. A permitted tool can still access resources available to its host process. Containing hostile code requires a runtime-owned sandbox, network/filesystem enforcement, approval handling and durable audit records.
 
-- **Sandbox**: LLM generates command -> sandbox intercepts -> allow/deny (deny-list)
-- **ToolClad**: LLM fills typed parameters -> policy gate -> executor validates -> constructs command from template (allow-list)
-
-The dangerous action cannot be expressed because the interface doesn't permit it.
-
-### Security Features
-
-- **Shell injection prevention**: All string types reject metacharacters (`;|&$\`(){}[]<>!\n\r`) by default
-- **Array-based execution**: Commands dispatched via direct `execve` (no `sh -c` shell interpretation)
-- **Process group isolation**: Tools spawned in new PGID; timeout kills entire process group (no zombies)
-- **Absolute path blocking**: `path` type rejects `/etc/shadow`, `C:\...` style paths
-- **Newline injection blocking**: `\n` and `\r` rejected in all string-based types
-- **HTTP body JSON-escaping**: Values interpolated into HTTP body templates are JSON-escaped to prevent injection
-- **Platform-aware evidence directories**: Evidence output uses platform-appropriate temp directories
-- **HTTP error semantics**: 4xx responses map to `client_error`, 5xx to `server_error` in evidence envelopes
-- **No eval**: Conditional evaluators use closed-vocabulary parsers, never dynamic code execution
+Reference runners validate supplied arguments and defaults, reject undeclared parameters, preserve literal argv boundaries and refuse effects requiring approval, Cedar or explicit scope enforcement. HTTP requests use fixed manifest-defined origins, single-pass secret expansion, no redirects or ambient proxies, and bounded responses. Child processes receive a minimal environment with output/time limits and original process-group cleanup. These controls have explicit limits; see [Security Model](docs/security-model.md).
 
 ## Packages
 

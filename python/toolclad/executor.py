@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import signal
+import selectors
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,47 @@ from typing import Any, Dict, Optional
 
 from toolclad.manifest import Manifest
 from toolclad.validator import ValidationError, validate_arg
+from toolclad.contracts import (
+    validate_arguments, check_execution, child_environment, template_argv,
+    http_url, http_template, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+)
+
+
+def _communicate_bounded(proc, timeout):
+    """Drain both pipes under a deadline and clean up the original process group."""
+    deadline = time.monotonic() + timeout
+    buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    def stop_group():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            selector.register(proc.stderr, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(proc.args, timeout)
+                if proc.poll() is not None:
+                    stop_group()
+                for key, _ in selector.select(min(remaining, 0.05)):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffer = buffers[key.fd]
+                    if len(buffer) + len(chunk) > MAX_RESPONSE_BYTES:
+                        raise ValueError("Process output exceeds 4 MiB per stream")
+                    buffer.extend(chunk)
+            proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+        return tuple(bytes(value).decode("utf-8", errors="replace") for value in buffers.values())
+    finally:
+        stop_group()
+        proc.stdout.close()
+        proc.stderr.close()
+        proc.wait(timeout=1)
 
 
 def _generate_scan_id() -> str:
@@ -67,28 +109,16 @@ def _evaluate_single(expr: str, resolved: Dict[str, str]) -> bool:
 
 def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
     """Validate arguments and resolve all template variables into a single context."""
-    resolved: Dict[str, str] = {}
-
-    for arg_name, arg_def in manifest.args.items():
-        if arg_name in args:
-            resolved[arg_name] = validate_arg(arg_def, args[arg_name])
-        elif arg_def.default is not None:
-            resolved[arg_name] = str(arg_def.default)
-        elif arg_def.required:
-            raise ValidationError(
-                f"Missing required argument: '{arg_name}'"
-            )
-        else:
-            resolved[arg_name] = ""
-
+    resolved = validate_arguments(manifest, args)
+    for name in manifest.args:
+        resolved.setdefault(name, "")
     for key, val in manifest.command.defaults.items():
-        if key not in resolved:
-            resolved[key] = str(val)
+        resolved.setdefault(key, str(val))
 
     scan_id = _generate_scan_id()
     evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
 
-    output_dir = evidence_dir
+    output_dir = os.path.join(evidence_dir, f"{scan_id}-{manifest.tool.name}")
     if manifest.tool.evidence.output_dir:
         output_dir = manifest.tool.evidence.output_dir.format(
             evidence_dir=evidence_dir, scan_id=scan_id
@@ -107,7 +137,9 @@ def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
         arg_value = resolved.get(map_arg, "")
         mapped = mapping_table.get(arg_value, "")
         resolved[f"_{map_arg}_flags"] = mapped
-        resolved["_scan_flags"] = mapped
+        resolved[f"_{map_arg}"] = mapped
+        if map_arg.endswith("_type"):
+            resolved[f"_{map_arg[:-5]}_flags"] = mapped
 
     for cond_name, cond_def in manifest.command.conditionals.items():
         if _evaluate_condition(cond_def.when, resolved):
@@ -180,11 +212,21 @@ def build_command(manifest: Manifest, args: Dict[str, str]) -> str:
 
     resolved = _resolve_vars(manifest, args)
 
-    command = _interpolate(manifest.command.template, resolved)
+    return shlex.join(_command_argv(manifest, resolved))
 
-    # Collapse multiple spaces into one and strip.
-    command = re.sub(r"\s+", " ", command).strip()
-    return command
+
+def _command_argv(manifest, resolved):
+    fragments = {}
+    for name, table in manifest.command.mappings.items():
+        fragment = table.get(resolved.get(name, ""), "")
+        fragments[f"_{name}_flags"] = fragments[f"_{name}"] = fragment
+        if name.endswith("_type"):
+            fragments[f"_{name[:-5]}_flags"] = fragment
+    for name, cond in manifest.command.conditionals.items():
+        fragments[f"_{name}"] = cond.template if _evaluate_condition(cond.when, resolved) else ""
+    if manifest.command.exec:
+        return [_interpolate(v, resolved) for v in manifest.command.exec]
+    return template_argv(manifest.command.template, resolved, fragments)
 
 
 def _interpolate(template: str, values: Dict[str, str]) -> str:
@@ -333,10 +375,17 @@ def _validate_output_schema(manifest: Manifest, parsed: Any) -> None:
         raise RuntimeError(f"Output schema validation failed: {e.message}")
 
 
-def _interpolate_http(template: str, args: Dict[str, str]) -> str:
-    """Interpolate arg placeholders then resolve secret references."""
-    result = _interpolate(template, args)
-    return inject_template_vars(result)
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _read_response(response):
+    with response:
+        content = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(content) > MAX_RESPONSE_BYTES:
+        raise ValueError("HTTP response exceeds 4 MiB")
+    return content.decode("utf-8", errors="replace")
 
 
 def _execute_http(
@@ -353,16 +402,15 @@ def _execute_http(
     scan_id = _generate_scan_id()
     effective_timeout = timeout or manifest.tool.timeout_seconds
 
-    # Interpolate URL, headers, and body with args + secrets.
-    url = _interpolate_http(http.url, args)
-    headers = {k: _interpolate_http(v, args) for k, v in http.headers.items()}
-    body: Optional[bytes] = None
+    args = validate_arguments(manifest, args)
+    check_execution(manifest, dry_run)
+    url = http_url(http.url, args)
+    headers = {k: http_template(v, args, dry_run=dry_run) for k, v in http.headers.items()}
+    body = None
     if http.body_template is not None:
-        # JSON-escape values to prevent injection into JSON body
-        escaped_args = {k: json.dumps(v)[1:-1] for k, v in args.items()}  # strip quotes from json.dumps
-        body_str = _interpolate(http.body_template, escaped_args)
-        body_str = inject_template_vars(body_str)
-        body = body_str.encode("utf-8")
+        body = http_template(http.body_template, args, dry_run=dry_run, json_string=True).encode()
+    if len(body or b"") + sum(len(k.encode()) + len(v.encode()) for k, v in headers.items()) + len(url.encode()) > MAX_REQUEST_BYTES:
+        raise ValueError("HTTP request exceeds 1 MiB")
 
     envelope: Dict[str, Any] = {
         "status": "success",
@@ -386,12 +434,12 @@ def _execute_http(
         req = urllib.request.Request(
             url, data=body, headers=headers, method=http.method
         )
-        resp = urllib.request.urlopen(req, timeout=effective_timeout)
+        resp = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open(req, timeout=effective_timeout)
         status_code = resp.status
-        resp_body = resp.read().decode("utf-8", errors="replace")
+        resp_body = _read_response(resp)
     except urllib.error.HTTPError as exc:
         status_code = exc.code
-        resp_body = exc.read().decode("utf-8", errors="replace")
+        resp_body = _read_response(exc)
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         envelope["duration_ms"] = elapsed_ms
@@ -403,13 +451,9 @@ def _execute_http(
     envelope["duration_ms"] = elapsed_ms
     envelope["http_status"] = status_code
 
-    is_success = True
-    if http.error_status and status_code in http.error_status:
+    is_success = (status_code in http.success_status if http.success_status else 200 <= status_code < 300)
+    if status_code in http.error_status:
         is_success = False
-    elif http.success_status and status_code not in http.success_status:
-        is_success = False
-    elif not http.success_status and not http.error_status:
-        is_success = 200 <= status_code < 300
 
     if not is_success:
         if 400 <= status_code < 500:
@@ -486,6 +530,12 @@ def execute(
         An evidence envelope dict with status, scan_id, tool, command,
         duration_ms, timestamp, output_file, output_hash, and results.
     """
+    args = validate_arguments(manifest, args)
+    check_execution(manifest, dry_run)
+    if timeout is not None and not 1 <= timeout <= manifest.tool.timeout_seconds:
+        raise ValueError("Timeout override must be positive and cannot extend the manifest deadline")
+    if dry_run and manifest.tool.dispatch == "callback":
+        return {"status": "dry_run", "command": "callback (embedding runtime required)", "results": {}}
     # Dispatch to HTTP or MCP execution if applicable.
     if manifest.http is not None:
         return _execute_http(manifest, args, dry_run=dry_run, timeout=timeout)
@@ -505,20 +555,12 @@ def execute(
 
     # Handle custom executor escape hatch.
     if manifest.command.executor:
-        # Validate args manually since build_command() isn't called for executor mode
-        validated_args: Dict[str, str] = {}
-        for arg_name, arg_def in manifest.args.items():
-            if arg_name in args:
-                validated_args[arg_name] = validate_arg(arg_def, args[arg_name])
-            elif arg_def.default is not None:
-                validated_args[arg_name] = str(arg_def.default)
-            elif arg_def.required:
-                raise ValidationError(f"Missing required argument: '{arg_name}'")
+        validated_args = args
 
         scan_id = _generate_scan_id()
         effective_timeout = timeout or manifest.tool.timeout_seconds
 
-        env = os.environ.copy()
+        env = child_environment()
         for k, v in validated_args.items():
             env[f"TOOLCLAD_ARG_{k.upper()}"] = str(v)
         env["TOOLCLAD_SCAN_ID"] = scan_id
@@ -550,9 +592,10 @@ def execute(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                preexec_fn=os.setpgrp,
+                start_new_session=True,
+            stdin=subprocess.DEVNULL,
             )
-            stdout, stderr = proc.communicate(timeout=effective_timeout)
+            stdout, stderr = _communicate_bounded(proc, effective_timeout)
             elapsed_ms = int((time.monotonic() - start) * 1000)
             envelope["duration_ms"] = elapsed_ms
             envelope["exit_code"] = proc.returncode
@@ -565,7 +608,9 @@ def execute(
                 try:
                     parsed = _parse_output(manifest, stdout)
                     envelope["results"] = parsed if isinstance(parsed, dict) else {"parsed_output": parsed}
-                except RuntimeError:
+                except RuntimeError as exc:
+                    envelope["status"] = "error"
+                    envelope["parser_error"] = str(exc)
                     envelope["results"] = {"raw_output": stdout}
         except subprocess.TimeoutExpired:
             if proc is not None:
@@ -582,17 +627,12 @@ def execute(
 
         return envelope
 
-    scan_id = _generate_scan_id()
+    resolved = _resolve_vars(manifest, args)
+    scan_id = resolved["_scan_id"]
     tool_name = manifest.tool.name
     effective_timeout = timeout or manifest.tool.timeout_seconds
-
-    # Build command — prefer exec array over template string.
-    if manifest.command.exec:
-        args_list = build_command_argv(manifest, args)
-        command = " ".join(args_list)
-    else:
-        command = build_command(manifest, args)
-        args_list = shlex.split(command)
+    args_list = _command_argv(manifest, resolved)
+    command = shlex.join(args_list)
 
     envelope: Dict[str, Any] = {
         "status": "success",
@@ -610,33 +650,23 @@ def execute(
         envelope["status"] = "dry_run"
         return envelope
 
-    # Ensure evidence output directory exists.
-    evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
-    if manifest.tool.evidence.output_dir:
-        out_dir = manifest.tool.evidence.output_dir.format(
-            evidence_dir=evidence_dir, scan_id=scan_id
-        )
-    else:
-        out_dir = os.path.join(evidence_dir, f"{scan_id}-{tool_name}")
-    os.makedirs(out_dir, exist_ok=True)
-
-    ext_map = {"xml": "xml", "json": "json", "csv": "csv", "text": "txt", "jsonl": "jsonl"}
-    out_format = manifest.output.format if manifest.output else "text"
-    ext = ext_map.get(out_format, "txt")
-    output_file = os.path.join(out_dir, f"scan.{ext}")
+    output_file = resolved["_output_file"]
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     envelope["output_file"] = output_file
     start = time.monotonic()
     proc = None
     try:
         proc = subprocess.Popen(
             args_list,
+            env=child_environment(),
             shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=os.setpgrp,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
         )
-        stdout, stderr = proc.communicate(timeout=effective_timeout)
+        stdout, stderr = _communicate_bounded(proc, effective_timeout)
         elapsed_ms = int((time.monotonic() - start) * 1000)
         envelope["duration_ms"] = elapsed_ms
         envelope["exit_code"] = proc.returncode
@@ -663,7 +693,9 @@ def execute(
                 parsed = _parse_output(manifest, stdout)
                 envelope["results"] = parsed if isinstance(parsed, dict) else {"parsed_output": parsed}
                 _validate_output_schema(manifest, parsed)
-            except RuntimeError:
+            except RuntimeError as exc:
+                envelope["status"] = "error"
+                envelope["parser_error"] = str(exc)
                 envelope["results"] = {"raw_output": stdout}
 
     except subprocess.TimeoutExpired:

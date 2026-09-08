@@ -3,6 +3,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateArg } from "./validator.js";
+import { validateArguments, checkExecution, childEnvironment, splitTemplate, quoteArg, templateArgv, prepareHttp, requestHttp, MAX_RESPONSE_BYTES } from './contracts.js';
 
 /**
  * Replace {_secret:name} placeholders with TOOLCLAD_SECRET_<NAME> env vars.
@@ -26,31 +27,7 @@ export function injectTemplateVars(template) {
  * @param {string} cmd - The command string to split
  * @returns {string[]} Array of arguments
  */
-function splitCommand(cmd) {
-  const args = [];
-  let current = "";
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const c = cmd[i];
-    if (c === "'" && !inDouble) {
-      inSingle = !inSingle;
-    } else if (c === '"' && !inSingle) {
-      inDouble = !inDouble;
-    } else if (c === " " && !inSingle && !inDouble) {
-      if (current.length > 0) {
-        args.push(current);
-        current = "";
-      }
-    } else {
-      current += c;
-    }
-  }
-  if (current.length > 0) {
-    args.push(current);
-  }
-  return args;
-}
+const splitCommand = splitTemplate;
 
 /**
  * Resolve all argument values: apply defaults, validate types, resolve mappings.
@@ -59,27 +36,7 @@ function splitCommand(cmd) {
  * @param {object} args - User-supplied arguments (key=value)
  * @returns {object} Validated argument map
  */
-function resolveArgs(manifest, args) {
-  const argDefs = manifest.args || {};
-  const resolved = {};
-
-  for (const [name, def] of Object.entries(argDefs)) {
-    let value = args[name];
-
-    // Apply default if missing
-    if (value === undefined || value === null) {
-      if (def.required && def.default === undefined) {
-        throw new Error(`Missing required argument: ${name}`);
-      }
-      value = def.default;
-      if (value === undefined) continue;
-    }
-
-    resolved[name] = validateArg(def, value);
-  }
-
-  return resolved;
-}
+const resolveArgs = validateArguments;
 
 /**
  * Resolve all template variables: args, defaults, mappings, conditionals,
@@ -91,8 +48,9 @@ function resolveArgs(manifest, args) {
  */
 function resolveContext(manifest, args) {
   const resolvedArgs = resolveArgs(manifest, args);
-  const command = manifest.command;
+  const command = manifest.command || {};
   const context = { ...resolvedArgs };
+  for (const name of Object.keys(manifest.args || {})) context[name] ??= "";
 
   if (command.defaults) {
     for (const [key, val] of Object.entries(command.defaults)) {
@@ -112,7 +70,8 @@ function resolveContext(manifest, args) {
       const argValue = context[argName];
       if (argValue !== undefined && mapping[argValue] !== undefined) {
         context[`_${argName}_flags`] = mapping[argValue];
-        context["_scan_flags"] = mapping[argValue];
+        context[`_${argName}`] = mapping[argValue];
+        if (argName.endsWith('_type')) context[`_${argName.slice(0, -5)}_flags`] = mapping[argValue];
       }
     }
   }
@@ -121,6 +80,7 @@ function resolveContext(manifest, args) {
     for (const [name, cond] of Object.entries(command.conditionals)) {
       const result = evaluateCondition(cond.when, context);
       context[`_cond_${name}`] = result ? interpolate(cond.template, context) : "";
+      context[`_${name}`] = context[`_cond_${name}`];
     }
   }
 
@@ -150,7 +110,7 @@ export function buildCommandArgv(manifest, args) {
     throw new Error("exec array produced empty argv");
   }
 
-  return { argv, resolvedArgs };
+  return { argv, resolvedArgs, scanId: context._scan_id };
 }
 
 /**
@@ -162,22 +122,26 @@ export function buildCommandArgv(manifest, args) {
  * @returns {{ command: string, resolvedArgs: object }} The constructed command and resolved args
  */
 export function buildCommand(manifest, args) {
-  const command = manifest.command;
+  const command = manifest.command || {};
 
   // If using an executor script, return that info
   if (command.executor) {
     const resolvedArgs = resolveArgs(manifest, args);
-    return { command: command.executor, resolvedArgs, isExecutor: true };
+    return { command: quoteArg(command.executor), resolvedArgs, isExecutor: true, scanId: randomBytes(16).toString("hex") };
   }
 
   const { resolvedArgs, context } = resolveContext(manifest, args);
-  const result = interpolate(command.template, context);
-
-  return {
-    command: result.replace(/\s+/g, " ").trim(),
-    resolvedArgs,
-    isExecutor: false,
-  };
+  const fragments = {};
+  for (const [name, table] of Object.entries(command.mappings || {})) {
+    const value = table[context[name]] || '';
+    fragments[`_${name}_flags`] = fragments[`_${name}`] = value;
+    if (name.endsWith('_type')) fragments[`_${name.slice(0, -5)}_flags`] = value;
+  }
+  for (const [name, cond] of Object.entries(command.conditionals || {})) {
+    fragments[`_${name}`] = fragments[`_cond_${name}`] = evaluateCondition(cond.when, context) ? cond.template : '';
+  }
+  const argv = command.exec?.length ? command.exec.map(v => interpolate(v, context)) : templateArgv(command.template, context, fragments);
+  return { command: argv.map(quoteArg).join(' '), resolvedArgs, isExecutor: false, scanId: context._scan_id };
 }
 
 /**
@@ -230,6 +194,9 @@ function evaluateSingleCondition(expr, context) {
  * @returns {object} Evidence envelope with results
  */
 export function execute(manifest, args, options = {}) {
+  args = resolveArgs(manifest, args);
+  checkExecution(manifest, options.dryRun);
+  if (options.dryRun && manifest.tool.dispatch === 'callback') return { status: 'dry_run', command: 'callback (embedding runtime required)', resolvedArgs: args };
   // Gate unimplemented modes
   if (manifest.session) {
     throw new Error(
@@ -249,7 +216,11 @@ export function execute(manifest, args, options = {}) {
 
   // Route to MCP proxy backend
   if (manifest.mcp) {
-    return executeMcp(manifest, args);
+    const preview = executeMcp(manifest, args);
+    if (options.dryRun) preview.status = 'dry_run';
+    preview.command = `mcp://${manifest.mcp.server}/${manifest.mcp.tool}`;
+    preview.resolvedArgs = args;
+    return preview;
   }
 
   // Determine if we're using exec array, template, or custom executor.
@@ -257,17 +228,20 @@ export function execute(manifest, args, options = {}) {
   let commandDisplay;
   let resolvedArgs;
   let isExecutor = false;
+  let scanId;
 
   if (manifest.command.exec && manifest.command.exec.length > 0) {
     // PREFERRED: Array-based command — maps directly to execve, no splitting.
     const built = buildCommandArgv(manifest, args);
     cmdParts = built.argv;
     resolvedArgs = built.resolvedArgs;
+    scanId = built.scanId;
     commandDisplay = cmdParts.join(" ");
   } else {
     const built = buildCommand(manifest, args);
     commandDisplay = built.command;
     resolvedArgs = built.resolvedArgs;
+    scanId = built.scanId;
     isExecutor = built.isExecutor;
     cmdParts = splitCommand(built.command);
   }
@@ -281,18 +255,18 @@ export function execute(manifest, args, options = {}) {
     };
   }
 
-  const timeoutMs = (manifest.tool.timeout_seconds || 30) * 1000;
+  const timeoutMs = (manifest.tool.timeout_seconds ?? 60) * 1000;
   const startTime = Date.now();
 
   let result;
 
   if (isExecutor) {
     // Escape hatch: pass validated args as env vars
-    const env = { ...process.env };
+    const env = childEnvironment();
     for (const [key, val] of Object.entries(resolvedArgs)) {
       env[`TOOLCLAD_ARG_${key.toUpperCase()}`] = String(val);
     }
-    env.TOOLCLAD_SCAN_ID = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
+    env.TOOLCLAD_SCAN_ID = scanId;
     env.TOOLCLAD_EVIDENCE_DIR =
       process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
 
@@ -302,20 +276,23 @@ export function execute(manifest, args, options = {}) {
       detached: true,
       env,
       encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
+      killSignal: "SIGKILL",
+      maxBuffer: MAX_RESPONSE_BYTES,
     });
   } else {
     result = spawnSync(cmdParts[0], cmdParts.slice(1), {
       shell: false,
       timeout: timeoutMs,
       detached: true,
+      env: childEnvironment(),
       encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
+      killSignal: "SIGKILL",
+      maxBuffer: MAX_RESPONSE_BYTES,
     });
   }
 
   // On timeout, kill the entire process group.
-  if (result.signal === "SIGTERM" && result.pid) {
+  if (result.pid) {
     try {
       process.kill(-result.pid, "SIGKILL");
     } catch {
@@ -328,12 +305,11 @@ export function execute(manifest, args, options = {}) {
   const stderr = result.stderr || "";
   const exitCode = result.status;
 
-  const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
   const outputHash = createHash("sha256").update(stdout).digest("hex");
 
   // Build evidence envelope with exit_code and stderr on all paths.
   const envelope = {
-    status: exitCode === 0 ? "success" : "error",
+    status: exitCode === 0 && !result.error ? "success" : "error",
     scan_id: scanId,
     tool: manifest.tool.name,
     command: commandDisplay,
@@ -344,8 +320,8 @@ export function execute(manifest, args, options = {}) {
     output_hash: `sha256:${outputHash}`,
   };
 
-  if (exitCode !== 0) {
-    envelope.error = stderr || `Process exited with code ${exitCode}`;
+  if (exitCode !== 0 || result.error) {
+    envelope.error = result.error?.message || stderr || `Process exited with code ${exitCode}`;
     envelope.results = { raw_output: stdout };
   } else {
     envelope.results = parseOutputJs(manifest, stdout);
@@ -573,28 +549,7 @@ function executeHttpSync(manifest, args, options = {}) {
     throw new Error("Manifest missing [http] section or http.url");
   }
 
-  const resolvedArgs = resolveArgs(manifest, args);
-  const context = { ...resolvedArgs };
-
-  let url = interpolate(httpDef.url, context);
-  url = injectTemplateVars(url);
-
-  const headers = {};
-  if (httpDef.headers) {
-    for (const [key, val] of Object.entries(httpDef.headers)) {
-      headers[key] = injectTemplateVars(interpolate(val, context));
-    }
-  }
-
-  let body = undefined;
-  if (httpDef.body_template) {
-    // JSON-escape values for safe interpolation into body templates
-    const escaped = {};
-    for (const [k, v] of Object.entries(context)) {
-      escaped[k] = JSON.stringify(String(v)).slice(1, -1);
-    }
-    body = injectTemplateVars(interpolate(httpDef.body_template, escaped));
-  }
+  const { url, headers, body, resolvedArgs } = prepareHttp(manifest, args, options.dryRun);
 
   const method = (httpDef.method || "GET").toUpperCase();
   const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
@@ -605,26 +560,21 @@ function executeHttpSync(manifest, args, options = {}) {
       scan_id: scanId,
       tool: manifest.tool.name,
       command: `${method} ${url}`,
+      resolvedArgs,
       timestamp: new Date().toISOString(),
     };
   }
 
-  // Build curl arguments for synchronous HTTP execution
-  const curlArgs = ["-s", "-S", "-X", method, "-w", "\n%{http_code}"];
-  for (const [k, v] of Object.entries(headers)) {
-    curlArgs.push("-H", `${k}: ${v}`);
-  }
-  if (body && method !== "GET" && method !== "HEAD") {
-    curlArgs.push("-d", body);
-  }
-  const timeout = manifest.tool.timeout_seconds || 30;
-  curlArgs.push("--max-time", String(timeout));
-  curlArgs.push(url);
-
+  // Keep secrets out of process arguments, disable user curl configuration and proxies.
+  const configQuote = value => '"' + String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n').replaceAll('\r', '\\r') + '"';
+  const config = Object.entries(headers).map(([k, v]) => `header = ${configQuote(`${k}: ${v}`)}`);
+  if (body !== undefined) config.push(`data-binary = ${configQuote(body)}`);
+  const timeout = manifest.tool.timeout_seconds ?? 60;
+  const curlArgs = ['-q', '--noproxy', '*', '--proto', '=http,https', '-sS', '-X', method, '-w', '\n%{http_code}', '--max-time', String(timeout), '--max-filesize', String(MAX_RESPONSE_BYTES), '--config', '-', '--url', url];
   const startTime = Date.now();
-  const result = spawnSync("curl", curlArgs, {
-    encoding: "utf-8",
-    timeout: (timeout + 5) * 1000,
+  const result = spawnSync('curl', curlArgs, {
+    input: config.join('\n') + '\n', env: childEnvironment(), encoding: 'utf-8',
+    timeout: (timeout + 1) * 1000, killSignal: 'SIGKILL', maxBuffer: MAX_RESPONSE_BYTES + 1024,
   });
 
   const durationMs = Date.now() - startTime;
@@ -635,8 +585,8 @@ function executeHttpSync(manifest, args, options = {}) {
 
   const outputHash = createHash("sha256").update(respBody).digest("hex");
 
-  const successStatus = httpDef.success_status || [200, 201, 202, 204];
-  const isSuccess = successStatus.includes(statusCode);
+  const successStatus = httpDef.success_status;
+  const isSuccess = result.status === 0 && !result.error && (successStatus?.length ? successStatus.includes(statusCode) : statusCode >= 200 && statusCode < 300) && !(httpDef.error_status || []).includes(statusCode);
 
   let status;
   if (isSuccess) {
@@ -666,7 +616,7 @@ function executeHttpSync(manifest, args, options = {}) {
 
 /**
  * Execute a tool via HTTP when the manifest has an [http] section.
- * Uses Node 18+ built-in fetch.
+ * Uses the core HTTP client without redirects or ambient proxies.
  *
  * @param {object} manifest - Parsed manifest with http section
  * @param {object} args - User-supplied arguments (key=value)
@@ -680,26 +630,7 @@ export async function executeHttp(manifest, args, options = {}) {
     throw new Error("Manifest missing [http] section or http.url");
   }
 
-  const resolvedArgs = resolveArgs(manifest, args);
-  const context = { ...resolvedArgs };
-
-  // Interpolate URL with args and template vars
-  let url = interpolate(httpDef.url, context);
-  url = injectTemplateVars(url);
-
-  // Interpolate headers
-  const headers = {};
-  if (httpDef.headers) {
-    for (const [key, val] of Object.entries(httpDef.headers)) {
-      headers[key] = injectTemplateVars(interpolate(val, context));
-    }
-  }
-
-  // Interpolate body
-  let body = undefined;
-  if (httpDef.body_template) {
-    body = injectTemplateVars(interpolate(httpDef.body_template, context));
-  }
+  const { url, headers, body, resolvedArgs } = prepareHttp(manifest, args, options.dryRun);
 
   const method = (httpDef.method || "GET").toUpperCase();
 
@@ -723,13 +654,13 @@ export async function executeHttp(manifest, args, options = {}) {
     fetchOptions.body = body;
   }
 
-  const response = await fetch(url, fetchOptions);
-  const responseBody = await response.text();
+  const response = await requestHttp(url, fetchOptions, manifest.tool.timeout_seconds ?? 60);
+  const responseBody = response.body;
   const durationMs = Date.now() - startTime;
   const outputHash = createHash("sha256").update(responseBody).digest("hex");
 
-  const successStatus = httpDef.success_status || [200, 201, 202, 204];
-  const isSuccess = successStatus.includes(response.status);
+  const successStatus = httpDef.success_status;
+  const isSuccess = (successStatus?.length ? successStatus.includes(response.status) : response.status >= 200 && response.status < 300) && !(httpDef.error_status || []).includes(response.status);
 
   const envelope = {
     status: isSuccess ? "success" : "error",
@@ -828,6 +759,7 @@ export function generateMcpSchema(manifest) {
     description: manifest.tool.description || "",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties,
       required,
     },

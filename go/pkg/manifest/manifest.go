@@ -24,13 +24,13 @@ type EvidenceDef struct {
 
 // ToolMeta holds the top-level [tool] section metadata.
 type ToolMeta struct {
-	Name           string       `toml:"name"`
-	Version        string       `toml:"version"`
-	Binary         string       `toml:"binary"`
-	Description    string       `toml:"description"`
-	TimeoutSeconds int          `toml:"timeout_seconds"`
-	RiskTier       string       `toml:"risk_tier"`
-	HumanApproval  bool         `toml:"human_approval"`
+	Name           string `toml:"name"`
+	Version        string `toml:"version"`
+	Binary         string `toml:"binary"`
+	Description    string `toml:"description"`
+	TimeoutSeconds int    `toml:"timeout_seconds"`
+	RiskTier       string `toml:"risk_tier"`
+	HumanApproval  bool   `toml:"human_approval"`
 	// Dispatch mode: "exec" (default) runs an execution backend; "callback"
 	// declares the manifest as validator-only — no [output] block or backend
 	// is required. Useful for in-process embeddings where ToolClad is the
@@ -53,12 +53,12 @@ type ArgDef struct {
 	Min         *int     `toml:"min"`
 	Max         *int     `toml:"max"`
 	// Float bounds for `number` type. Fall back to Min/Max cast to float64 when nil.
-	MinFloat    *float64 `toml:"min_float"`
-	MaxFloat    *float64 `toml:"max_float"`
-	Clamp       bool     `toml:"clamp"`
-	Sanitize    []string `toml:"sanitize"`
-	Schemes     []string `toml:"schemes"`
-	ScopeCheck  bool     `toml:"scope_check"`
+	MinFloat   *float64 `toml:"min_float"`
+	MaxFloat   *float64 `toml:"max_float"`
+	Clamp      bool     `toml:"clamp"`
+	Sanitize   []string `toml:"sanitize"`
+	Schemes    []string `toml:"schemes"`
+	ScopeCheck bool     `toml:"scope_check"`
 }
 
 // ConditionalDef represents a conditional command fragment.
@@ -75,12 +75,12 @@ type ConditionalDef struct {
 //
 // When both are present, exec takes precedence.
 type CommandDef struct {
-	Template     string                        `toml:"template"`
-	Exec         []string                      `toml:"exec"`
-	Executor     string                        `toml:"executor"`
-	Defaults     map[string]any                `toml:"defaults"`
-	Mappings     map[string]map[string]string  `toml:"mappings"`
-	Conditionals map[string]ConditionalDef     `toml:"conditionals"`
+	Template     string                       `toml:"template"`
+	Exec         []string                     `toml:"exec"`
+	Executor     string                       `toml:"executor"`
+	Defaults     map[string]any               `toml:"defaults"`
+	Mappings     map[string]map[string]string `toml:"mappings"`
+	Conditionals map[string]ConditionalDef    `toml:"conditionals"`
 }
 
 // OutputDef holds the [output] section.
@@ -225,18 +225,13 @@ func LoadManifest(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("reading manifest: %w", err)
 	}
 
-	var m Manifest
+	m := Manifest{Tool: ToolMeta{TimeoutSeconds: 60}}
 	if err := toml.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing manifest: %w", err)
 	}
 
 	if m.Tool.Name == "" {
 		return nil, fmt.Errorf("manifest %s: missing required tool.name", path)
-	}
-
-	// Set default timeout if not specified.
-	if m.Tool.TimeoutSeconds == 0 {
-		m.Tool.TimeoutSeconds = 60
 	}
 
 	// Set default risk tier.

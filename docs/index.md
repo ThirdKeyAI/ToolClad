@@ -1,5 +1,7 @@
 # ToolClad
 
+For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
+
 **Declarative tool interface contracts for agentic runtimes.**
 
 ToolClad is the tool execution layer of the [ThirdKey](https://thirdkey.ai) trust stack: [SchemaPin](https://schemapin.org) (tool integrity) / [AgentPin](https://agentpin.org) (agent identity) / **ToolClad** (tool contracts) / [Symbiont](https://symbiont.dev) (runtime).
@@ -79,21 +81,13 @@ type = "string"
 description = "Raw WHOIS registration data"
 ```
 
-The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command.
+The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The application exposes the typed interface to the agent.
 
 ## Why ToolClad?
 
-ToolClad inverts the security model of sandbox-based approaches:
+ToolClad exposes declared parameters and operation structure to an agent. Validated defaults, literal argument boundaries, explicit runtime requirements and constrained HTTP transport reduce accidental authority at the invocation boundary.
 
-| | Sandbox (deny-list) | ToolClad (allow-list) |
-|---|---|---|
-| **Flow** | LLM generates command &#8594; sandbox intercepts &#8594; allow/deny | LLM fills typed parameters &#8594; executor validates &#8594; constructs command from template |
-| **What the agent sees** | A shell | Typed fields with constraints |
-| **Dangerous actions** | Possible but intercepted (gaps exist) | Cannot be expressed (interface does not permit it) |
-| **Static analysis** | Not possible | Inspect manifest to determine all possible invocations |
-| **Policy integration** | Post-hoc | Cedar policies reference manifest-declared properties |
-
-The dangerous action cannot be expressed because the interface does not permit it.
+ToolClad and OS isolation address different boundaries. A trusted manifest can select a powerful executable, and that executable runs with its host permissions. Use an embedding runtime for hostile-code isolation, approval/Cedar evaluation, connection-time egress enforcement and authenticated audit records. See [Security Model](security-model.md).
 
 ## Reference Implementations
 
@@ -104,7 +98,7 @@ The dangerous action cannot be expressed because the interface does not permit i
 | JavaScript | `js/` | [npmjs.com/package/toolclad](https://www.npmjs.com/package/toolclad) |
 | Go | `go/` | `go install ./cmd/toolclad` |
 
-All four implementations parse the same `.clad.toml` format, validate arguments with the same type system, and produce interoperable evidence envelopes.
+All four implementations use `.clad.toml` contracts. Shared execution vectors check common validation and argv behavior; network validators, output parsing and envelope fields retain implementation differences.
 
 ## Documentation
 

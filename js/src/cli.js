@@ -34,6 +34,7 @@ program
       const args = parseArgs(opts.arg);
       const result = execute(manifest, args);
       console.log(JSON.stringify(result, null, 2));
+      if (result.status !== "success") process.exitCode = 1;
     } catch (err) {
       console.error(`Error: ${err.message}`);
       process.exit(1);
@@ -91,13 +92,15 @@ function parseArgs(argList) {
     if (eqIdx === -1) {
       throw new Error(`Invalid argument format: "${item}" (expected key=value)`);
     }
-    result[item.slice(0, eqIdx)] = item.slice(eqIdx + 1);
+    const name = item.slice(0, eqIdx).trim();
+    if (!name || Object.hasOwn(result, name)) throw new Error('Argument names must be nonempty and unique');
+    Object.defineProperty(result, name, { value: item.slice(eqIdx + 1), enumerable: true });
   }
   return result;
 }
 
 function formatArgs(args) {
-  return Object.entries(args)
+  return Object.entries(args || {})
     .map(([k, v]) => `${k}=${v}`)
     .join(", ");
 }

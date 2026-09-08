@@ -20,12 +20,12 @@ ToolClad provides:
 - **Manifest parsing** — Load and validate `.clad.toml` tool interface contracts (oneshot, session, browser modes)
 - **Argument validation** — 15 built-in type validators (incl. `number` and ASCII-strict `scope_target` with IDN/punycode rejection) with shell injection sanitization, plus custom types via `toolclad.toml`
 - **Dispatch modes** — `tool.dispatch = "exec"` (default) runs an execution backend; `dispatch = "callback"` is a validator-only embedding for in-process tool dispatch (no `[output]`/backend required)
-- **Five execution backends** — Shell command, HTTP API, MCP proxy, PTY session, CDP/Playwright browser
+- **Backend contracts** — Command and HTTP reference execution; MCP previews; PTY session and browser execution require an embedding runtime
 - **HTTP backend** — REST/GraphQL API tools with `{_secret:name}` template variable injection
-- **MCP proxy backend** — Governed passthrough to upstream MCP servers with field mapping
+- **MCP proxy backend** — Validated field mapping and delegation previews; no standalone upstream dispatch
 - **Command construction** — Template interpolation with mappings, conditionals, and defaults
 - **Tool execution** — Direct argv dispatch, process group kill on timeout, SHA-256 evidence hashing
-- **Output parsers** — builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
+- **Output parsers** — builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text; custom scripts require an embedding runtime
 - **MCP schema generation** — Auto-generate inputSchema + outputSchema for LLM tool use
 - **Evidence envelopes** — Structured JSON with scan_id, timestamps, exit_code, stderr, output_hash
 
@@ -58,9 +58,9 @@ ToolClad is a framework for defining tools, not a tool itself. It provides a CLI
 
 ## Security Model
 
-ToolClad uses an **allow-list** approach: the LLM fills typed parameters constrained by the manifest. The executor validates and constructs the command. The LLM never generates or sees shell commands.
+ToolClad uses an **allow-list** approach: the LLM fills typed parameters constrained by the manifest. The executor validates and constructs the command. The application can expose typed parameters instead of command text.
 
-All string-based types reject shell metacharacters by default: `;|&$\`(){}[]<>!`
+Type-specific validators reject defined metacharacters. Literal argv construction preserves argument boundaries independently of those filters. ToolClad does not provide OS isolation. See `docs/reference-execution.md` for approval/Cedar/scope refusals, secret handling, process limits and evidence limitations.
 
 ## Example Manifests
 

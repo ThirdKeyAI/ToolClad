@@ -1,6 +1,6 @@
 # Command Construction
 
-ToolClad command construction is the core mechanism that prevents LLMs from generating arbitrary shell commands. Parameters are validated, then interpolated into a declared command structure. Commands are dispatched via direct `execve` (no `sh -c`), so shell interpretation never occurs.
+ToolClad command construction is the core mechanism that prevents LLMs from generating arbitrary shell commands. Parameters are validated, then interpolated into a declared command structure. Commands use direct argv dispatch without an implicit shell. The manifest remains trusted and can explicitly select an interpreter.
 
 ## Invocation Forms
 
@@ -17,7 +17,7 @@ exec = ["curl", "-H", "Authorization: {token}", "{target}"]
 
 ### String Template Form (Legacy)
 
-A single string that is split into argv via a quote-aware splitter before execution. Works for simple cases but can break when validated parameter values contain spaces.
+The trusted template is tokenized before substitution. Values containing spaces remain literal arguments. Standalone mapping/conditional placeholders can expand trusted fragments; those fragments are also tokenized before argument substitution.
 
 ```toml
 [command]
@@ -35,7 +35,7 @@ Both `exec` array elements and `template` strings support `{placeholder}` interp
 ```toml
 [command]
 exec = ["nmap", "{_scan_flags}", "--max-rate", "{max_rate}", "-oX", "{_output_file}", "-v", "{extra_flags}", "{target}"]
-# Or equivalently (legacy):
+# Legacy form expands a standalone mapping into several arguments:
 # template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} -v {extra_flags} {target}"
 ```
 
@@ -46,7 +46,9 @@ exec = ["nmap", "{_scan_flags}", "--max-rate", "{max_rate}", "-oX", "{_output_fi
 | `{_output_file}` | Auto-generated evidence output path | `/evidence/123-nmap/scan.xml` |
 | `{_scan_id}` | Auto-generated scan/invocation ID | `1711929600-12345` |
 | `{_evidence_dir}` | Evidence directory from runtime config | `/evidence` |
-| `{_secret:name}` | Resolved from environment/Vault | (never logged) |
+| `{_secret:name}` | HTTP header/body templates only | Redacted in dry runs; embedding runtime supplies secret policy |
+
+In an `exec` array, each mapping/conditional stays one argument; split flags such as `-sT` and `-sV` into explicit elements when separate flags are required.
 
 Variables prefixed with `_` are injected by the executor, not provided by the agent. The agent only fills parameters declared in `[args]`.
 
@@ -143,16 +145,8 @@ The custom executor receives validated arguments as environment variables:
 | `TOOLCLAD_ARG_TARGET` | Validated `target` arg value |
 | `TOOLCLAD_ARG_PORT` | Validated `port` arg value |
 | `TOOLCLAD_SCAN_ID` | Auto-generated scan ID |
-| `TOOLCLAD_OUTPUT_DIR` | Evidence output directory |
-| `TOOLCLAD_EVIDENCE_DIR` | Root evidence directory |
 
-The escape hatch is for command construction only. All other ToolClad guarantees still apply:
-
-- Parameter validation runs before the executor is called
-- Scope enforcement runs on `scope_target` args
-- Timeout enforcement wraps the executor process
-- Evidence envelope captures the executor's stdout
-- Cedar policy evaluation runs before anything executes
+Custom executors run with validated `TOOLCLAD_ARG_*` values and invocation metadata in a minimal environment. Standalone execution refuses declared approval, Cedar and explicit scope requirements. Wrappers remain trusted code with host permissions; they must handle their input safely. See [Reference Execution](reference-execution.md).
 
 ```bash
 #!/bin/bash
@@ -174,15 +168,15 @@ msfconsole -q -x "
 
 ## Secret Injection
 
-The `{_secret:name}` syntax resolves secrets from environment variables at invocation time. Secrets never appear in the manifest, MCP schema, or LLM context.
+The `{_secret:name}` syntax resolves secrets from environment variables at invocation time. Dry runs do not read secret values. Response bodies can still contain data echoed by an endpoint; output is not universally redacted.
 
 ```toml
 [http]
-url = "https://api.example.com/v1/{endpoint}?key={_secret:api_key}"
+url = "https://api.example.com/v1/{endpoint}"
 headers = { "Authorization" = "Bearer {_secret:bearer_token}" }
 ```
 
-Resolution: `{_secret:api_key}` -> `$TOOLCLAD_SECRET_API_KEY` environment variable. In Symbiont, secrets resolve from Vault/OpenBao.
+Resolution: `{_secret:bearer_token}` -> `$TOOLCLAD_SECRET_BEARER_TOKEN` environment variable. Secret placeholders in URLs are refused. In Symbiont, secrets resolve from Vault/OpenBao.
 
 ## Array-Based Execution
 
@@ -208,17 +202,13 @@ This means:
 
 Even if injection characters somehow pass type validation, they are treated as literal strings by `execve`.
 
-## Process Group Kill on Timeout
+## Process Supervision
 
-Tools are spawned in a new process group (PGID). When `timeout_seconds` is exceeded, the executor sends `SIGTERM` to the entire process group, then `SIGKILL` after a grace period. This kills the tool and all its child processes -- no zombie processes, no orphaned background jobs.
-
-```
-Spawn:   tool PID=1234, PGID=1234
-Timeout: kill(-1234, SIGTERM)  ->  kills PID 1234 and all children
-Grace:   kill(-1234, SIGKILL)  ->  force kill if still alive
-```
+The reference runners bound stdout/stderr and enforce configured process deadlines. They attempt to kill the original process group on timeout and completion. Processes that leave that group are outside this cleanup mechanism. See [Reference Execution](reference-execution.md#processes-and-evidence) for limits and embedding requirements.
 
 ## Full Example: Hydra with Conditionals
+
+This contract requires approval in an embedding runtime. Standalone `test` can preview it; `run` refuses it.
 
 ```toml
 [tool]
@@ -234,6 +224,7 @@ human_approval = true
 position = 1
 required = true
 type = "scope_target"
+block_internal = true
 
 [args.service]
 position = 2
@@ -244,7 +235,6 @@ allowed = ["ssh", "ftp", "http-get", "http-post-form", "smb", "rdp", "mysql", "p
 [args.port]
 type = "port"
 required = false
-default = 0
 
 [args.username]
 type = "string"
@@ -272,10 +262,10 @@ clamp = true
 default = 4
 
 [command]
-template = "hydra {_conditional_flags} -t {threads} {target} {service}"
+template = "hydra {_service_port} {_username_file} {_password_file} {_single_user} {_single_pass} -t {threads} {target} {service}"
 
 [command.conditionals]
-service_port = { when = "port != 0", template = "-s {port}" }
+service_port = { when = "port != ''", template = "-s {port}" }
 username_file = { when = "username_file != ''", template = "-L {username_file}" }
 password_file = { when = "password_file != ''", template = "-P {password_file}" }
 single_user = { when = "username != '' and username_file == ''", template = "-l {username}" }

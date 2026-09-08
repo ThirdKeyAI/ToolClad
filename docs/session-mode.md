@@ -5,6 +5,8 @@ description: Interactive CLI sessions with per-interaction governance
 
 # Session Mode
 
+**Implementation scope:** This chapter describes embedding-runtime contracts. The standalone reference runners do not execute sessions or browsers or supply Symbiont governance services. Confirm support in the deployed runtime; see [Reference Execution](reference-execution.md).
+
 Session mode governs interactive CLI tools -- programs that stay alive across multiple interactions and maintain internal state. Tools like `psql`, `msfconsole`, `redis-cli`, `kubectl exec`, and `gdb` accept commands over time, where each command changes the tool's internal state and carries a different risk level.
 
 ## What Session Mode Solves

@@ -5,6 +5,8 @@ description: Using ToolClad with the Symbiont agentic runtime
 
 # Symbiont Integration
 
+**Implementation scope:** This chapter describes embedding-runtime contracts. The standalone reference runners do not execute sessions or browsers or supply Symbiont governance services. Confirm support in the deployed runtime; see [Reference Execution](reference-execution.md).
+
 ToolClad is the `tools/` directory convention for [Symbiont](https://symbiont.dev). The runtime auto-discovers `.clad.toml` manifests, registers them as MCP tools, wires them into the ORGA reasoning loop, and enforces Cedar policies -- all without writing Rust code.
 
 ## Runtime Discovery

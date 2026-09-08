@@ -238,7 +238,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 
 ## See also
 
-- [API Reference — `executor::execute`](api-reference.md#executorexecutemanifest-args---resultevidenceenvelope) — the synchronous primitive this recipe wraps.
+- [API Reference — `executor::execute`](api-reference.md#executorexecutemanifest-args-resultevidenceenvelope) — the synchronous primitive this recipe wraps.
 - [Output & Evidence](output-evidence.md) — the `EvidenceEnvelope` shape your tool-result messages carry.
 - [Security Model](security-model.md) — argument validation, scope enforcement, and evidence chaining all still apply inside the loop.
 - [Symbiont Integration](symbiont-integration.md) — a concrete runtime that uses this pattern end-to-end.

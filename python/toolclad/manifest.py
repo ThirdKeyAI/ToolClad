@@ -19,6 +19,7 @@ class CedarDef:
 
     resource: str = ""
     action: str = ""
+    _configured: bool = field(default=False, repr=False)
 
 
 @dataclass
@@ -239,6 +240,7 @@ class Manifest:
 
 def _parse_cedar(data: Dict[str, Any]) -> CedarDef:
     return CedarDef(
+        _configured=True,
         resource=data.get("resource", ""),
         action=data.get("action", ""),
     )

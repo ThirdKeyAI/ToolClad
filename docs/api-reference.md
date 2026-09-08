@@ -5,6 +5,8 @@ description: Library API reference for Rust, Python, JavaScript, and Go
 
 # API Reference
 
+For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
+
 ToolClad provides library APIs in four languages. Each implementation supports manifest parsing, argument validation, command construction, execution, and MCP schema generation.
 
 ## Rust
