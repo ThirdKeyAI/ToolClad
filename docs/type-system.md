@@ -2,19 +2,13 @@
 
 For current standalone behavior, refusal conditions and migration changes, see [Reference Execution](reference-execution.md). Policy metadata and type checks do not provide OS containment.
 
-ToolClad provides 14 built-in types (10 core + 4 extended) that cover the validation patterns repeated across tool wrappers. Every type includes injection sanitization by default. Types are designed so that "valid according to the type" means "safe to interpolate into a command."
+ToolClad provides 16 built-in types. Validators constrain argument data; direct argv construction preserves argument boundaries. A valid argument does not establish filesystem, network or interpreter authorization.
 
 ## Injection Sanitization
 
-All string-based types reject shell metacharacters by default:
+`string` rejects its implementation's shell metacharacters. Network and structured types apply their own checks. `literal_text` deliberately preserves punctuation, whitespace and newlines for source files, patches and messages. Select the type that describes the tool's data contract.
 
-```
-Blocked characters: ; | & $ ` ( ) { } [ ] < > ! \n \r
-```
-
-Newline injection (`\n`, `\r`) is blocked on all string-based types. This prevents argument splitting, header injection, and command chaining. The command is never constructed if validation fails.
-
-Even if injection characters somehow passed type validation, array-based execution (`execve`, no `sh -c`) treats them as literal strings. Injection sanitization is the first defense layer; direct `execve` is the second.
+Commands are tokenized before substitution and executed without a shell. A manifest that intentionally invokes an interpreter or passes data to an executable's code-evaluation option still authorizes that behavior. Use the embedding runtime's policy and sandbox to control those effects.
 
 ---
 
@@ -22,14 +16,14 @@ Even if injection characters somehow passed type validation, array-based executi
 
 ### `string`
 
-General-purpose text. Optionally constrained by regex `pattern`. When `sanitize = ["injection"]` is set, shell metacharacters are explicitly rejected. Without explicit sanitization, strings are still validated against any declared `pattern`.
+General-purpose filtered text, optionally constrained by regex `pattern`. Shell metacharacters are rejected even without explicit `sanitize = ["injection"]`. Use `literal_text` when whitespace and punctuation must be retained.
 
 **Validation rules:**
 
-- Trim whitespace
-- If `sanitize = ["injection"]`, reject shell metacharacters
+- Rust trims whitespace; the other reference validators preserve it
+- Reject the implementation's shell metacharacters
 - If `pattern` is declared, value must match the regex
-- Empty strings are allowed unless `required = true` and no `default` is set
+- The execution layer rejects empty or whitespace-only required `string` values, including defaults
 
 ```toml
 [args.name]
@@ -46,6 +40,30 @@ description = "Metasploit module path"
 **Valid:** `hello-world`, `exploit/windows/smb/ms17_010`
 
 **Rejected:** `hello; rm -rf /` (injection), `$(whoami)` (injection), `Hello123` (pattern mismatch for `^[a-z]+$`)
+
+### `literal_text`
+
+Exact UTF-8 text for source content, patches, messages and other data arguments.
+
+- Accept only strings containing valid Unicode scalar values; reject invalid UTF-8 or unpaired surrogate values where the language can represent them.
+- Preserve text exactly, including empty strings, whitespace, newlines, quotes, shell punctuation and template-looking text. No trimming, Unicode normalization or metacharacter sanitization applies.
+- Reject NUL and values exceeding **32,768 UTF-8 bytes**. For example, 8,192 four-byte characters fit; 8,193 do not.
+- An optional `pattern` searches the original text. Anchor the pattern when a whole-value match is required. Use regex syntax supported by all target implementations; Rust/Go and Python/JavaScript use different regex engines.
+- `required = true` requires a supplied value or a validated default; an explicit empty string satisfies it. Defaults must also be strings. Custom-type validation helpers accept `base = "literal_text"`.
+
+```toml
+[args.content]
+type = "literal_text"
+required = true
+description = "Exact document content, at most 32768 UTF-8 bytes"
+
+[command]
+exec = ["document-writer", "--content", "{content}"]
+```
+
+The command is illustrative: the manifest author chooses and authorizes the actual writer. A value such as `$(command); {other}` remains a single data argument and is never recursively expanded. The selected executable can still interpret its argument as options, code or a query. `literal_text` does not grant interpreter execution or bypass approval, Cedar, scope or sandbox requirements.
+
+MCP schemas expose a string, `maxLength = 32768`, a NUL exclusion and the declared pattern. The `x-toolclad-max-utf8-bytes = 32768` annotation records the byte limit. JSON Schema's character limit cannot enforce the stricter byte limit by itself; the runtime validator remains authoritative.
 
 ### `integer`
 
@@ -356,11 +374,11 @@ Custom types inherit all validation behavior from their `base` type, plus any ad
 |------------|-----------|----------|
 | `min` / `max` | `integer` | Bounds checking |
 | `clamp` | `integer` | Clamp to range instead of rejecting |
-| `pattern` | `string`, `regex_match` | Regex validation |
+| `pattern` | `string`, `literal_text`, `regex_match` | Regex validation |
 | `allowed` | `enum` | Exhaustive value list |
 | `schemes` | `url` | Restrict URL schemes |
 | `scope_check` | `url` | Extract host for scope validation |
-| `sanitize` | all string-based | Explicit injection sanitization |
+| `sanitize` | filtered string types | Explicit injection sanitization; not applied to `literal_text` |
 | `default` | any | Value when parameter not provided |
 
 ## Validation Error Examples

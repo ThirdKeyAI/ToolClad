@@ -285,6 +285,12 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
 
         // Map ToolClad types to JSON Schema types with constraints.
         match def.type_name.as_str() {
+            "literal_text" => {
+                prop.insert("type".into(), serde_json::json!("string"));
+                prop.insert("maxLength".into(), serde_json::json!(32768));
+                prop.insert("x-toolclad-max-utf8-bytes".into(), serde_json::json!(32768));
+                prop.insert("not".into(), serde_json::json!({"pattern": "\u{0000}"}));
+            }
             "integer" => {
                 prop.insert("type".to_string(), serde_json::json!("integer"));
             }

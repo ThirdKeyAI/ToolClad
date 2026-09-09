@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 )
@@ -64,6 +65,7 @@ type typeHandler func(def *manifest.ArgDef, value string) (string, error)
 
 var typeHandlers = map[string]typeHandler{
 	"string":          validateString,
+	"literal_text":    validateLiteralText,
 	"integer":         validateInteger,
 	"number":          validateNumber,
 	"port":            validatePort,
@@ -108,6 +110,25 @@ func validateString(def *manifest.ArgDef, value string) (string, error) {
 		}
 		if !re.MatchString(value) {
 			return "", newErr(def.Name, fmt.Sprintf("value %q does not match pattern: %s", value, def.Pattern))
+		}
+	}
+	return value, nil
+}
+
+func validateLiteralText(def *manifest.ArgDef, value string) (string, error) {
+	if !utf8.ValidString(value) {
+		return "", newErr(def.Name, "literal_text requires valid UTF-8")
+	}
+	if len(value) > 32768 || strings.ContainsRune(value, 0) {
+		return "", newErr(def.Name, "literal_text must contain no NUL and at most 32768 UTF-8 bytes")
+	}
+	if def.Pattern != "" {
+		re, err := regexp.Compile(def.Pattern)
+		if err != nil {
+			return "", newErr(def.Name, "invalid literal_text pattern")
+		}
+		if !re.MatchString(value) {
+			return "", newErr(def.Name, "literal_text does not match pattern")
 		}
 	}
 	return value, nil

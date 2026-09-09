@@ -85,7 +85,7 @@ npm install toolclad           # JavaScript / npm
 Each implementation provides:
 
 - **Manifest parsing** -- load and validate `.clad.toml` files (oneshot, session, browser modes)
-- **14 built-in type validators** -- all with injection sanitization, plus custom types via `toolclad.toml`
+- **16 built-in type validators** -- type-specific validation and literal argv dispatch, plus custom types via `toolclad.toml`
 - **Command construction** -- template interpolation with mappings, conditionals, defaults
 - **Execution** -- direct argv dispatch, real timeout enforcement with process group kill, SHA-256 evidence hashing
 - **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
@@ -116,6 +116,7 @@ cd go && go run ./cmd/toolclad test ../examples/whois_lookup.clad.toml --arg tar
 
 | Type | Validates | Examples |
 |------|-----------|---------|
+| `literal_text` | Exact UTF-8, no NUL, at most 32,768 bytes; optional pattern | Source content, patches, messages |
 | `string` | Non-empty, injection-safe, optional regex `pattern` | General text |
 | `integer` | Numeric, optional `min`/`max` with `clamp` | Thread counts |
 | `number` | Float, optional `min_float`/`max_float` with `clamp`; rejects NaN/inf | Confidence scores, ratios |

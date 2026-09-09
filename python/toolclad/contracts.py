@@ -20,6 +20,8 @@ def validate_arguments(manifest, args):
     for name, definition in manifest.args.items():
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
             raise ValidationError(f"Invalid argument name: {name}")
+        if definition.type == "literal_text" and name in args and not isinstance(args[name], str):
+            raise ValidationError(f"literal_text requires a string: {name}")
         value = args.get(name, definition.default)
         if value is None:
             value = manifest.command.defaults.get(name)
@@ -27,8 +29,10 @@ def validate_arguments(manifest, args):
             if definition.required:
                 raise ValidationError(f"Missing required argument: '{name}'")
             continue
+        if definition.type == "literal_text" and not isinstance(value, str):
+            raise ValidationError(f"literal_text requires a string: {name}")
         value = str(value).lower() if isinstance(value, bool) else str(value)
-        if "\0" in value or (definition.required and not value.strip()):
+        if "\0" in value or (definition.required and definition.type != "literal_text" and not value.strip()):
             raise ValidationError(f"Invalid empty or NUL argument: {name}")
         resolved[name] = validate_arg(definition, value)
     if sum(len(v.encode()) for v in resolved.values()) > MAX_REQUEST_BYTES:
@@ -61,7 +65,7 @@ def child_environment():
     return {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT") if k in os.environ}
 
 
-def template_argv(template, values, fragments):
+def template_argv(template, values, fragments, present=()):
     """Only manifest-owned fragments may introduce argument boundaries."""
     def substitute(text):
         return TOKEN.sub(lambda m: str(values.get(m[1], m[0])), text)
@@ -72,7 +76,7 @@ def template_argv(template, values, fragments):
             argv.extend(substitute(part) for part in shlex.split(fragments[match[1]]))
         else:
             value = substitute(token)
-            if value or not token:
+            if value or not token or any(m[1] in present for m in TOKEN.finditer(token)):
                 argv.append(value)
     if not argv or not argv[0]:
         raise ValueError("Command produced empty argv")

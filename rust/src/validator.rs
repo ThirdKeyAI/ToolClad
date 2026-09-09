@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 /// Supported argument types for validation.
 pub const SUPPORTED_TYPES: &[&str] = &[
     "string",
+    "literal_text",
     "integer",
     "number",
     "port",
@@ -44,6 +45,17 @@ static URL_RE: LazyLock<Regex> =
 ///
 /// Returns the (possibly transformed) value on success, or a validation error.
 pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, ToolCladError> {
+    // Literal text is data: validate before any trimming or metacharacter filter.
+    if def.type_name == "literal_text" {
+        if value.len() > 32_768 || value.contains('\0') {
+            return Err(ToolCladError::ValidationError(format!(
+                "argument '{name}' literal_text must contain no NUL and at most 32768 UTF-8 bytes"
+            )));
+        }
+        let mut literal = def.clone();
+        literal.sanitize = None;
+        return validate_string(name, &literal, value, false);
+    }
     let val = value.trim();
 
     // Network-shaped types (hostname, URL, IP, CIDR) reject leading/trailing
@@ -370,9 +382,9 @@ fn always_blocked_ip_reason(ip: &IpAddr) -> Option<&'static str> {
         IpAddr::V6(a) => a.to_ipv4_mapped(),
     };
     if let Some(a) = v4 {
-        return a
-            .is_link_local()
-            .then_some("is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked");
+        return a.is_link_local().then_some(
+            "is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked",
+        );
     }
     if let IpAddr::V6(a) = ip {
         if (a.segments()[0] & 0xffc0) == 0xfe80 {
@@ -881,11 +893,11 @@ mod tests {
         // pass as canonical IPs or sneak through as "hostnames".
         let def = make_arg("scope_target");
         for v in [
-            "2130706433",  // decimal integer
-            "0x7f000001",  // hex
-            "0177.0.0.1",  // octal-leading
-            "127.1",       // shorthand
-            "010.0.0.1",   // leading-zero octet
+            "2130706433", // decimal integer
+            "0x7f000001", // hex
+            "0177.0.0.1", // octal-leading
+            "127.1",      // shorthand
+            "010.0.0.1",  // leading-zero octet
         ] {
             assert!(validate_arg("t", &def, v).is_err(), "should reject {v}");
         }
@@ -936,7 +948,12 @@ mod tests {
     #[test]
     fn test_scope_target_blocks_metadata_unconditionally() {
         let def = make_arg("scope_target"); // block_internal = false
-        for v in ["169.254.169.254", "169.254.0.1", "::ffff:169.254.169.254", "fe80::1"] {
+        for v in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "::ffff:169.254.169.254",
+            "fe80::1",
+        ] {
             let err = validate_arg("t", &def, v).unwrap_err().to_string();
             assert!(err.contains("always blocked"), "{v} -> {err}");
         }
@@ -949,7 +966,7 @@ mod tests {
             "127.0.0.1",
             "10.0.0.5",
             "192.168.1.1",
-            "169.254.169.254",  // IMDS (always-block path)
+            "169.254.169.254", // IMDS (always-block path)
             "0.0.0.0",
             "::1",
             "::ffff:127.0.0.1", // v4-mapped loopback must be unwrapped
@@ -980,7 +997,11 @@ mod tests {
         assert!(validate_arg("u", &public, "http://xn--example-9c.com/").is_err());
         // loopback allowed only when block_internal is off
         assert!(validate_arg("u", &public, "http://127.0.0.1/").is_ok());
-        let blocking = ArgDef { type_name: "url".to_string(), block_internal: true, ..Default::default() };
+        let blocking = ArgDef {
+            type_name: "url".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
         assert!(validate_arg("u", &blocking, "http://127.0.0.1/").is_err());
         assert!(validate_arg("u", &blocking, "http://10.0.0.5/x").is_err());
     }

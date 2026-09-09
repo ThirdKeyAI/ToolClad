@@ -242,3 +242,9 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 - [Output & Evidence](output-evidence.md) — the `EvidenceEnvelope` shape your tool-result messages carry.
 - [Security Model](security-model.md) — argument validation, scope enforcement, and evidence chaining all still apply inside the loop.
 - [Symbiont Integration](symbiont-integration.md) — a concrete runtime that uses this pattern end-to-end.
+
+## Supplying exact text
+
+Declare source content, patches or messages as `literal_text` when whitespace and punctuation must survive unchanged. Submit the original string; do not add shell quoting or escape template-looking tokens. An empty string is valid when content should be empty. The runtime rejects NUL, invalid Unicode and more than 32,768 UTF-8 bytes.
+
+Generated MCP schemas retain the declared pattern and advertise the character ceiling plus `x-toolclad-max-utf8-bytes`. Client-side schema validation cannot replace the runtime byte check or the embedding runtime's effect authorization. See [literal_text](type-system.md#literal_text).

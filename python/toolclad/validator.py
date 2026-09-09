@@ -42,6 +42,25 @@ def _validate_string(arg_def: ArgDef, value: str) -> str:
     return value
 
 
+def _validate_literal_text(arg_def: ArgDef, value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError("literal_text requires a string")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValidationError("literal_text requires valid UTF-8") from exc
+    if size > 32768 or "\0" in value:
+        raise ValidationError("literal_text must contain no NUL and at most 32768 UTF-8 bytes")
+    if arg_def.pattern is not None:
+        try:
+            matches = re.search(arg_def.pattern, value)
+        except re.error as exc:
+            raise ValidationError("Invalid literal_text pattern") from exc
+        if not matches:
+            raise ValidationError("literal_text does not match pattern")
+    return value
+
+
 def _validate_integer(arg_def: ArgDef, value: str) -> str:
     try:
         num = int(value)
@@ -322,6 +341,7 @@ def _validate_regex_match(arg_def: ArgDef, value: str) -> str:
 # Registry of type handlers.
 _TYPE_HANDLERS = {
     "string": _validate_string,
+    "literal_text": _validate_literal_text,
     "integer": _validate_integer,
     "number": _validate_number,
     "port": _validate_port,
@@ -354,7 +374,7 @@ def validate_arg(arg_def: ArgDef, value: Any) -> str:
     Raises:
         ValidationError: If the value fails validation.
     """
-    str_value = str(value)
+    str_value = value if arg_def.type == "literal_text" else str(value)
 
     handler = _TYPE_HANDLERS.get(arg_def.type)
     if handler is None:
@@ -400,7 +420,7 @@ def validate_arg_with_custom_types(
             schemes=arg_def.schemes,
             scope_check=arg_def.scope_check,
         )
-        return handler(synthetic, str(value))
+        return validate_arg(synthetic, value)
 
     # Not a custom type, use standard validation
     return validate_arg(arg_def, value)

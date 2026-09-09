@@ -95,6 +95,11 @@ def _mcp_type_and_constraints(arg) -> Tuple[str, dict]:
     """Return (json_schema_type, extra_constraints) for an arg."""
     t = arg.type
     extra: dict = {}
+    if t == "literal_text":
+        extra = {"maxLength": 32768, "x-toolclad-max-utf8-bytes": 32768, "not": {"pattern": "\0"}}
+        if arg.pattern is not None:
+            extra["pattern"] = arg.pattern
+        return "string", extra
     if t == "integer":
         return "integer", extra
     if t == "number":

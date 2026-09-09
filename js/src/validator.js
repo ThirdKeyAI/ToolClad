@@ -38,6 +38,7 @@ export function validateArg(argDef, value) {
 
 const TYPE_HANDLERS = {
   string: validateString,
+  literal_text: validateLiteralText,
   integer: validateInteger,
   number: validateNumber,
   port: validatePort,
@@ -69,6 +70,19 @@ function validateString(argDef, value) {
     }
   }
   return str;
+}
+
+function validateLiteralText(argDef, value) {
+  if (typeof value !== "string") throw new Error("literal_text requires a string");
+  // In Unicode mode, valid surrogate pairs are one code point; lone halves match.
+  if (/[\uD800-\uDFFF]/u.test(value)) throw new Error("literal_text requires valid UTF-8");
+  if (Buffer.byteLength(value, "utf8") > 32768 || value.includes("\0")) {
+    throw new Error("literal_text must contain no NUL and at most 32768 UTF-8 bytes");
+  }
+  if (argDef.pattern !== undefined && !new RegExp(argDef.pattern).test(value)) {
+    throw new Error("literal_text does not match pattern");
+  }
+  return value;
 }
 
 function validateInteger(argDef, value) {

@@ -44,9 +44,14 @@ func ValidateArguments(m *manifest.Manifest, args map[string]string) (map[string
 				}
 				continue
 			}
+			if def.Type == "literal_text" {
+				if _, ok := fallback.(string); !ok {
+					return nil, fmt.Errorf("literal_text default must be a string: %s", name)
+				}
+			}
 			value = fmt.Sprint(fallback)
 		}
-		if strings.ContainsRune(value, 0) || (def.Required && strings.TrimSpace(value) == "") {
+		if strings.ContainsRune(value, 0) || (def.Required && def.Type != "literal_text" && strings.TrimSpace(value) == "") {
 			return nil, fmt.Errorf("invalid empty or NUL argument: %s", name)
 		}
 		clean, err := validator.ValidateArg(def, value)
@@ -218,7 +223,7 @@ func commandFragments(m *manifest.Manifest, values map[string]string) map[string
 	return result
 }
 
-func templateArgv(template string, values, fragments map[string]string) ([]string, error) {
+func templateArgv(template string, values, fragments map[string]string, present map[string]bool) ([]string, error) {
 	tokens, err := splitTemplate(template)
 	if err != nil {
 		return nil, err
@@ -239,7 +244,11 @@ func templateArgv(template string, values, fragments map[string]string) ([]strin
 			}
 		}
 		value := interpolateString(token, values)
-		if value != "" || token == "" {
+		keepEmpty := false
+		for _, match := range tokenPattern.FindAllStringSubmatch(token, -1) {
+			keepEmpty = keepEmpty || present[match[1]]
+		}
+		if value != "" || token == "" || keepEmpty {
 			argv = append(argv, value)
 		}
 	}

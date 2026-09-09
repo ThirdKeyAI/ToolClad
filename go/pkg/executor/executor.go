@@ -37,10 +37,14 @@ type EvidenceEnvelope struct {
 
 // resolveVars validates arguments and resolves all template variables (args,
 // defaults, mappings) into a single interpolation context.
-func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]string, error) {
+func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]string, map[string]bool, error) {
 	cleaned, err := ValidateArguments(m, args)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	present := make(map[string]bool)
+	for name := range cleaned {
+		present[name] = true
 	}
 	for name := range m.Args {
 		if _, ok := cleaned[name]; !ok {
@@ -66,7 +70,7 @@ func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]strin
 	cleaned["_scan_id"] = scanID
 	cleaned["_evidence_dir"] = evidenceDir
 	cleaned["_output_file"] = filepath.Join(evidenceDir, scanID+"-output")
-	return cleaned, nil
+	return cleaned, present, nil
 }
 
 // BuildCommandArgv builds an argv array from the manifest's exec field.
@@ -78,7 +82,7 @@ func BuildCommandArgv(m *manifest.Manifest, args map[string]string) ([]string, e
 		return nil, fmt.Errorf("manifest %q has no exec array", m.Tool.Name)
 	}
 
-	cleaned, err := resolveVars(m, args)
+	cleaned, _, err := resolveVars(m, args)
 	if err != nil {
 		return nil, err
 	}
@@ -99,15 +103,15 @@ func BuildCommandArgv(m *manifest.Manifest, args map[string]string) ([]string, e
 // It returns the fully constructed command string ready for execution.
 // For new manifests, prefer BuildCommandArgv with the exec array format.
 func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) {
-	cleaned, err := resolveVars(m, args)
+	cleaned, present, err := resolveVars(m, args)
 	if err != nil {
 		return "", err
 	}
-	argv, err := preparedArgv(m, cleaned)
+	argv, err := preparedArgv(m, cleaned, present)
 	return displayArgv(argv), err
 }
 
-func preparedArgv(m *manifest.Manifest, vars map[string]string) ([]string, error) {
+func preparedArgv(m *manifest.Manifest, vars map[string]string, present map[string]bool) ([]string, error) {
 	if m.Command.Executor != "" {
 		return []string{m.Command.Executor}, nil
 	}
@@ -121,7 +125,7 @@ func preparedArgv(m *manifest.Manifest, vars map[string]string) ([]string, error
 		}
 		return argv, nil
 	}
-	return templateArgv(m.Command.Template, vars, commandFragments(m, vars))
+	return templateArgv(m.Command.Template, vars, commandFragments(m, vars), present)
 }
 
 func shellSplit(command string) []string { argv, _ := splitTemplate(command); return argv }
@@ -154,12 +158,12 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	}
 
 	start := time.Now()
-	vars, err := resolveVars(m, args)
+	vars, present, err := resolveVars(m, args)
 	if err != nil {
 		return nil, err
 	}
 	scanID := vars["_scan_id"]
-	cmdArgs, err := preparedArgv(m, vars)
+	cmdArgs, err := preparedArgv(m, vars, present)
 	if err != nil {
 		return nil, err
 	}
@@ -726,6 +730,9 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 				prop["maximum"] = *arg.MaxFloat
 			}
 		}
+		if arg.Type == "literal_text" && arg.Pattern != "" {
+			prop["pattern"] = arg.Pattern
+		}
 		prop["description"] = arg.Description
 		if len(arg.Allowed) > 0 {
 			prop["enum"] = arg.Allowed
@@ -779,6 +786,8 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 // mcpTypeConstraints maps ToolClad types to JSON Schema type and constraints for MCP.
 func mcpTypeConstraints(t string) map[string]any {
 	switch t {
+	case "literal_text":
+		return map[string]any{"type": "string", "maxLength": 32768, "x-toolclad-max-utf8-bytes": 32768, "not": map[string]any{"pattern": "\x00"}}
 	case "integer":
 		return map[string]any{"type": "integer"}
 	case "number":

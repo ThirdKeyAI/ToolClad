@@ -199,7 +199,7 @@ Error: Argument validation failed
   target: injection characters detected (;) in scope_target value
 ```
 
-Shell metacharacters (`` ; | & $ ` ( ) { } [ ] < > ! \n \r ``) are rejected by default on all string-based types. The command is never constructed, let alone executed.
+Shell metacharacters (`` ; | & $ ` ( ) { } [ ] < > ! \n \r ``) are rejected by the `string` validator. Use [`literal_text`](type-system.md#literal_text) for exact content that must retain punctuation and newlines; its UTF-8, NUL and byte-limit checks still apply. The command is never constructed, let alone executed.
 
 ## A More Complex Example
 

@@ -178,6 +178,149 @@
       "args": {},
       "expected_argv": [],
       "error": true
+    },
+    {
+      "name": "literal_text_source",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {
+        "value": " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n"
+      },
+      "expected_argv": [
+        "echo",
+        " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n"
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_empty",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {
+        "value": ""
+      },
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_space",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {
+        "value": " \t\n"
+      },
+      "expected_argv": [
+        "echo",
+        " \t\n"
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_exec_empty",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\nexec=[\"echo\",\"{value}\"]\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {
+        "value": ""
+      },
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_default_empty",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\ndefault=\"\"\n",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_command_default_empty",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[command.defaults]\nvalue=\"\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_missing_required",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": true
+    },
+    {
+      "name": "literal_text_omitted_optional",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\n\n",
+      "args": {},
+      "expected_argv": [
+        "echo"
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_pattern",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\npattern=\"message\"\n",
+      "args": {
+        "value": " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n"
+      },
+      "expected_argv": [
+        "echo",
+        " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n"
+      ],
+      "error": false
+    },
+    {
+      "name": "literal_text_pattern_denied",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\npattern=\"^no$\"\n",
+      "args": {
+        "value": " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n"
+      },
+      "expected_argv": [
+        "echo",
+        " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n"
+      ],
+      "error": true
+    },
+    {
+      "name": "literal_text_nul",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {
+        "value": "a\u0000b"
+      },
+      "expected_argv": [
+        "echo",
+        "a\u0000b"
+      ],
+      "error": true
+    },
+    {
+      "name": "literal_text_numeric_default",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[args.value]\ntype=\"literal_text\"\ndefault=123\n",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": true
+    },
+    {
+      "name": "literal_text_numeric_command_default",
+      "manifest": "[tool]\nname = \"contract_fixture\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"Execution contract regression fixture\"\ntimeout_seconds = 2\n[output]\nformat = \"text\"\n[command]\ntemplate=\"echo {value}\"\n[command.defaults]\nvalue=123\n[args.value]\ntype=\"literal_text\"\nrequired=true\n",
+      "args": {},
+      "expected_argv": [
+        "echo",
+        ""
+      ],
+      "error": true
     }
   ]
 }

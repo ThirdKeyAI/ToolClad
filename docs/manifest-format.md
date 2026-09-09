@@ -94,7 +94,7 @@ Each parameter is a TOML table under `[args]`:
 [args.target]
 position = 1              # Positional index in the command template
 required = true            # Is this parameter mandatory?
-type = "scope_target"      # One of 14 built-in types or a custom type
+type = "scope_target"      # One of 16 built-in types or a custom type
 description = "Target CIDR, IP, or hostname"
 
 [args.scan_type]
@@ -138,7 +138,7 @@ required = false
 | `description` | string | Human-readable description (included in MCP schema) |
 | `default` | any | Default value when parameter is not provided |
 | `allowed` | array | Valid values for `enum` type |
-| `pattern` | string | Regex constraint for `string` and `regex_match` types |
+| `pattern` | string | Regex constraint for `string`, `literal_text` and `regex_match` types |
 | `sanitize` | array | Sanitization rules: `["injection"]` |
 | `min` | number | Minimum for `integer` type |
 | `max` | number | Maximum for `integer` type |

@@ -307,3 +307,9 @@ The Symbiont runtime includes specialized executors for stateful modes:
 - **BrowserExecutor**: CDP-direct WebSocket, persistent daemon per tab, live browser attachment, accessibility tree extraction, page state inference, redirect interception, screenshot evidence
 
 Both executors plug into the same ORGA loop and Cedar policy infrastructure as oneshot tools. The governance model is identical; only the transport differs.
+
+## Literal content arguments
+
+The four reference validators now share Symbiont's `literal_text` contract: exact UTF-8, no NUL, at most 32,768 bytes and an optional pattern over the original text. Use it for document/source content and patches that must retain punctuation and newlines. Required empty content is valid; omitted required content fails.
+
+Use fixed manifest-owned argv slots for these values. ToolClad validates the data contract; Symbiont binds the prepared call to its principal, policy, approval, audit and selected execution boundary. Permitting literal content does not permit the child to choose a shell or interpreter. Standalone reference runners still refuse approval, Cedar and explicit scope requirements. See [Reference Execution](reference-execution.md).

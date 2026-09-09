@@ -22,11 +22,13 @@ The CLI interface retains the same four commands. There is no new graphical UI. 
 
 ## Arguments and templates
 
-All supplied names must be declared in `[args]`. Duplicate CLI names, empty names, missing or empty required values and NUL bytes are refused. Defaults in argument definitions, and command defaults referring to declared arguments, pass through the same validators as supplied values. Argument defaults take precedence over command defaults. Clamping applies to defaults as well as supplied values. Generated MCP input schemas set `additionalProperties = false`.
+All supplied names must be declared in `[args]`. Duplicate CLI names, empty names, missing required values and NUL bytes are refused. Required values must be nonempty except for `literal_text`, where an explicit empty string is valid. Defaults in argument definitions, and command defaults referring to declared arguments, pass through the same validators as supplied values. Argument defaults take precedence over command defaults. Clamping applies to defaults as well as supplied values. Generated MCP input schemas set `additionalProperties = false`.
+
+`literal_text` preserves source text, patches and messages exactly: valid UTF-8, no NUL, at most 32,768 bytes, with optional `pattern` validation. It permits shell punctuation as argument data. It does not authorize the executable to evaluate that data or waive any execution requirement. See [Type System](type-system.md#literal_text).
 
 Use `exec = ["tool", "--label", "{label}"]` for literal argument arrays. Every element remains one argument, including an empty element. Values still have to pass their declared validators.
 
-Legacy templates are tokenized **before** argument substitution. For `template = "tool --label {label}"`, the value `alpha --extra` remains one label argument. An omitted optional placeholder can disappear from a legacy template. A literal quoted empty argument remains empty.
+Legacy templates are tokenized **before** argument substitution. For `template = "tool --label {label}"`, the value `alpha --extra` remains one label argument. An omitted optional placeholder can disappear from a legacy template. A supplied or defaulted empty value remains one empty argument, as does a literal quoted empty argument. This preserves the distinction between missing data and empty content.
 
 Only a standalone placeholder for a trusted mapping or conditional fragment can expand into several legacy-template arguments. Those fragments are tokenized before their argument values are inserted. For example, `_scan_flags` is the short alias for the mapping on `scan_type`. Generic aliases are `_<argument>` and `_<argument>_flags`. In an explicit `exec` array, a fragment remains one element; `"-sT -sV"` does **not** become two flags.
 
@@ -62,7 +64,7 @@ Evidence envelopes and SHA-256 output hashes are diagnostic records, **not signe
 
 ## Validation
 
-`tests/execution_vectors.json` supplies common argument/argv cases to all four language suites. `tests/e2e_cli.py` launches all four shipping CLIs against temporary process fixtures and loopback HTTP servers. It checks expected exits and actual effects, uses synthetic secrets, includes proxy/redirect traps, and records planned/executed cases plus source/executable hashes before and after the run.
+`tests/literal_text_vectors.json` checks exact text, byte limits, patterns and custom-type validation. `tests/execution_vectors.json` supplies common argument/argv cases to all four language suites. `tests/e2e_cli.py` launches all four shipping CLIs against temporary process fixtures and loopback HTTP servers. It checks expected exits and actual effects, including literal-text argv/body round trips, empty values, pre-effect refusals and a temporary shell-effect canary, uses synthetic secrets, includes proxy/redirect traps, and records planned/executed cases plus source/executable hashes before and after the run.
 
 ```bash
 CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/tmp/toolclad-target cargo build --manifest-path rust/Cargo.toml

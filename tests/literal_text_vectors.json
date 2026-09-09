@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "empty",
+      "value": "",
+      "repeat": 1,
+      "error": false,
+      "pattern": null
+    },
+    {
+      "name": "whitespace",
+      "value": " \t\r\n",
+      "repeat": 1,
+      "error": false,
+      "pattern": null
+    },
+    {
+      "name": "source",
+      "value": " \t{\"message\": \"héllo 🌍\", \"code\": \"$(touch trap); `id` | & <> [] !\"}\n{other} {_secret:token}\\'\"\r\n",
+      "repeat": 1,
+      "error": false,
+      "pattern": null
+    },
+    {
+      "name": "ascii_limit",
+      "value": "a",
+      "repeat": 32768,
+      "error": false,
+      "pattern": null
+    },
+    {
+      "name": "ascii_over",
+      "value": "a",
+      "repeat": 32769,
+      "error": true,
+      "pattern": null
+    },
+    {
+      "name": "unicode_limit",
+      "value": "🌍",
+      "repeat": 8192,
+      "error": false,
+      "pattern": null
+    },
+    {
+      "name": "unicode_over",
+      "value": "🌍",
+      "repeat": 8193,
+      "error": true,
+      "pattern": null
+    },
+    {
+      "name": "nul",
+      "value": "before\u0000after",
+      "repeat": 1,
+      "error": true,
+      "pattern": null
+    },
+    {
+      "name": "pattern_search",
+      "value": "prefix valid suffix",
+      "repeat": 1,
+      "error": false,
+      "pattern": "valid"
+    },
+    {
+      "name": "pattern_exact",
+      "value": " code\n",
+      "repeat": 1,
+      "error": false,
+      "pattern": "^ code\\n$"
+    },
+    {
+      "name": "pattern_denied",
+      "value": " code\n",
+      "repeat": 1,
+      "error": true,
+      "pattern": "^code$"
+    },
+    {
+      "name": "pattern_invalid",
+      "value": "x",
+      "repeat": 1,
+      "error": true,
+      "pattern": "["
+    }
+  ]
+}

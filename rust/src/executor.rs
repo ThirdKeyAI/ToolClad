@@ -5,7 +5,7 @@ use crate::contracts::{
 use crate::types::{EvidenceEnvelope, Manifest, ToolCladError};
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -204,7 +204,7 @@ pub fn build_command_argv(
         .as_ref()
         .ok_or_else(|| ToolCladError::CommandError("no exec array in manifest".to_string()))?;
 
-    let vars = resolve_vars(manifest, args)?;
+    let (vars, _) = resolve_vars(manifest, args)?;
 
     let argv: Vec<String> = exec
         .iter()
@@ -231,11 +231,11 @@ pub fn build_command(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<String, ToolCladError> {
-    let vars = resolve_vars(manifest, args)?;
+    let (vars, present) = resolve_vars(manifest, args)?;
     let argv = if manifest.command.exec.is_some() {
         build_command_argv(manifest, args)?
     } else {
-        template_argv(manifest, &vars)?
+        template_argv(manifest, &vars, &present)?
     };
     Ok(display_argv(&argv))
 }
@@ -291,6 +291,7 @@ fn command_fragments(
 fn template_argv(
     manifest: &Manifest,
     vars: &HashMap<String, String>,
+    present: &HashSet<String>,
 ) -> Result<Vec<String>, ToolCladError> {
     let template = manifest
         .command
@@ -303,6 +304,7 @@ fn template_argv(
             .ok_or_else(|| ToolCladError::CommandError("unclosed command quote or escape".into()))
     };
     let mut argv = Vec::new();
+    let placeholder = Regex::new(r"\{(\w+)\}").unwrap();
     for token in split(template)? {
         if let Some(fragment) = token
             .strip_prefix('{')
@@ -314,7 +316,12 @@ fn template_argv(
             }
         } else {
             let value = interpolate_template(&token, vars);
-            if !value.is_empty() || token.is_empty() {
+            if !value.is_empty()
+                || token.is_empty()
+                || placeholder
+                    .captures_iter(&token)
+                    .any(|c| present.contains(&c[1]))
+            {
                 argv.push(value);
             }
         }
@@ -331,8 +338,9 @@ fn template_argv(
 fn resolve_vars(
     manifest: &Manifest,
     args: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, ToolCladError> {
+) -> Result<(HashMap<String, String>, HashSet<String>), ToolCladError> {
     let mut vars = validate_arguments(manifest, args)?;
+    let present = vars.keys().cloned().collect();
     for name in manifest.args.keys() {
         vars.entry(name.clone()).or_default();
     }
@@ -366,7 +374,7 @@ fn resolve_vars(
         vars.insert(key, fragment);
     }
 
-    Ok(vars)
+    Ok((vars, present))
 }
 
 /// Interpolate `{placeholder}` references in a template string.
@@ -721,7 +729,7 @@ pub fn execute(
         ));
     }
 
-    let vars = resolve_vars(manifest, &validated)?;
+    let (vars, present) = resolve_vars(manifest, &validated)?;
     let scan_id = vars["_scan_id"].clone();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
@@ -758,7 +766,7 @@ pub fn execute(
 
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
         } else {
-            let argv = template_argv(manifest, &vars)?;
+            let argv = template_argv(manifest, &vars, &present)?;
             let cmd_string = display_argv(&argv);
             let mut cmd = Command::new(&argv[0]);
             child_environment(&mut cmd);

@@ -18,7 +18,7 @@
 ToolClad provides:
 
 - **Manifest parsing** — Load and validate `.clad.toml` tool interface contracts (oneshot, session, browser modes)
-- **Argument validation** — 15 built-in type validators (incl. `number` and ASCII-strict `scope_target` with IDN/punycode rejection) with shell injection sanitization, plus custom types via `toolclad.toml`
+- **Argument validation** — 16 built-in type validators (incl. `number` and ASCII-strict `scope_target` with IDN/punycode rejection) with type-specific validation and exact `literal_text` arguments, plus custom types via `toolclad.toml`
 - **Dispatch modes** — `tool.dispatch = "exec"` (default) runs an execution backend; `dispatch = "callback"` is a validator-only embedding for in-process tool dispatch (no `[output]`/backend required)
 - **Backend contracts** — Command and HTTP reference execution; MCP previews; PTY session and browser execution require an embedding runtime
 - **HTTP backend** — REST/GraphQL API tools with `{_secret:name}` template variable injection

@@ -140,7 +140,7 @@ export function buildCommand(manifest, args) {
   for (const [name, cond] of Object.entries(command.conditionals || {})) {
     fragments[`_${name}`] = fragments[`_cond_${name}`] = evaluateCondition(cond.when, context) ? cond.template : '';
   }
-  const argv = command.exec?.length ? command.exec.map(v => interpolate(v, context)) : templateArgv(command.template, context, fragments);
+  const argv = command.exec?.length ? command.exec.map(v => interpolate(v, context)) : templateArgv(command.template, context, fragments, resolvedArgs);
   return { command: argv.map(quoteArg).join(' '), resolvedArgs, isExecutor: false, scanId: context._scan_id };
 }
 
@@ -775,6 +775,9 @@ export function generateMcpSchema(manifest) {
 
 function mcpTypeAndConstraints(toolcladType, argDef) {
   switch (toolcladType) {
+    case "literal_text":
+      return { type: "string", maxLength: 32768, "x-toolclad-max-utf8-bytes": 32768,
+        not: { pattern: "\0" }, ...(argDef?.pattern !== undefined ? { pattern: argDef.pattern } : {}) };
     case "integer":
       return { type: "integer" };
     case "number": {

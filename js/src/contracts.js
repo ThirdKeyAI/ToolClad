@@ -18,11 +18,12 @@ export function validateArguments(manifest, args) {
       throw new Error(`Invalid argument name: ${name}`);
     }
     const value = Object.hasOwn(args, name) ? args[name] : (def.default ?? manifest.command?.defaults?.[name]);
+    if (def.type === "literal_text" && Object.hasOwn(args, name) && typeof value !== "string") throw new Error(`literal_text requires a string: ${name}`);
     if (value === undefined || value === null) {
       if (def.required) throw new Error(`Missing required argument: ${name}`);
       continue;
     }
-    if (String(value).includes('\0') || (def.required && !String(value).trim())) throw new Error(`Invalid empty or NUL argument: ${name}`);
+    if (String(value).includes('\0') || (def.required && def.type !== "literal_text" && !String(value).trim())) throw new Error(`Invalid empty or NUL argument: ${name}`);
     resolved[name] = validateArg(def, value);
   }
   if (Object.values(resolved).reduce((n, v) => n + Buffer.byteLength(String(v)), 0) > MAX_REQUEST_BYTES) throw new Error('Arguments exceed 1 MiB');
@@ -75,13 +76,13 @@ export function quoteArg(value) {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(text) ? text : "'" + text.replaceAll("'", "'\"'\"'") + "'";
 }
 
-export function templateArgv(template, values, fragments) {
+export function templateArgv(template, values, fragments, present = {}) {
   const substitute = t => t.replace(token, (m, k) => String(values[k] ?? m));
   const argv = [];
   for (const part of splitTemplate(template)) {
     const match = /^\{(\w+)\}$/.exec(part);
     if (match && Object.hasOwn(fragments, match[1])) argv.push(...splitTemplate(fragments[match[1]]).map(substitute));
-    else { const value = substitute(part); if (value || !part) argv.push(value); }
+    else { const value = substitute(part); if (value || !part || [...part.matchAll(token)].some(m => Object.hasOwn(present, m[1]))) argv.push(value); }
   }
   if (!argv.length || !argv[0]) throw new Error('Command produced empty argv');
   return argv;

@@ -16,7 +16,7 @@ struct Vectors {
 fn shared_execution_vectors() {
     let vectors: Vectors =
         serde_json::from_str(include_str!("../../tests/execution_vectors.json")).unwrap();
-    assert_eq!(vectors.cases.len(), 17);
+    assert_eq!(vectors.cases.len(), 30);
     for case in vectors.cases {
         let manifest = toolclad::parse_manifest(&case.manifest).unwrap();
         let result = toolclad::executor::build_command(&manifest, &case.args);

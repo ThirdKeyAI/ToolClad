@@ -95,6 +95,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='toolclad-e2e-') as temp:
             directory = Path(temp)
             marker = directory / 'effect.json'
+            shell_trap = directory / 'literal-shell-effect'
             child_pid = directory / 'child.pid'
             fixture = directory / 'fixture.py'
             fixture.write_text('''#!/usr/bin/python3
@@ -169,6 +170,7 @@ print(json.dumps(result))
                     out, err = process.communicate(timeout=6)
                     stdout, stderr = out.decode(errors='replace'), err.decode(errors='replace')
                     assert (process.returncode == 0) == success, f'exit={process.returncode}; {stderr[:500]}; {stdout[:500]}'
+                    assert not shell_trap.exists(), 'literal text was interpreted by a shell'
                     assert marker.exists() == effects, f'effect marker={marker.exists()}'
                     assert len(server.requests) == requests, f'requests={server.requests}'
                     assert not trap.requests, f'proxy/redirect trap reached: {trap.requests}'
@@ -204,6 +206,44 @@ print(json.dumps(result))
             for language in runners:
                 run_case(language,'literal_template_argv',manifest(),['value=alpha --extra'],success=True,effects=True,check=marker_check('alpha --extra'))
                 run_case(language,'literal_exec_argv',manifest(command(exec_array=True)),['value=alpha --extra'],success=True,effects=True,check=marker_check('alpha --extra'))
+                literaldef = '[args.value]\ntype="literal_text"\nrequired=true\n'
+                literal = ' \t{"message":"héllo 🌍"}\n$(touch ' + str(shell_trap) + '); `touch ' + str(shell_trap) + '` | & <> [] ! {_secret:token} {other}\\\'"\r\n'
+                run_case(language,'literal_text_template',manifest(definitions=literaldef),['value='+literal],success=True,effects=True,check=marker_check(literal))
+                run_case(language,'literal_text_exec',manifest(command(exec_array=True),definitions=literaldef),['value='+literal],success=True,effects=True,check=marker_check(literal))
+                run_case(language,'literal_text_empty',manifest(definitions=literaldef),['value='],success=True,effects=True,check=marker_check(''))
+                run_case(language,'literal_text_exec_empty',manifest(command(exec_array=True),definitions=literaldef),['value='],success=True,effects=True,check=marker_check(''))
+                run_case(language,'literal_text_whitespace',manifest(definitions=literaldef),['value= \t\r\n'],success=True,effects=True,check=marker_check(' \t\r\n'))
+                run_case(language,'literal_text_default_empty',manifest(definitions=literaldef+'default=""\n'),success=True,effects=True,check=marker_check(''))
+                run_case(language,'literal_text_command_default_empty',manifest(command()+'[command.defaults]\nvalue=""\n',definitions=literaldef),success=True,effects=True,check=marker_check(''))
+                run_case(language,'literal_text_ascii_limit',manifest(definitions=literaldef),['value='+'a'*32768],success=True,effects=True,check=marker_check('a'*32768))
+                run_case(language,'literal_text_utf8_limit',manifest(definitions=literaldef),['value='+'🌍'*8192],success=True,effects=True,check=marker_check('🌍'*8192))
+                run_case(language,'literal_text_ascii_over',manifest(definitions=literaldef),['value='+'a'*32769])
+                run_case(language,'literal_text_utf8_over',manifest(definitions=literaldef),['value='+'🌍'*8193])
+                run_case(language,'literal_text_nul_default',manifest(definitions=literaldef+'default='+json.dumps('a\0b')+'\n'))
+                run_case(language,'literal_text_numeric_default',manifest(definitions=literaldef+'default=123\n'))
+                run_case(language,'literal_text_pattern',manifest(definitions=literaldef+'pattern="message"\n'),['value='+literal],success=True,effects=True,check=marker_check(literal))
+                run_case(language,'literal_text_pattern_denied',manifest(definitions=literaldef+'pattern="^no$"\n'),['value='+literal])
+                run_case(language,'literal_text_pattern_invalid',manifest(definitions=literaldef+'pattern="["\n'),['value='+literal])
+                run_case(language,'literal_text_missing',manifest(definitions=literaldef))
+                run_case(language,'literal_text_omitted_optional',manifest(definitions=literaldef.replace('required=true','required=false')),success=True,effects=True,
+                         check=lambda out,err: assert_equal(json.loads(marker.read_text())['argv'],[]))
+                run_case(language,'literal_text_approval',manifest(tool='human_approval=true\n',definitions=literaldef),['value='+literal])
+                run_case(language,'literal_text_cedar',manifest(tool='[tool.cedar]\nresource="Fixture"\naction="execute"\n',definitions=literaldef),['value='+literal])
+                run_case(language,'literal_text_scope',manifest(definitions=literaldef+'scope_check=true\n'),['value='+literal])
+                def literal_schema(out, err):
+                    schema = json.loads(out)['inputSchema']
+                    prop = schema['properties']['value']
+                    assert_equal(prop['type'], 'string')
+                    assert_equal(prop['maxLength'], 32768)
+                    assert_equal(prop['x-toolclad-max-utf8-bytes'], 32768)
+                    assert_equal(prop['not'], {'pattern':'\0'})
+                    assert_equal(prop['pattern'], 'message')
+                    assert 'value' in schema['required']
+                run_case(language,'literal_text_schema',manifest(definitions=literaldef+'pattern="message"\n'),subcommand='schema',success=True,check=literal_schema)
+                run_case(language,'literal_text_http_body',http(body='{"value":"{value}"}',definitions=literaldef),['value='+literal],success=True,requests=1,
+                         check=lambda out,err: assert_equal(json.loads(server.requests[0]['body']),{'value':literal}))
+                run_case(language,'literal_text_http_header_newline',http(headers='X-Text="{value}"\n',definitions=literaldef),['value=hello\r\nInjected: yes'])
+                run_case(language,'literal_text_http_url_newline',http('/{value}',definitions=literaldef),['value=hello\nworld'])
                 run_case(language,'clamped_default',manifest(definitions='[args.value]\ntype="integer"\nmax=10\nclamp=true\ndefault=99\n'),success=True,effects=True,check=marker_check('10'))
                 run_case(language,'invalid_default',manifest(definitions='[args.value]\ntype="port"\ndefault=0\n'))
                 run_case(language,'unknown_argument',manifest(),['value=ok','unknown=no'])
@@ -265,7 +305,7 @@ print(json.dumps(result))
         server.shutdown(); trap.shutdown(); server.server_close(); trap.server_close()
     after = source_digest()
     after_artifacts = {name: hashlib.sha256(Path(runner[0]).read_bytes()).hexdigest() for name, runner in runners.items()}
-    expected = 44 * len(runners)
+    expected = 69 * len(runners)
     report = dict(planned=expected, executed=len(results), passed=sum(r['passed'] for r in results),
                   failed=sum(not r['passed'] for r in results), source_before=before, source_after=after,
                   artifacts_before=artifacts, artifacts_after=after_artifacts, cases=results)

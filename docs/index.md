@@ -23,7 +23,7 @@ A ToolClad manifest answers four questions:
 
 ## Key Features
 
-- **14 built-in type validators** -- all with shell injection sanitization, plus custom types via `toolclad.toml`
+- **16 built-in type validators** -- type-specific validation and literal argv dispatch, plus custom types via `toolclad.toml`
 - **Five execution backends** -- Shell command, HTTP API, MCP proxy, PTY session, CDP browser
 - **Command construction** -- `exec` array (preferred) or `template` string with mappings, conditionals, defaults; no `sh -c`
 - **MCP schema generation** -- Auto-generate `inputSchema` + `outputSchema` from manifest declarations
@@ -106,7 +106,7 @@ All four implementations use `.clad.toml` contracts. Shared execution vectors ch
 |-------|-------------|
 | [Getting Started](getting-started.md) | Install, create, validate, and run your first manifest |
 | [Manifest Format](manifest-format.md) | Complete `.clad.toml` reference for every section |
-| [Type System](type-system.md) | All 14 built-in types with validation rules and examples |
+| [Type System](type-system.md) | All 16 built-in types with validation rules and examples |
 | [Command Construction](command-construction.md) | Templates, mappings, conditionals, array-based execution |
 | [HTTP and MCP Backends](http-mcp-backends.md) | HTTP API tools and governed MCP proxy passthrough |
 | [Session Mode](session-mode.md) | PTY sessions with per-interaction governance |

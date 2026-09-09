@@ -363,12 +363,13 @@ description = "Raw module execution output"
 
 ## Type System
 
-Built-in validation types cover the patterns repeated across all existing wrapper scripts. Every type includes injection sanitization (shell metacharacter rejection) by default. Types are designed so that "valid according to the type" means "safe to interpolate into a shell command."
+The 16 built-in types constrain tool argument data. Type-specific validators reject invalid structures; `literal_text` preserves source punctuation and whitespace. Direct argv dispatch preserves argument boundaries. Validation does not authorize shell interpretation, tool effects or access outside an embedding runtime's execution boundary.
 
 ### Core Types
 
 | Type | Validates | Examples |
 |------|-----------|---------|
+| `literal_text` | Exact UTF-8; no NUL; at most 32,768 bytes; optional pattern | Source content, patches, messages |
 | `string` | Non-empty, injection-safe | General text arguments |
 | `integer` | Numeric, optional `min`/`max` with clamping | Thread counts, retry limits |
 | `number` | Float, optional `min_float`/`max_float` with clamping; rejects NaN/inf | Confidence scores, ratios |
@@ -380,6 +381,8 @@ Built-in validation types cover the patterns repeated across all existing wrappe
 | `path` | No traversal (`../`), optionally must exist | Wordlists, config files, output dirs |
 | `ip_address` | Valid IPv4 or IPv6 | Listener addresses, bind addresses |
 | `cidr` | Valid CIDR notation | Network ranges |
+
+`literal_text` is preserved before trimming or metacharacter filtering. Required means present: empty strings are valid, including defaults. Defaults must be strings. Its optional regex searches the original text; anchor whole-value constraints and use portable syntax. Custom-type validation helpers may resolve `base = "literal_text"`. See [Type System](docs/type-system.md#literal_text) for the complete contract and schema annotations. Argument data never recursively expands into templates. The type does not authorize a selected executable to interpret that data as code, and does not replace policy, approval or OS isolation.
 
 ### Extended Types
 

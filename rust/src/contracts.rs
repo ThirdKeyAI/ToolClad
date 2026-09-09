@@ -34,11 +34,19 @@ pub fn validate_arguments(
         if !name_pattern.is_match(name) {
             return Err(invalid(format!("invalid argument name: {name}")));
         }
-        let fallback = definition
+        let fallback_value = definition
             .default
             .as_ref()
-            .or_else(|| manifest.command.defaults.as_ref().and_then(|d| d.get(name)))
-            .map(value_string);
+            .or_else(|| manifest.command.defaults.as_ref().and_then(|d| d.get(name)));
+        if !args.contains_key(name)
+            && definition.type_name == "literal_text"
+            && fallback_value.is_some_and(|v| !v.is_str())
+        {
+            return Err(invalid(format!(
+                "literal_text default must be a string: {name}"
+            )));
+        }
+        let fallback = fallback_value.map(value_string);
         let value = args.get(name).or(fallback.as_ref());
         let Some(value) = value else {
             if definition.required {
@@ -46,7 +54,11 @@ pub fn validate_arguments(
             }
             continue;
         };
-        if value.contains('\0') || (definition.required && value.trim().is_empty()) {
+        if value.contains('\0')
+            || (definition.required
+                && definition.type_name != "literal_text"
+                && value.trim().is_empty())
+        {
             return Err(invalid(format!("invalid empty or NUL argument: {name}")));
         }
         result.insert(name.clone(), validate_arg(name, definition, value)?);

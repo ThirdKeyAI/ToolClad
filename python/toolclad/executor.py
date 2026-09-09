@@ -107,9 +107,10 @@ def _evaluate_single(expr: str, resolved: Dict[str, str]) -> bool:
     return False
 
 
-def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
+def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> tuple:
     """Validate arguments and resolve all template variables into a single context."""
     resolved = validate_arguments(manifest, args)
+    present = set(resolved)
     for name in manifest.args:
         resolved.setdefault(name, "")
     for key, val in manifest.command.defaults.items():
@@ -149,7 +150,7 @@ def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
         else:
             resolved[f"_{cond_name}"] = ""
 
-    return resolved
+    return resolved, present
 
 
 def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> list:
@@ -175,7 +176,7 @@ def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> list:
             f"Manifest '{manifest.tool.name}' has no exec array."
         )
 
-    resolved = _resolve_vars(manifest, args)
+    resolved, present = _resolve_vars(manifest, args)
 
     argv = [_interpolate(element, resolved) for element in manifest.command.exec]
 
@@ -210,12 +211,12 @@ def build_command(manifest: Manifest, args: Dict[str, str]) -> str:
             f"({manifest.command.executor}); cannot build a template command."
         )
 
-    resolved = _resolve_vars(manifest, args)
+    resolved, present = _resolve_vars(manifest, args)
 
-    return shlex.join(_command_argv(manifest, resolved))
+    return shlex.join(_command_argv(manifest, resolved, present))
 
 
-def _command_argv(manifest, resolved):
+def _command_argv(manifest, resolved, present):
     fragments = {}
     for name, table in manifest.command.mappings.items():
         fragment = table.get(resolved.get(name, ""), "")
@@ -226,7 +227,7 @@ def _command_argv(manifest, resolved):
         fragments[f"_{name}"] = cond.template if _evaluate_condition(cond.when, resolved) else ""
     if manifest.command.exec:
         return [_interpolate(v, resolved) for v in manifest.command.exec]
-    return template_argv(manifest.command.template, resolved, fragments)
+    return template_argv(manifest.command.template, resolved, fragments, present)
 
 
 def _interpolate(template: str, values: Dict[str, str]) -> str:
@@ -627,11 +628,11 @@ def execute(
 
         return envelope
 
-    resolved = _resolve_vars(manifest, args)
+    resolved, present = _resolve_vars(manifest, args)
     scan_id = resolved["_scan_id"]
     tool_name = manifest.tool.name
     effective_timeout = timeout or manifest.tool.timeout_seconds
-    args_list = _command_argv(manifest, resolved)
+    args_list = _command_argv(manifest, resolved, present)
     command = shlex.join(args_list)
 
     envelope: Dict[str, Any] = {
