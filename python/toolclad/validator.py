@@ -253,10 +253,12 @@ def _validate_url(arg_def: ArgDef, value: str) -> str:
 
 def _validate_path(arg_def: ArgDef, value: str) -> str:
     _check_injection(value)
+    if "\0" in value:
+        raise ValidationError("Path must not contain NUL")
     # Block absolute paths
-    if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
+    if value.startswith(("/", "\\")) or (len(value) >= 2 and value[1] == ":"):
         raise ValidationError(f"Path must be relative, not absolute: {value}")
-    if ".." in value.split("/") or ".." in value.split("\\"):
+    if ".." in re.split(r"[/\\]", value):
         raise ValidationError(f"Path traversal detected in: {value!r}")
     return value
 
@@ -302,11 +304,7 @@ def _validate_msf_options(arg_def: ArgDef, value: str) -> str:
 
 
 def _validate_credential_file(arg_def: ArgDef, value: str) -> str:
-    _check_injection(value)
-    if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
-        raise ValidationError(f"Credential file must be a relative path: {value}")
-    if ".." in value.split("/") or ".." in value.split("\\"):
-        raise ValidationError(f"Path traversal detected: {value}")
+    value = _validate_path(arg_def, value)
     import os
     if not os.path.exists(value):
         raise ValidationError(f"Credential file not found: {value}")

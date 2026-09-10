@@ -356,19 +356,17 @@ func validateURL(def *manifest.ArgDef, value string) (string, error) {
 }
 
 func validatePath(def *manifest.ArgDef, value string) (string, error) {
+	if strings.ContainsRune(value, 0) {
+		return "", newErr(def.Name, "path must not contain NUL")
+	}
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
 	}
 	// Block absolute paths
-	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
+	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, "\\") || (len(value) >= 2 && value[1] == ':') {
 		return "", newErr(def.Name, "path must be relative, not absolute")
 	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
-		}
-	}
-	for _, part := range strings.Split(value, "\\") {
+	for _, part := range strings.FieldsFunc(value, func(c rune) bool { return c == '/' || c == '\\' }) {
 		if part == ".." {
 			return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
 		}
@@ -418,23 +416,15 @@ func validateMsfOptions(def *manifest.ArgDef, value string) (string, error) {
 }
 
 func validateCredentialFile(def *manifest.ArgDef, value string) (string, error) {
-	if err := CheckInjection(value); err != nil {
-		return "", newErr(def.Name, err.Error())
-	}
-	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
-		return "", newErr(def.Name, "credential file must be a relative path")
-	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected: %q", value))
-		}
+	if _, err := validatePath(def, value); err != nil {
+		return "", err
 	}
 	info, err := os.Stat(value)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("credential file not found: %q", value))
 	}
-	if info.IsDir() {
-		return "", newErr(def.Name, fmt.Sprintf("not a file: %q", value))
+	if !info.Mode().IsRegular() {
+		return "", newErr(def.Name, fmt.Sprintf("not a regular file: %q", value))
 	}
 	return value, nil
 }

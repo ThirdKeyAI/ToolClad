@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "valid_0",
+      "value": "input.txt",
+      "error": false
+    },
+    {
+      "name": "valid_1",
+      "value": "./input.txt",
+      "error": false
+    },
+    {
+      "name": "valid_2",
+      "value": "data//input.txt",
+      "error": false
+    },
+    {
+      "name": "valid_3",
+      "value": "data/report..csv",
+      "error": false
+    },
+    {
+      "name": "valid_4",
+      "value": "data../input.txt",
+      "error": false
+    },
+    {
+      "name": "valid_5",
+      "value": "data/report final.csv",
+      "error": false
+    },
+    {
+      "name": "valid_6",
+      "value": "data/r\u00e9sum\u00e9.csv",
+      "error": false
+    },
+    {
+      "name": "outer_spaces_compatibility",
+      "value": " input.txt ",
+      "error": false,
+      "rust_value": "input.txt"
+    },
+    {
+      "name": "refused_0",
+      "value": "..",
+      "error": true
+    },
+    {
+      "name": "refused_1",
+      "value": "data/..",
+      "error": true
+    },
+    {
+      "name": "refused_2",
+      "value": "../input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_3",
+      "value": "data/../input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_4",
+      "value": "data\\..",
+      "error": true
+    },
+    {
+      "name": "refused_5",
+      "value": "data/..\\input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_6",
+      "value": "data\\../input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_7",
+      "value": "/input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_8",
+      "value": "C:\\input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_9",
+      "value": "C:input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_10",
+      "value": "\\input.txt",
+      "error": true
+    },
+    {
+      "name": "refused_11",
+      "value": "\\\\host\\share",
+      "error": true
+    },
+    {
+      "name": "refused_12",
+      "value": "input;other",
+      "error": true
+    },
+    {
+      "name": "refused_13",
+      "value": "input\u0000.txt",
+      "error": true
+    }
+  ]
+}

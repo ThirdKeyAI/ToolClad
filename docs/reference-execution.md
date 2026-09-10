@@ -26,6 +26,15 @@ All supplied names must be declared in `[args]`. Duplicate CLI names, empty name
 
 `literal_text` preserves source text, patches and messages exactly: valid UTF-8, no NUL, at most 32,768 bytes, with optional `pattern` validation. It permits shell punctuation as argument data. It does not authorize the executable to evaluate that data or waive any execution requirement. See [Type System](type-system.md#literal_text).
 
+`path` and `credential_file` share a portable relative-path check: absolute/rooted
+paths, NUL and `..` components under either separator are refused. Accepted
+spelling is retained, including benign dotted components. Rust retains its existing
+outer-whitespace trim before validation; other reference implementations preserve
+that whitespace. Credential paths add
+an existing-regular-file preflight in the caller's filesystem; they do not grant
+access or prove filesystem confinement. JavaScript's existing metacharacter
+filter still rejects backslashes, including relative Windows spellings.
+
 Use `exec = ["tool", "--label", "{label}"]` for literal argument arrays. Every element remains one argument, including an empty element. Values still have to pass their declared validators.
 
 Legacy templates are tokenized **before** argument substitution. For `template = "tool --label {label}"`, the value `alpha --extra` remains one label argument. An omitted optional placeholder can disappear from a legacy template. A supplied or defaulted empty value remains one empty argument, as does a literal quoted empty argument. This preserves the distinction between missing data and empty content.
@@ -77,3 +86,16 @@ python3 tests/e2e_cli.py \
 ```
 
 The Python interpreter needs the package's declared dependencies; JavaScript needs `npm install` in `js/`. The local process fixtures use Unix process groups and `/usr/bin/python3`. No provider credentials, external HTTP destinations, autonomous attack model or public services are used. These deterministic checks establish regression coverage for the listed contracts, not proof against all escape attempts.
+
+The focused path suite uses `tests/path_vectors.json` in all four validators,
+including custom aliases, and exercises actual CLI effects, previews, typed
+defaults and nonregular credential-file refusal:
+
+```sh
+python3 tests/path_e2e_cli.py \
+  --rust-bin /path/to/toolclad-rust --go-bin /path/to/toolclad-go \
+  --python python3 --report /tmp/toolclad-path-e2e.json
+```
+
+It reuses built executables and does not start HTTP servers or other network
+services. Build/source hashes and exact planned/completed cases are retained.

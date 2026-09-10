@@ -495,13 +495,18 @@ fn validate_url(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladE
 
 fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
-    if val.contains("../") || val.contains("..\\") {
+    if val.contains('\0') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' path must not contain NUL"
+        )));
+    }
+    if val.split(['/', '\\']).any(|component| component == "..") {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' path must not contain traversal sequences (../)"
         )));
     }
     // Block absolute paths to prevent access to system files
-    if val.starts_with('/') || (val.len() >= 2 && val.as_bytes()[1] == b':') {
+    if val.starts_with(['/', '\\']) || (val.len() >= 2 && val.as_bytes()[1] == b':') {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' must be a relative path, not absolute"
         )));
@@ -577,17 +582,7 @@ fn validate_msf_options(name: &str, _def: &ArgDef, val: &str) -> Result<String, 
 }
 
 fn validate_credential_file(name: &str, _def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
-    reject_injection(name, val)?;
-    if val.starts_with('/') || (val.len() >= 2 && val.as_bytes()[1] == b':') {
-        return Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' must be a relative path"
-        )));
-    }
-    if val.contains("../") || val.contains("..\\") {
-        return Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' path must not contain traversal sequences"
-        )));
-    }
+    validate_path(name, val)?;
     let path = std::path::Path::new(val);
     if !path.exists() {
         return Err(ToolCladError::ValidationError(format!(

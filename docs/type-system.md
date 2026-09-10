@@ -201,8 +201,9 @@ File path with safety constraints. Blocks directory traversal and absolute paths
 **Validation rules:**
 
 - Reject shell metacharacters
-- Reject traversal sequences: `../` and `..\`
-- Reject absolute paths: paths starting with `/` or containing `X:` (Windows drive letter)
+- Reject NUL and parent components equal to `..`, splitting on `/` and `\` together (including bare, trailing and mixed-separator forms)
+- Reject absolute or rooted paths starting with `/` or `\`, and drive-prefixed paths such as `C:file`
+- Preserve accepted relative spelling; do not resolve symlinks or canonicalize against a filesystem. Ordinary dotted components such as `data../input.txt` remain valid. Existing language-specific metacharacter restrictions still apply. Rust retains its existing normalization of surrounding whitespace before validation; the other reference implementations preserve that whitespace.
 
 ```toml
 [args.wordlist]
@@ -280,13 +281,14 @@ description = "Additional set KEY VALUE options, semicolon-delimited"
 
 ### `credential_file`
 
-Path type with additional constraint: the file must exist and be readable. Used for username/password lists in brute-force tools.
+Path type with additional constraint: the file must exist and be a regular file. Used for username/password lists in brute-force tools.
 
 **Validation rules:**
 
 - All `path` type rules apply (no traversal, no absolute paths)
 - File must exist on disk
-- File must be readable by the current process
+- File must be regular; directories, FIFOs, devices and sockets are refused
+- This metadata preflight follows symlinks and does not establish readability, confinement or identity at later execution
 
 ```toml
 [args.password_file]

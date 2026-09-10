@@ -261,10 +261,11 @@ function validateUrl(argDef, value) {
 function validatePath(argDef, value) {
   const str = String(value);
   checkInjection(str);
-  if (str.startsWith("/") || (str.length >= 2 && str[1] === ":")) {
+  if (str.includes("\0")) throw new Error("Path must not contain NUL");
+  if (str.startsWith("/") || str.startsWith("\\") || (str.length >= 2 && str[1] === ":")) {
     throw new Error(`Path must be relative, not absolute: ${str}`);
   }
-  if (str.includes("../") || str.includes("..\\")) {
+  if (str.split(/[/\\]/).includes("..")) {
     throw new Error(`Path traversal not allowed: ${str}`);
   }
   return str;
@@ -337,14 +338,7 @@ function validateMsfOptions(argDef, value) {
 }
 
 function validateCredentialFile(argDef, value) {
-  const str = String(value);
-  checkInjection(str);
-  if (str.startsWith("/") || (str.length >= 2 && str[1] === ":")) {
-    throw new Error(`Credential file must be a relative path: ${str}`);
-  }
-  if (str.includes("../") || str.includes("..\\")) {
-    throw new Error(`Path traversal not allowed: ${str}`);
-  }
+  const str = validatePath(argDef, value);
   if (!existsSync(str)) {
     throw new Error(`Credential file not found: ${str}`);
   }
