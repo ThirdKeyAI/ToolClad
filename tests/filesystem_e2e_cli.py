@@ -38,28 +38,34 @@ def main():
                'PYTHONPATH': str(ROOT / 'python'), 'TOOLCLAD_EVIDENCE_DIR': str(root / 'evidence')}
         for language, runner in runners.items():
             for name, declaration in [('ordinary', ''), ('empty', '[filesystem]\n'),
+                    ('source', '[source]\noperation="read_file"\n'),
+                    ('source_empty', '[source]\n'),
+                    ('source_only', '[source]\noperation="list_files"\n'),
                     ('read', '[filesystem]\nread=["input.txt"]\n'),
                     ('create', '[filesystem]\ncreate=["result.txt"]\nmax_file_bytes=1024\n')]:
                 for mode in ['run', 'test']:
                     marker.unlink(missing_ok=True)
                     manifest = root / 'fixture.clad.toml'
-                    manifest.write_text(base + declaration)
+                    fixture = base
+                    if name == 'source_only':
+                        fixture = base.split('[command]')[0].replace('binary="python3"\n', '')
+                    manifest.write_text(fixture + declaration)
                     completed = subprocess.run(runner + [mode, str(manifest)], cwd=root, env=env,
                         capture_output=True, text=True, timeout=8)
-                    allowed = mode == 'test' or name == 'ordinary'
+                    allowed = not name.startswith('source') and (mode == 'test' or name == 'ordinary')
                     expected_effect = mode == 'run' and name == 'ordinary'
                     passed = (completed.returncode == 0) == allowed and marker.exists() == expected_effect
                     if expected_effect:
                         passed = passed and marker.read_text() == 'useful result'
                     if not allowed:
-                        passed = passed and 'filesystem grants require an embedding runtime' in (completed.stdout + completed.stderr).lower()
+                        passed = passed and ('source queries' if name.startswith('source') else 'filesystem grants') + ' require an embedding runtime' in (completed.stdout + completed.stderr).lower()
                     cases.append(dict(language=language, case=name, mode=mode, passed=passed,
                         exit_code=completed.returncode, effect=marker.exists(), stdout=completed.stdout, stderr=completed.stderr))
     after = source_digest()
     after_hashes = {name: hashlib.sha256(Path(command[0]).read_bytes()).hexdigest() for name, command in runners.items()}
-    passed = len(cases) == 32 and all(row['passed'] for row in cases) and before == after and hashes == after_hashes
+    passed = len(cases) == 56 and all(row['passed'] for row in cases) and before == after and hashes == after_hashes
     report = dict(passed=passed, source_before=before, source_after=after, binaries_before=hashes,
-                  binaries_after=after_hashes, planned=32, executed=len(cases), cases=cases)
+                  binaries_after=after_hashes, planned=56, executed=len(cases), cases=cases)
     Path(args.report).write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(dict(passed=passed, cases=len(cases), report=args.report)))
     return 0 if passed else 1

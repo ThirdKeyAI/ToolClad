@@ -186,6 +186,7 @@ type BrowserStateDef struct {
 // Output is a pointer because callback-dispatch manifests may omit [output].
 type Manifest struct {
 	Filesystem map[string]any     `toml:"filesystem"`
+	Source     map[string]any     `toml:"source"`
 	Tool       ToolMeta           `toml:"tool"`
 	Args       map[string]*ArgDef `toml:"args"`
 	Command    CommandDef         `toml:"command"`
@@ -230,6 +231,10 @@ func LoadManifest(path string) (*Manifest, error) {
 	m := Manifest{Tool: ToolMeta{TimeoutSeconds: 60}}
 	if err := toml.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	if m.Source != nil {
+		return nil, fmt.Errorf("source queries require an embedding runtime")
 	}
 
 	if m.Tool.Name == "" {

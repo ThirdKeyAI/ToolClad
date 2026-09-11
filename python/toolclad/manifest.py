@@ -228,6 +228,7 @@ class Manifest:
     browser: Optional[BrowserDef] = None
     source_path: str = ""
     filesystem: Optional[Dict[str, Any]] = None
+    source: Optional[Dict[str, Any]] = None
 
     @property
     def args_sorted(self) -> List[ArgDef]:
@@ -494,6 +495,9 @@ def load_manifest(path: str) -> Manifest:
 
     with open(file_path, "rb") as f:
         data = tomllib.load(f)
+
+    if "source" in data:
+        raise ValueError("Source queries require an embedding runtime")
 
     if "tool" not in data:
         raise ValueError(f"Manifest {path} is missing required [tool] section")

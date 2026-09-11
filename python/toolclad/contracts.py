@@ -41,6 +41,8 @@ def validate_arguments(manifest, args):
 
 
 def check_execution(manifest, dry_run=False):
+    if manifest.source is not None:
+        raise ValueError("Source queries require an embedding runtime")
     if type(manifest.tool.timeout_seconds) is not int or not 1 <= manifest.tool.timeout_seconds <= 3600:
         raise ValueError("timeout_seconds must be between 1 and 3600")
     command = manifest.command

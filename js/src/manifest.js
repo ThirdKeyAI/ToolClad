@@ -9,6 +9,7 @@ import TOML from "@iarna/toml";
 export function loadManifest(path) {
   const content = readFileSync(path, "utf-8");
   const manifest = TOML.parse(content);
+  if (Object.hasOwn(manifest, "source")) throw new Error("Source queries require an embedding runtime");
 
   if (!manifest.tool || !manifest.tool.name) {
     throw new Error(`Invalid manifest: missing [tool] section or tool.name`);

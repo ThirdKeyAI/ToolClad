@@ -106,3 +106,14 @@ python3 tests/path_e2e_cli.py \
 
 It reuses built executables and does not start HTTP servers or other network
 services. Build/source hashes and exact planned/completed cases are retained.
+
+## Runtime source-query extension
+
+Symbiont's `[source]` backend selects fixed read-only file queries inside its
+trusted runtime. The standalone Rust, Python, JavaScript and Go implementations
+do not implement that broker. They reject source declarations during manifest
+loading and execution checks, including dry-run/validation commands. An empty
+source table or one accompanying a command cannot fall back to command execution.
+Use an embedding runtime that implements the source contract. The targeted
+filesystem CLI parity suite checks these refusals alongside ordinary useful
+command execution and file-grant refusal.

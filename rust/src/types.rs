@@ -7,6 +7,8 @@ pub struct Manifest {
     pub tool: ToolMeta,
     /// Retained for embedding runtimes; reference execution cannot enforce files.
     pub filesystem: Option<toml::Value>,
+    /// Runtime-owned source broker extension; reference execution refuses it.
+    pub source: Option<toml::Value>,
     #[serde(default)]
     pub args: HashMap<String, ArgDef>,
     #[serde(default)]

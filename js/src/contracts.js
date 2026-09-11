@@ -31,6 +31,7 @@ export function validateArguments(manifest, args) {
 }
 
 export function checkExecution(manifest, dryRun = false) {
+  if (Object.hasOwn(manifest, "source")) throw new Error("Source queries require an embedding runtime");
   const timeout = manifest.tool.timeout_seconds ?? 60;
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) throw new Error('timeout_seconds must be between 1 and 3600');
   const command = manifest.command || {};

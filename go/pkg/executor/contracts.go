@@ -68,6 +68,9 @@ func ValidateArguments(m *manifest.Manifest, args map[string]string) (map[string
 }
 
 func checkExecution(m *manifest.Manifest, dryRun bool) error {
+	if m.Source != nil {
+		return fmt.Errorf("source queries require an embedding runtime")
+	}
 	if m.Tool.TimeoutSeconds < 1 || m.Tool.TimeoutSeconds > 3600 {
 		return fmt.Errorf("timeout_seconds must be between 1 and 3600")
 	}

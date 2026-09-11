@@ -100,7 +100,15 @@ pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, ToolCladError>
 
 /// Parse a manifest from a TOML string.
 pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
-    let manifest: Manifest = toml::from_str(toml_str)
+    let raw: toml::Value = toml::from_str(toml_str)
+        .map_err(|e| ToolCladError::ManifestError(format!("TOML parse error: {e}")))?;
+    if raw.get("source").is_some() {
+        return Err(ToolCladError::ManifestError(
+            "source queries require an embedding runtime".into(),
+        ));
+    }
+    let manifest: Manifest = raw
+        .try_into()
         .map_err(|e| ToolCladError::ManifestError(format!("TOML parse error: {e}")))?;
     validate_manifest(&manifest)?;
     Ok(manifest)

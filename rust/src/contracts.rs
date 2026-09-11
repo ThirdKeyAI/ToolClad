@@ -70,6 +70,9 @@ pub fn validate_arguments(
 }
 
 pub(crate) fn check_execution(m: &Manifest, dry_run: bool) -> Result<(), ToolCladError> {
+    if m.source.is_some() {
+        return Err(invalid("source queries require an embedding runtime"));
+    }
     if !(1..=3600).contains(&m.tool.timeout_seconds) {
         return Err(invalid("timeout_seconds must be between 1 and 3600"));
     }
