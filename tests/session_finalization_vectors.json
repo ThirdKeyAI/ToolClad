@@ -1,0 +1,32 @@
+[
+  {
+    "name": "default",
+    "manifest": "[tool]\nname=\"terminal_fixture\"\nbinary=\"python3\"\nversion=\"1\"\nmode=\"session\"\ndescription=\"File finalization contract\"\n[session]\nstartup_command=\"python3\"\nready_pattern=\"READY>\"\n[session.commands.finish]\npattern=\"finish\"\ndescription=\"Finalize and publish output\"\n[filesystem]\nread=[\"input.txt\"]\ncreate=[\"result.json\"]\n[output]\nformat=\"text\"\n",
+    "expected": false
+  },
+  {
+    "name": "enabled",
+    "manifest": "[tool]\nname=\"terminal_fixture\"\nbinary=\"python3\"\nversion=\"1\"\nmode=\"session\"\ndescription=\"File finalization contract\"\n[session]\nstartup_command=\"python3\"\nready_pattern=\"READY>\"\n[session.commands.finish]\npattern=\"finish\"\ndescription=\"Finalize and publish output\"\nfinalize=true\n[filesystem]\nread=[\"input.txt\"]\ncreate=[\"result.json\"]\n[output]\nformat=\"text\"\n",
+    "expected": true
+  },
+  {
+    "name": "disabled",
+    "manifest": "[tool]\nname=\"terminal_fixture\"\nbinary=\"python3\"\nversion=\"1\"\nmode=\"session\"\ndescription=\"File finalization contract\"\n[session]\nstartup_command=\"python3\"\nready_pattern=\"READY>\"\n[session.commands.finish]\npattern=\"finish\"\ndescription=\"Finalize and publish output\"\nfinalize=false\n[filesystem]\nread=[\"input.txt\"]\ncreate=[\"result.json\"]\n[output]\nformat=\"text\"\n",
+    "expected": false
+  },
+  {
+    "name": "string",
+    "manifest": "[tool]\nname=\"terminal_fixture\"\nbinary=\"python3\"\nversion=\"1\"\nmode=\"session\"\ndescription=\"File finalization contract\"\n[session]\nstartup_command=\"python3\"\nready_pattern=\"READY>\"\n[session.commands.finish]\npattern=\"finish\"\ndescription=\"Finalize and publish output\"\nfinalize=\"true\"\n[filesystem]\nread=[\"input.txt\"]\ncreate=[\"result.json\"]\n[output]\nformat=\"text\"\n",
+    "expected": null
+  },
+  {
+    "name": "number",
+    "manifest": "[tool]\nname=\"terminal_fixture\"\nbinary=\"python3\"\nversion=\"1\"\nmode=\"session\"\ndescription=\"File finalization contract\"\n[session]\nstartup_command=\"python3\"\nready_pattern=\"READY>\"\n[session.commands.finish]\npattern=\"finish\"\ndescription=\"Finalize and publish output\"\nfinalize=1\n[filesystem]\nread=[\"input.txt\"]\ncreate=[\"result.json\"]\n[output]\nformat=\"text\"\n",
+    "expected": null
+  },
+  {
+    "name": "array",
+    "manifest": "[tool]\nname=\"terminal_fixture\"\nbinary=\"python3\"\nversion=\"1\"\nmode=\"session\"\ndescription=\"File finalization contract\"\n[session]\nstartup_command=\"python3\"\nready_pattern=\"READY>\"\n[session.commands.finish]\npattern=\"finish\"\ndescription=\"Finalize and publish output\"\nfinalize=[]\n[filesystem]\nread=[\"input.txt\"]\ncreate=[\"result.json\"]\n[output]\nformat=\"text\"\n",
+    "expected": null
+  }
+]

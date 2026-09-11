@@ -53,6 +53,12 @@ export function loadManifest(path) {
     }
   }
 
+  for (const command of Object.values(manifest.session?.commands ?? {})) {
+    if (Object.hasOwn(command, 'finalize') && typeof command.finalize !== 'boolean') {
+      throw new Error('session command finalize must be a boolean');
+    }
+    command.finalize ??= false;
+  }
   return manifest;
 }
 

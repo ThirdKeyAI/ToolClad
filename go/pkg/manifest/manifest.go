@@ -141,6 +141,7 @@ type SessionCommandDef struct {
 	Description   string             `toml:"description"`
 	RiskTier      string             `toml:"risk_tier"`
 	HumanApproval bool               `toml:"human_approval"`
+	Finalize      bool               `toml:"finalize"`
 	ExtractTarget bool               `toml:"extract_target"`
 	Args          map[string]*ArgDef `toml:"args"`
 }

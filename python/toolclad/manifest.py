@@ -150,6 +150,7 @@ class SessionCommandDef:
     description: str = ""
     risk_tier: str = "low"
     human_approval: bool = False
+    finalize: bool = False
     extract_target: bool = False
     args: Dict[str, ArgDef] = field(default_factory=dict)
 
@@ -349,6 +350,9 @@ def _parse_session_interaction(data: Dict[str, Any]) -> SessionInteractionDef:
 
 
 def _parse_session_command(data: Dict[str, Any]) -> SessionCommandDef:
+    finalize = data.get("finalize", False)
+    if not isinstance(finalize, bool):
+        raise ValueError("session command finalize must be a boolean")
     args: Dict[str, ArgDef] = {}
     for arg_name, arg_data in data.get("args", {}).items():
         args[arg_name] = _parse_arg(arg_name, arg_data)
@@ -357,6 +361,7 @@ def _parse_session_command(data: Dict[str, Any]) -> SessionCommandDef:
         description=data.get("description", ""),
         risk_tier=data.get("risk_tier", "low"),
         human_approval=data.get("human_approval", False),
+        finalize=finalize,
         extract_target=data.get("extract_target", False),
         args=args,
     )

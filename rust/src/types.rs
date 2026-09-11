@@ -253,6 +253,9 @@ pub struct SessionCommandDef {
     pub risk_tier: String,
     #[serde(default)]
     pub human_approval: bool,
+    /// Close the embedded session and publish declared output after cleanup.
+    #[serde(default)]
+    pub finalize: bool,
     #[serde(default)]
     pub extract_target: bool,
     #[serde(default)]

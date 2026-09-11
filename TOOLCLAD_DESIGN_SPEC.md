@@ -1043,6 +1043,16 @@ The `[session.commands]` section is the critical difference from open-ended term
 
 The LLM never sees a free-text input field. It picks from typed operations. The parameter is validated against the command's `pattern` regex, scope-checked if `extract_target = true`, and policy-gated at the command's declared `risk_tier`. A command that does not match any declared pattern is rejected before it reaches the PTY.
 
+A command can declare `finalize = true` (boolean, default `false`) to end the
+embedded session after its configured response. A runtime implementing file
+publication must confirm worker cleanup before publishing declared new output.
+Ordinary cleanup or cancellation does not implicitly publish pending files.
+The flag carries lifecycle authority in the trusted manifest; an argument cannot
+enable it. All four reference parsers preserve this field, while standalone
+reference runners continue to refuse session execution. See
+[session finalization](docs/session-mode.md#explicit-finalization-and-file-output)
+for the implemented Symbiont file contract and its limits.
+
 #### Prompt-Based State Inference
 
 The `ready_pattern` regex tells the SessionExecutor when the tool is waiting for input. But different prompts reveal different internal states:

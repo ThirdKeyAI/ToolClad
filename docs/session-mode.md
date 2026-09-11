@@ -9,6 +9,27 @@ description: Interactive CLI sessions with per-interaction governance
 
 Session mode governs interactive CLI tools -- programs that stay alive across multiple interactions and maintain internal state. Tools like `psql`, `msfconsole`, `redis-cli`, `kubectl exec`, and `gdb` accept commands over time, where each command changes the tool's internal state and carries a different risk level.
 
+## Explicit finalization and file output
+
+`session.commands.<name>.finalize` is a boolean, defaulting to `false`. An embedding
+runtime supporting this contract executes the authorized command, waits for its
+configured response, closes the session and confirms worker cleanup before
+publishing declared new file output. The command must return the expected ready
+prompt; sending an application exit command is not a substitute for this protocol.
+
+Symbiont's Docker/gVisor file broker retains explicit bounded input snapshots and
+one private staged output across session commands. It requires a finalizing
+command when `[filesystem].create` is used. Intermediate responses distinguish
+pending output from published file receipts. Cancellation or ordinary cleanup
+does not implicitly publish pending output; changed grants require a new run.
+File publication and prompt acknowledgement do not establish application-level
+transaction success or exactly-once external effects.
+
+All four reference parsers preserve this flag and reject non-boolean values.
+The standalone reference runners continue to refuse session execution and
+unenforced filesystem grants; parsing or previewing a finalizer does not execute
+these lifecycle controls.
+
 ## What Session Mode Solves
 
 The oneshot model (validate, construct, execute, parse) does not fit interactive tools because:
@@ -135,6 +156,7 @@ Each entry under `[session.commands]` declares a permitted operation:
 | `description` | string | Human-readable description (shown in MCP tool listing) |
 | `risk_tier` | string | `"low"`, `"medium"`, or `"high"` |
 | `human_approval` | boolean | Whether this command requires human approval before execution |
+| `finalize` | boolean | Default `false`; close the session after its response and publish declared output after confirmed cleanup in a supporting runtime |
 | `extract_target` | boolean | If `true`, extract the target value for scope checking |
 
 A command that does not match any declared pattern is rejected before it reaches the PTY.

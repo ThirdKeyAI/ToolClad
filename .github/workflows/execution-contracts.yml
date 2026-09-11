@@ -27,7 +27,12 @@ jobs:
         working-directory: go
       - run: npm ci --ignore-scripts
         working-directory: js
-      - run: python3 -m pip install ./python
+      - run: python3 -m pip install ./python pytest
+      - run: cargo test --locked --manifest-path rust/Cargo.toml --test session_finalization
+      - run: go test ./pkg/manifest -run TestSessionFinalizationContract
+        working-directory: go
+      - run: python3 -m pytest python/tests/test_session_finalization.py -q
+      - run: node --test js/test/session_finalization.test.js
       - run: python3 tests/filesystem_e2e_cli.py --rust-bin rust/target/debug/toolclad --go-bin toolclad-go --report filesystem-parity.json
       - run: python3 tests/path_e2e_cli.py --rust-bin rust/target/debug/toolclad --go-bin toolclad-go --report path-parity.json
       - uses: actions/upload-artifact@v4
