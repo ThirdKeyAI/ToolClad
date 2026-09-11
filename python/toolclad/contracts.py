@@ -52,6 +52,8 @@ def check_execution(manifest, dry_run=False):
         raise ValueError("Ambiguous execution backends")
     if dry_run:
         return
+    if manifest.filesystem is not None:
+        raise ValueError("Filesystem grants require an embedding runtime")
     if (manifest.tool.dispatch != "exec" or manifest.tool.human_approval
             or manifest.tool.cedar._configured or manifest.tool.cedar.resource or manifest.tool.cedar.action
             or any(a.scope_check for a in manifest.args.values())):

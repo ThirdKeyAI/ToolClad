@@ -5,6 +5,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Manifest {
     pub tool: ToolMeta,
+    /// Retained for embedding runtimes; reference execution cannot enforce files.
+    pub filesystem: Option<toml::Value>,
     #[serde(default)]
     pub args: HashMap<String, ArgDef>,
     #[serde(default)]

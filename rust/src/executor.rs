@@ -1001,6 +1001,7 @@ mod tests {
 
     fn minimal_manifest() -> Manifest {
         Manifest {
+            filesystem: None,
             tool: ToolMeta {
                 name: "test_tool".to_string(),
                 version: "1.0.0".to_string(),

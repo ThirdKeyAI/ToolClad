@@ -83,6 +83,9 @@ func checkExecution(m *manifest.Manifest, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
+	if m.Filesystem != nil {
+		return fmt.Errorf("filesystem grants require an embedding runtime")
+	}
 	scoped := false
 	for _, a := range m.Args {
 		scoped = scoped || a.ScopeCheck

@@ -87,6 +87,9 @@ pub(crate) fn check_execution(m: &Manifest, dry_run: bool) -> Result<(), ToolCla
     if dry_run {
         return Ok(());
     }
+    if m.filesystem.is_some() {
+        return Err(invalid("filesystem grants require an embedding runtime"));
+    }
     if m.tool.dispatch != "exec"
         || m.tool.human_approval
         || m.tool.cedar.is_some()

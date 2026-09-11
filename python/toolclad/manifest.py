@@ -226,6 +226,7 @@ class Manifest:
     session: Optional[SessionDef] = None
     browser: Optional[BrowserDef] = None
     source_path: str = ""
+    filesystem: Optional[Dict[str, Any]] = None
 
     @property
     def args_sorted(self) -> List[ArgDef]:
@@ -495,6 +496,8 @@ def load_manifest(path: str) -> Manifest:
     manifest = Manifest(source_path=str(file_path.resolve()))
 
     manifest.tool = _parse_tool(data["tool"])
+    if "filesystem" in data:
+        manifest.filesystem = data["filesystem"]
 
     if "args" in data:
         for arg_name, arg_data in data["args"].items():

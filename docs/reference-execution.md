@@ -16,6 +16,7 @@ This branch hardens the boundary between supplied arguments, trusted manifest st
 | MCP | Produces a `delegation_preview`; no upstream call occurs. `run` exits nonzero because the tool has not executed. |
 | Session/browser | Parsed contract formats; reference execution remains unavailable. |
 | Custom parser | Refused before execution. Reference runners do not execute parser scripts. |
+| `[filesystem]` | Retained for embedding runtimes and previews; execution is refused even for an empty table. The reference runners cannot restrict host file access. |
 | Multiple backends | Refused as ambiguous. An `exec` array and legacy `template` in the same command section are allowed; `exec` takes precedence. |
 
 The CLI interface retains the same four commands. There is no new graphical UI. The visible differences are earlier refusals, safely quoted command previews, redacted secret previews, bounded failures and meaningful process exit codes.
@@ -72,6 +73,12 @@ Captured stdout and stderr have a 4 MiB limit per stream. Process supervision us
 Evidence envelopes and SHA-256 output hashes are diagnostic records, **not signed audit receipts**. Parser and output-schema behavior still differs across implementations; successful execution does not prove full JSON Schema validation, durable evidence persistence or complete descendant cleanup. A failure can occur after an external effect. Do not automatically retry an effectful call solely because its envelope reports failure.
 
 ## Validation
+
+`tests/filesystem_e2e_cli.py` checks all four shipping CLIs: ordinary useful work,
+previews without effects, and refusal before effects for empty, read and create
+file declarations. It records source and binary hashes. The execution-contract
+CI workflow runs this fixture and the path-contract CLI fixture on relevant
+changes. These checks establish consistent refusal, not filesystem containment.
 
 `tests/literal_text_vectors.json` checks exact text, byte limits, patterns and custom-type validation. `tests/execution_vectors.json` supplies common argument/argv cases to all four language suites. `tests/e2e_cli.py` launches all four shipping CLIs against temporary process fixtures and loopback HTTP servers. It checks expected exits and actual effects, including literal-text argv/body round trips, empty values, pre-effect refusals and a temporary shell-effect canary, uses synthetic secrets, includes proxy/redirect traps, and records planned/executed cases plus source/executable hashes before and after the run.
 

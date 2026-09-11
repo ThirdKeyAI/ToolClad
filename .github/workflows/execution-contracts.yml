@@ -1,0 +1,37 @@
+name: Execution contract parity
+on:
+  push:
+    paths: ['rust/**', 'python/**', 'js/**', 'go/**', 'tests/**', '.github/workflows/execution-contracts.yml']
+  pull_request:
+    paths: ['rust/**', 'python/**', 'js/**', 'go/**', 'tests/**', '.github/workflows/execution-contracts.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference-cli-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - run: cargo build --locked --manifest-path rust/Cargo.toml
+      - run: go build -o ../toolclad-go ./cmd/toolclad
+        working-directory: go
+      - run: npm ci --ignore-scripts
+        working-directory: js
+      - run: python3 -m pip install ./python
+      - run: python3 tests/filesystem_e2e_cli.py --rust-bin rust/target/debug/toolclad --go-bin toolclad-go --report filesystem-parity.json
+      - run: python3 tests/path_e2e_cli.py --rust-bin rust/target/debug/toolclad --go-bin toolclad-go --report path-parity.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: execution-contract-evidence
+          path: '*-parity.json'

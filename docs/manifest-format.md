@@ -31,6 +31,29 @@ human_approval = false         # Require human approval before execution. Defaul
 | `risk_tier` | string | no | `"low"` | Risk level for Cedar policy decisions |
 | `human_approval` | boolean | no | `false` | Require human approval before any execution |
 
+## `[filesystem]` -- Embedding File Capabilities
+
+```toml
+[filesystem]
+read = ["{input}"]
+create = ["{output}"]
+max_file_bytes = 8388608
+```
+
+This table requires an embedding runtime that enforces per-operation file access.
+The reference runners retain it for previews and refuse actual execution,
+including an empty `[filesystem]` table. They do not validate host paths or
+implement a file sandbox. Removing this table removes the requirement; it does
+not confer equivalent restrictions on standalone execution.
+
+Symbiont's Linux Docker/gVisor one-shot file broker accepts normalized relative
+paths or entire argument references, at most 32 inputs and one new output. Its
+per-file limit defaults to 8 MiB and may be set from one byte to 16 MiB, with a
+32 MiB combined input limit. It binds input snapshots into authorization,
+rejects links and special files, publishes outputs without overwriting existing
+entries, and excludes host mounts from custom parsers. Other embedding runtimes
+must declare their supported contract and refuse requirements they cannot enforce.
+
 ## `[tool.cedar]` -- Cedar Policy Metadata
 
 ```toml

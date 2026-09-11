@@ -184,6 +184,7 @@ type BrowserStateDef struct {
 //
 // Output is a pointer because callback-dispatch manifests may omit [output].
 type Manifest struct {
+	Filesystem map[string]any     `toml:"filesystem"`
 	Tool       ToolMeta           `toml:"tool"`
 	Args       map[string]*ArgDef `toml:"args"`
 	Command    CommandDef         `toml:"command"`

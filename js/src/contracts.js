@@ -36,6 +36,7 @@ export function checkExecution(manifest, dryRun = false) {
   const command = manifest.command || {};
   if ([command.exec?.length || command.template, command.executor, manifest.http, manifest.mcp, manifest.session, manifest.browser].filter(Boolean).length > 1) throw new Error('Ambiguous execution backends');
   if (dryRun) return;
+  if (Object.hasOwn(manifest, 'filesystem')) throw new Error('Filesystem grants require an embedding runtime');
   if ((manifest.tool.dispatch ?? 'exec') !== 'exec' || manifest.tool.human_approval || manifest.tool.cedar || Object.values(manifest.args || {}).some(a => a.scope_check)) {
     throw new Error('Execution requires an embedding runtime for dispatch, approval, Cedar or scope enforcement');
   }
