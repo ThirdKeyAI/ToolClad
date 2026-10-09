@@ -2,7 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Top-level manifest parsed from a `.clad.toml` file.
+///
+/// Every section carries `deny_unknown_fields`: a manifest is a security
+/// contract, so a key the runtime does not implement is a load error rather
+/// than a control that silently degrades to "off". The loader checks the
+/// document against the key allowlist first (so it can name every unknown
+/// key); serde is the second layer.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub tool: ToolMeta,
     #[serde(default)]
@@ -19,8 +26,27 @@ pub struct Manifest {
     pub browser: Option<BrowserDef>,
 }
 
+/// Accepted values for `tool.mode`.
+pub const MODES: &[&str] = &["oneshot", "session", "browser"];
+
+impl Manifest {
+    /// Effective execution mode. `tool.mode` is advisory: when declared it is
+    /// returned as-is, otherwise the mode is derived from the backend section
+    /// present (`[session]` → `"session"`, `[browser]` → `"browser"`, else
+    /// `"oneshot"`).
+    pub fn mode(&self) -> &str {
+        match self.tool.mode.as_deref() {
+            Some(mode) => mode,
+            None if self.session.is_some() => "session",
+            None if self.browser.is_some() => "browser",
+            None => "oneshot",
+        }
+    }
+}
+
 /// Tool metadata section `[tool]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolMeta {
     pub name: String,
     pub version: String,
@@ -38,8 +64,35 @@ pub struct ToolMeta {
     /// argument fence and dispatch happens elsewhere.
     #[serde(default = "default_dispatch")]
     pub dispatch: String,
+    /// Advisory execution mode: `"oneshot"`, `"session"`, or `"browser"`.
+    /// Validated at load; see [`Manifest::mode`] for the derived value when
+    /// absent.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Declares that the tool connects to a network destination derived from
+    /// its arguments, so every network-target argument must default-deny
+    /// internal addresses.
+    #[serde(default)]
+    pub network_egress: bool,
+    /// Permit an interpreter (`sh`, `python`, `env`, ...) as the command's
+    /// argv[0]. Off by default: an interpreter turns an argument into code.
+    #[serde(default)]
+    pub allow_interpreter: bool,
     pub cedar: Option<CedarMeta>,
     pub evidence: Option<EvidenceMeta>,
+    pub limits: Option<ToolLimits>,
+}
+
+/// Resource limits for the child process `[tool.limits]`. Each limit is
+/// applied only when declared.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolLimits {
+    pub nproc: Option<u64>,
+    pub nofile: Option<u64>,
+    pub fsize_bytes: Option<u64>,
+    pub address_space_bytes: Option<u64>,
+    pub cpu_seconds: Option<u64>,
 }
 
 fn default_dispatch() -> String {
@@ -56,6 +109,7 @@ fn default_risk_tier() -> String {
 
 /// Cedar policy integration metadata `[tool.cedar]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CedarMeta {
     pub resource: String,
     pub action: String,
@@ -63,12 +117,16 @@ pub struct CedarMeta {
 
 /// Evidence capture configuration `[tool.evidence]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceMeta {
     pub output_dir: String,
     #[serde(default)] // defaults to false, matching Python
     pub capture: bool,
     #[serde(default = "default_hash")]
     pub hash: String,
+    /// Capture a screenshot per interaction (browser mode).
+    #[serde(default)]
+    pub screenshots: bool,
 }
 
 fn default_true() -> bool {
@@ -84,6 +142,7 @@ fn default_hash() -> String {
 /// Each argument has a typed validator, optional constraints (min/max, pattern,
 /// allowed list), and injection sanitization by default.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArgDef {
     #[serde(default)]
     pub position: u32,
@@ -147,6 +206,7 @@ pub struct ArgDef {
 /// When both are present, `exec` takes precedence and `template` is kept for
 /// display only.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandDef {
     pub template: Option<String>,
     /// Canonical array-based command construction that maps directly to execve.
@@ -177,6 +237,7 @@ pub struct CommandDef {
 
 /// A conditional fragment `[command.conditionals.<name>]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConditionalDef {
     pub when: String,
     pub template: String,
@@ -189,6 +250,7 @@ pub struct ConditionalDef {
 
 /// Output definition `[output]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputDef {
     pub format: String,
     #[serde(default)]
@@ -197,14 +259,22 @@ pub struct OutputDef {
     pub envelope: bool,
     #[serde(default = "default_schema")]
     pub schema: serde_json::Value,
+    /// Upper bound on captured output, in bytes.
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: u64,
 }
 
 fn default_schema() -> serde_json::Value {
     serde_json::json!({"type": "object"})
 }
 
+fn default_max_bytes() -> u64 {
+    8_388_608
+}
+
 /// HTTP backend configuration `[http]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpDef {
     pub method: String,
     pub url: String,
@@ -219,6 +289,7 @@ pub struct HttpDef {
 
 /// MCP proxy backend configuration `[mcp]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpProxyDef {
     pub server: String,
     pub tool: String,
@@ -228,6 +299,7 @@ pub struct McpProxyDef {
 
 /// Session mode configuration `[session]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionDef {
     pub startup_command: String,
     pub ready_pattern: String,
@@ -242,6 +314,23 @@ pub struct SessionDef {
     pub interaction: Option<SessionInteractionDef>,
     #[serde(default)]
     pub commands: HashMap<String, SessionCommandDef>,
+    pub child_detection: Option<SessionChildDetectionDef>,
+}
+
+/// Child-session detection `[session.child_detection]`.
+///
+/// Parsed so a manifest that declares it loads. A match on tool output alone
+/// never registers a child session: output is attacker-influenced, so a child
+/// context may only be registered when the runtime observes it through a
+/// channel the far side does not control, with the contract taken from
+/// `manifest`, resolved at load time.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionChildDetectionDef {
+    pub pattern: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub manifest: String,
 }
 
 fn default_300() -> u64 {
@@ -257,6 +346,7 @@ fn default_100() -> u32 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionInteractionDef {
     #[serde(default)]
     pub input_sanitize: Vec<String>,
@@ -275,6 +365,7 @@ fn default_2000() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionCommandDef {
     pub pattern: String,
     pub description: String,
@@ -290,6 +381,7 @@ pub struct SessionCommandDef {
 
 /// Browser mode configuration `[browser]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserDef {
     #[serde(default = "default_cdp")]
     pub engine: String,
@@ -313,6 +405,15 @@ pub struct BrowserDef {
     #[serde(default)]
     pub commands: HashMap<String, BrowserCommandDef>,
     pub state: Option<BrowserStateDef>,
+    pub defaults: Option<BrowserDefaultsDef>,
+}
+
+/// Per-command defaults `[browser.defaults]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDefaultsDef {
+    /// "accessibility_tree" | "html" | "text"
+    pub extract_mode: Option<String>,
 }
 
 fn default_10() -> u64 {
@@ -344,6 +445,7 @@ fn default_a11y() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserScopeDef {
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -354,6 +456,7 @@ pub struct BrowserScopeDef {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserCommandDef {
     pub description: String,
     #[serde(default = "default_risk_tier")]
@@ -365,6 +468,7 @@ pub struct BrowserCommandDef {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserStateDef {
     #[serde(default)]
     pub fields: Vec<String>,

@@ -10,7 +10,12 @@ from typing import Dict, List, Optional, Tuple
 import click
 
 from toolclad.executor import build_command_argv, execute
-from toolclad.manifest import Manifest, load_manifest
+from toolclad.manifest import (
+    LoadOptions,
+    Manifest,
+    load_manifest,
+    load_manifest_with_options,
+)
 from toolclad.validator import ValidationError, validate_arg_mode
 
 
@@ -42,10 +47,17 @@ def main() -> None:
 
 @main.command()
 @click.argument("manifest_path", type=click.Path(exists=True))
-def validate(manifest_path: str) -> None:
+@click.option(
+    "--allow-unknown-keys",
+    is_flag=True,
+    help="Report unknown manifest keys as warnings on stderr instead of failing.",
+)
+def validate(manifest_path: str, allow_unknown_keys: bool) -> None:
     """Parse and validate a .clad.toml manifest."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(
+            manifest_path, LoadOptions(allow_unknown_keys=allow_unknown_keys)
+        )
     except (ValueError, FileNotFoundError) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
@@ -71,6 +83,7 @@ def validate(manifest_path: str) -> None:
     out_format = manifest.output.format if manifest.output else "(none — callback dispatch)"
     click.echo(f"Output:       {out_format}")
     click.echo(f"Dispatch:     {manifest.tool.dispatch}")
+    click.echo(f"Mode:         {manifest.tool.mode}")
     click.echo()
     click.echo("OK")
 

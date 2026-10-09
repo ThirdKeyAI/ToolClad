@@ -3,26 +3,232 @@ import TOML from "@iarna/toml";
 import { compileCommand } from "./executor.js";
 
 /**
- * Load and parse a .clad.toml manifest file.
+ * Complete manifest key allowlist, one entry per section, in the order of the
+ * normative table so the two can be diffed line by line.
+ *
+ * A section path ending in `<n>` is keyed by author-chosen names whose
+ * contents are checked against the listed keys (`[args.<n>]`,
+ * `[command.conditionals.<n>]`, `[session.commands.<n>]`,
+ * `[browser.commands.<n>]`). A known key whose value is a table but that has
+ * no entry of its own here is an open map or opaque data and is not walked:
+ * `command.defaults`, `command.mappings`, `output.schema`, `http.headers`,
+ * `mcp.field_map`, and the `args` of a session or browser command.
+ */
+export const MANIFEST_KEYS = Object.freeze({
+  "tool":
+    "name version binary description timeout_seconds risk_tier " +
+    "human_approval dispatch mode network_egress allow_interpreter " +
+    "cedar evidence limits",
+  "tool.cedar": "resource action",
+  "tool.evidence": "output_dir capture hash screenshots",
+  "tool.limits": "nproc nofile fsize_bytes address_space_bytes cpu_seconds",
+  "args.<n>":
+    "position required type description default allowed pattern " +
+    "sanitize min max min_float max_float clamp schemes " +
+    "scope_check block_internal allow_leading_dash allow_whitespace",
+  "command":
+    "template exec executor defaults mappings conditionals " +
+    "end_of_options",
+  "command.conditionals.<n>": "when template",
+  "output": "format parser envelope schema max_bytes",
+  "http": "method url headers body_template success_status error_status",
+  "mcp": "server tool field_map",
+  "session":
+    "startup_command ready_pattern startup_timeout_seconds " +
+    "idle_timeout_seconds session_timeout_seconds max_interactions " +
+    "interaction commands child_detection",
+  "session.interaction": "input_sanitize output_max_bytes output_wait_ms",
+  "session.commands.<n>":
+    "pattern description risk_tier human_approval " +
+    "extract_target args",
+  "session.child_detection": "pattern type manifest",
+  "browser":
+    "engine headless connect extract_mode startup_timeout_seconds " +
+    "session_timeout_seconds idle_timeout_seconds max_interactions " +
+    "scope commands state defaults",
+  "browser.defaults": "extract_mode",
+  "browser.scope": "allowed_domains blocked_domains allow_external",
+  "browser.commands.<n>": "description risk_tier human_approval args",
+  "browser.state": "fields",
+});
+
+// Section path -> Set of allowed keys. The root entry ("") is derived from the
+// table's first path components so the top-level section list cannot drift
+// from it.
+const SECTION_KEYS = new Map(
+  Object.entries(MANIFEST_KEYS).map(([section, keys]) => [
+    section,
+    new Set(keys.split(" ")),
+  ])
+);
+SECTION_KEYS.set(
+  "",
+  new Set([...SECTION_KEYS.keys()].map((section) => section.split(".")[0]))
+);
+
+const TOOL_MODES = ["oneshot", "session", "browser"];
+const LIMIT_KEYS = ["nproc", "nofile", "fsize_bytes", "address_space_bytes", "cpu_seconds"];
+const DEFAULT_OUTPUT_MAX_BYTES = 8388608;
+
+function isTable(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !(value instanceof Date)
+  );
+}
+
+/**
+ * Walk a parsed manifest and return every key the allowlist does not know, as
+ * sorted concrete dotted paths (e.g. `args.target.block_internal_typo`).
+ *
+ * @param {object} manifest - Raw TOML.parse result
+ * @returns {string[]} Sorted unknown key paths; empty when the manifest is clean
+ */
+export function findUnknownKeys(manifest) {
+  const unknown = [];
+  walkTable(manifest, "", "", unknown);
+  return unknown.sort();
+}
+
+function walkTable(table, section, path, unknown) {
+  const allowed = SECTION_KEYS.get(section);
+  if (allowed) {
+    for (const [key, value] of Object.entries(table)) {
+      const keyPath = path === "" ? key : `${path}.${key}`;
+      if (!allowed.has(key)) {
+        unknown.push(keyPath);
+        continue;
+      }
+      if (isTable(value)) {
+        walkTable(value, section === "" ? key : `${section}.${key}`, keyPath, unknown);
+      }
+    }
+    return;
+  }
+
+  // A section keyed by author-chosen names: check each entry's contents.
+  const named = `${section}.<n>`;
+  if (SECTION_KEYS.has(named)) {
+    for (const [name, value] of Object.entries(table)) {
+      if (isTable(value)) {
+        walkTable(value, named, `${path}.${name}`, unknown);
+      }
+    }
+    return;
+  }
+
+  // Open map or opaque data: not walked.
+}
+
+function takeBool(table, section, key, fallback) {
+  const value = table[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") {
+    throw new Error(`Invalid manifest: ${section}.${key} must be a boolean`);
+  }
+  return value;
+}
+
+function takeInt(table, section, key, fallback) {
+  const value = table[key];
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value)) {
+    throw new Error(`Invalid manifest: ${section}.${key} must be an integer`);
+  }
+  return value;
+}
+
+function requireTable(value, section) {
+  if (value !== undefined && !isTable(value)) {
+    throw new Error(`Invalid manifest: ${section} must be a table`);
+  }
+  return value;
+}
+
+/**
+ * Load and parse a .clad.toml manifest file. Always strict: an unknown key in
+ * any section is a load error.
  * @param {string} path - Path to the .clad.toml file
  * @returns {object} Parsed manifest object
  */
 export function loadManifest(path) {
+  return loadManifestWithOptions(path, {});
+}
+
+/**
+ * Load a manifest with loader options. Library callers should use
+ * `loadManifest`; this entry point exists for the CLI's `--allow-unknown-keys`
+ * escape hatch.
+ *
+ * @param {string} path - Path to the .clad.toml file
+ * @param {object} [options]
+ * @param {boolean} [options.allowUnknownKeys=false] - Downgrade unknown keys
+ *   from a load error to a warning on stderr
+ * @returns {object} Parsed manifest object
+ */
+export function loadManifestWithOptions(path, options = {}) {
+  const { allowUnknownKeys = false } = options;
   const content = readFileSync(path, "utf-8");
   const manifest = TOML.parse(content);
+
+  // Key check runs on the raw parse result, before any structural validation,
+  // so a typo cannot be masked by a default and every unknown key is reported.
+  const unknown = findUnknownKeys(manifest);
+  if (unknown.length > 0) {
+    const messages = unknown.map((key) => `unknown key '${key}' in manifest`);
+    if (!allowUnknownKeys) {
+      throw new Error(messages.join("; "));
+    }
+    for (const message of messages) {
+      console.warn(`warning: ${message}`);
+    }
+  }
 
   if (!manifest.tool || !manifest.tool.name) {
     throw new Error(`Invalid manifest: missing [tool] section or tool.name`);
   }
+  const tool = manifest.tool;
 
   // Default and validate dispatch mode.
-  const dispatch = manifest.tool.dispatch ?? "exec";
+  const dispatch = tool.dispatch ?? "exec";
   if (dispatch !== "exec" && dispatch !== "callback") {
     throw new Error(
       `Invalid manifest: invalid dispatch '${dispatch}', must be 'exec' or 'callback'`
     );
   }
-  manifest.tool.dispatch = dispatch;
+  tool.dispatch = dispatch;
+
+  // tool.mode is advisory: when absent it follows the backend section present.
+  if (tool.mode === undefined) {
+    tool.mode = manifest.session ? "session" : manifest.browser ? "browser" : "oneshot";
+  } else if (!TOOL_MODES.includes(tool.mode)) {
+    throw new Error(
+      `Invalid manifest: invalid tool.mode '${tool.mode}', must be one of ${TOOL_MODES.join(", ")}`
+    );
+  }
+
+  // Keys registered ahead of the waves that enforce them: accept them, check
+  // their shape, and give them inert defaults.
+  tool.network_egress = takeBool(tool, "tool", "network_egress", false);
+  tool.allow_interpreter = takeBool(tool, "tool", "allow_interpreter", false);
+  if (requireTable(tool.evidence, "tool.evidence")) {
+    tool.evidence.screenshots = takeBool(tool.evidence, "tool.evidence", "screenshots", false);
+  }
+  if (requireTable(tool.limits, "tool.limits")) {
+    for (const key of LIMIT_KEYS) {
+      takeInt(tool.limits, "tool.limits", key, undefined);
+    }
+  }
+  if (requireTable(manifest.output, "output")) {
+    manifest.output.max_bytes = takeInt(
+      manifest.output,
+      "output",
+      "max_bytes",
+      DEFAULT_OUTPUT_MAX_BYTES
+    );
+  }
 
   const isCallback = dispatch === "callback";
 
@@ -35,7 +241,7 @@ export function loadManifest(path) {
     const hasBrowser = !!manifest.browser;
 
     if (!hasHttp && !hasMcp && !hasSession && !hasBrowser) {
-      if (!manifest.tool.binary && !(manifest.command && manifest.command.executor)) {
+      if (!tool.binary && !(manifest.command && manifest.command.executor)) {
         throw new Error(
           `Invalid manifest: must specify tool.binary, command.executor, [http], [mcp], [session], or [browser] (or set tool.dispatch = "callback" for validator-only manifests)`
         );

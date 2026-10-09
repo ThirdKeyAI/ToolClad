@@ -505,3 +505,698 @@ template = "-H {headers}"
 		t.Fatalf("expected glued conditional var rejection, got %v", err)
 	}
 }
+
+// --- Unknown manifest keys (SEMANTICS.md W2) ---
+
+func TestUnknownToolKeyRefused(t *testing.T) {
+	p := writeTmp(t, `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+tiemout_seconds = 5
+
+[command]
+exec = ["echo"]
+
+[output]
+format = "text"
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected misspelled tool key to be refused")
+	}
+	if !strings.Contains(err.Error(), "unknown key 'tool.tiemout_seconds' in manifest") {
+		t.Errorf("error must name the key: %v", err)
+	}
+}
+
+func TestUnknownArgKeyRefused(t *testing.T) {
+	p := writeTmp(t, manifestHeader+`
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+block_internal_typo = true
+
+[command]
+exec = ["echo", "{target}"]
+`)
+	_, err := LoadManifest(p)
+	if err == nil || !strings.Contains(err.Error(), "unknown key 'args.target.block_internal_typo' in manifest") {
+		t.Fatalf("expected args.target.block_internal_typo to be refused, got %v", err)
+	}
+}
+
+func TestUnknownSectionKeysRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "command",
+			body: `
+[command]
+exec = ["echo"]
+shell = true
+`,
+			want: "unknown key 'command.shell' in manifest",
+		},
+		{
+			name: "output",
+			body: `
+[command]
+exec = ["echo"]
+
+[output]
+formatt = "text"
+`,
+			want: "unknown key 'output.formatt' in manifest",
+		},
+		{
+			name: "http",
+			body: `
+[http]
+method = "GET"
+url = "https://example.com/"
+verify_tls = false
+
+[output]
+format = "json"
+`,
+			want: "unknown key 'http.verify_tls' in manifest",
+		},
+		{
+			name: "conditional",
+			body: `
+[args.rate]
+position = 1
+required = false
+type = "integer"
+
+[command]
+exec = ["echo", "{_rate_flag}"]
+
+[command.conditionals.rate_flag]
+whenn = "rate != ''"
+template = "--rate {rate}"
+
+[output]
+format = "text"
+`,
+			want: "unknown key 'command.conditionals.rate_flag.whenn' in manifest",
+		},
+		{
+			name: "session",
+			body: `
+[session]
+startup_command = "sh"
+ready_patern = "> "
+
+[output]
+format = "text"
+`,
+			want: "unknown key 'session.ready_patern' in manifest",
+		},
+		{
+			name: "browser",
+			body: `
+[browser]
+engine = "chromium"
+headles = true
+
+[output]
+format = "text"
+`,
+			want: "unknown key 'browser.headles' in manifest",
+		},
+	}
+	header := `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+`
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := writeTmp(t, header+c.body)
+			_, err := LoadManifest(p)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want %q in error, got %v", c.want, err)
+			}
+		})
+	}
+}
+
+func TestUnknownKeysReportedTogetherSorted(t *testing.T) {
+	p := writeTmp(t, `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+zzz_last = 1
+tiemout_seconds = 5
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+block_internal_typo = true
+
+[command]
+exec = ["echo", "{target}"]
+shell = true
+
+[output]
+format = "text"
+formatt = "text"
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	want := []string{
+		"unknown key 'args.target.block_internal_typo' in manifest",
+		"unknown key 'command.shell' in manifest",
+		"unknown key 'output.formatt' in manifest",
+		"unknown key 'tool.tiemout_seconds' in manifest",
+		"unknown key 'tool.zzz_last' in manifest",
+	}
+	last := -1
+	for _, w := range want {
+		idx := strings.Index(msg, w)
+		if idx < 0 {
+			t.Errorf("error must name %q: %s", w, msg)
+			continue
+		}
+		if idx < last {
+			t.Errorf("unknown keys must be sorted; %q out of order in: %s", w, msg)
+		}
+		if strings.Count(msg, w) != 1 {
+			t.Errorf("%q must be reported exactly once: %s", w, msg)
+		}
+		last = idx
+	}
+}
+
+func TestUnknownTableReportedByItsOwnPath(t *testing.T) {
+	p := writeTmp(t, manifestHeader+`
+[command]
+exec = ["echo"]
+
+[sandbox]
+enabled = true
+level = 2
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected unknown table to be refused")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "unknown key 'sandbox' in manifest") {
+		t.Errorf("unknown table must be reported by its own path: %s", msg)
+	}
+	if strings.Contains(msg, "sandbox.enabled") || strings.Contains(msg, "sandbox.level") {
+		t.Errorf("entries beneath an unknown table must not be reported separately: %s", msg)
+	}
+}
+
+func TestAllowUnknownKeysDowngradesToWarning(t *testing.T) {
+	src := `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+tiemout_seconds = 5
+
+[command]
+exec = ["echo"]
+shell = true
+
+[output]
+format = "text"
+`
+	p := writeTmp(t, src)
+
+	// The strict entry points stay strict.
+	if _, err := LoadManifest(p); err == nil {
+		t.Fatal("LoadManifest must stay strict")
+	}
+	if _, err := LoadManifestWithOptions(p, LoadOptions{}); err == nil {
+		t.Fatal("zero LoadOptions must be strict")
+	}
+
+	var buf bytes.Buffer
+	old := WarningOutput
+	WarningOutput = &buf
+	defer func() { WarningOutput = old }()
+
+	m, err := LoadManifestWithOptions(p, LoadOptions{AllowUnknownKeys: true})
+	if err != nil {
+		t.Fatalf("AllowUnknownKeys must load: %v", err)
+	}
+	if m.Tool.Name != "x" {
+		t.Errorf("manifest not loaded: %+v", m.Tool)
+	}
+	out := buf.String()
+	for _, w := range []string{
+		"warning: unknown key 'command.shell' in manifest\n",
+		"warning: unknown key 'tool.tiemout_seconds' in manifest\n",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("expected %q on WarningOutput, got %q", w, out)
+		}
+	}
+}
+
+func TestOpenMapKeysNotReported(t *testing.T) {
+	p := writeTmp(t, `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+
+[args.mode]
+position = 1
+required = true
+type = "enum"
+allowed = ["fast"]
+
+[command]
+exec = ["echo", "{anything}", "{_mode_flags}"]
+
+[command.defaults]
+anything = "goes"
+other = 5
+
+[command.defaults.nested]
+deeper = true
+
+[command.mappings.mode]
+fast = "-T4"
+
+[output]
+format = "json"
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.raw_output]
+type = "string"
+description = "nested schema tables are author-defined"
+
+[output.schema.properties.hosts.items.properties.port]
+type = "integer"
+
+[http]
+method = "GET"
+url = "https://example.com/"
+
+[http.headers]
+Accept = "application/json"
+X-Anything = "allowed"
+
+[mcp]
+server = "mcp://example.com"
+tool = "scan"
+
+[mcp.field_map]
+mode = "speed"
+`)
+	m, err := LoadManifest(p)
+	if err != nil {
+		t.Fatalf("author-chosen keys under open maps must load: %v", err)
+	}
+	if m.Command.Defaults["anything"] != "goes" {
+		t.Errorf("command.defaults not decoded: %v", m.Command.Defaults)
+	}
+	if m.Http.Headers["X-Anything"] != "allowed" {
+		t.Errorf("http.headers not decoded: %v", m.Http.Headers)
+	}
+	if m.Mcp.FieldMap["mode"] != "speed" {
+		t.Errorf("mcp.field_map not decoded: %v", m.Mcp.FieldMap)
+	}
+	if _, ok := m.Output.Schema["properties"]; !ok {
+		t.Errorf("output.schema not decoded: %v", m.Output.Schema)
+	}
+}
+
+// TestEveryAllowlistedKeyAccepted exercises every key in the SEMANTICS.md W2
+// allowlist so the Go struct tags cannot drift from the other runtimes.
+func TestEveryAllowlistedKeyAccepted(t *testing.T) {
+	oneshot := writeTmp(t, `
+[tool]
+name = "all_keys"
+version = "1.0.0"
+binary = "echo"
+description = "exercises every oneshot key"
+timeout_seconds = 30
+risk_tier = "low"
+human_approval = false
+dispatch = "exec"
+mode = "oneshot"
+network_egress = true
+allow_interpreter = false
+
+[tool.cedar]
+resource = "Tool::AllKeys"
+action = "execute_tool"
+
+[tool.evidence]
+output_dir = "{evidence_dir}/{scan_id}"
+capture = true
+hash = "sha256"
+screenshots = false
+
+[tool.limits]
+nproc = 64
+nofile = 256
+fsize_bytes = 1048576
+address_space_bytes = 536870912
+cpu_seconds = 30
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+description = "target"
+default = "example.com"
+allowed = []
+pattern = "^[a-z.]+$"
+sanitize = ["injection"]
+min = 1
+max = 10
+min_float = 0.5
+max_float = 9.5
+clamp = true
+schemes = ["https"]
+scope_check = false
+block_internal = true
+allow_leading_dash = false
+allow_whitespace = false
+
+[args.mode]
+position = 2
+required = false
+type = "enum"
+allowed = ["fast", "slow"]
+default = "fast"
+
+[command]
+template = "echo {target}"
+exec = ["echo", "{target}", "{_mode_flags}", "{_rate}", "{maxtime}"]
+executor = ""
+end_of_options = "--"
+
+[command.defaults]
+maxtime = "600s"
+
+[command.mappings.mode]
+fast = "-T4"
+slow = "-T1"
+
+[command.conditionals.rate]
+when = "target != ''"
+template = "--rate 10"
+
+[output]
+format = "json"
+parser = "builtin:json"
+envelope = true
+max_bytes = 1024
+
+[output.schema]
+type = "object"
+
+[output.schema.properties.raw_output]
+type = "string"
+
+[http]
+method = "POST"
+url = "https://api.example.com/scan"
+body_template = "{\"target\": \"{target}\"}"
+success_status = [200]
+error_status = [500]
+
+[http.headers]
+Accept = "application/json"
+
+[mcp]
+server = "mcp://example.com"
+tool = "remote_scan"
+
+[mcp.field_map]
+target = "host"
+`)
+	m, err := LoadManifest(oneshot)
+	if err != nil {
+		t.Fatalf("every allowlisted oneshot key must load: %v", err)
+	}
+	if !m.Tool.NetworkEgress || m.Tool.AllowInterpreter || m.Tool.Mode != "oneshot" {
+		t.Errorf("tool keys not decoded: %+v", m.Tool)
+	}
+	if m.Tool.Limits == nil || m.Tool.Limits.Nproc == nil || *m.Tool.Limits.Nproc != 64 ||
+		m.Tool.Limits.CPUSeconds == nil || *m.Tool.Limits.CPUSeconds != 30 {
+		t.Errorf("tool.limits not decoded: %+v", m.Tool.Limits)
+	}
+	if m.Tool.Evidence == nil || m.Tool.Evidence.Screenshots {
+		t.Errorf("tool.evidence.screenshots not decoded: %+v", m.Tool.Evidence)
+	}
+	if !m.Args["target"].BlockInternal {
+		t.Errorf("args.target.block_internal not decoded: %+v", m.Args["target"])
+	}
+	if m.Output.MaxBytes == nil || *m.Output.MaxBytes != 1024 || m.Output.MaxBytesLimit() != 1024 {
+		t.Errorf("output.max_bytes not decoded: %+v", m.Output)
+	}
+
+	sessionBrowser := writeTmp(t, `
+[tool]
+name = "session_browser"
+version = "1.0.0"
+binary = "msfconsole"
+description = "exercises every session and browser key"
+mode = "session"
+
+[session]
+startup_command = "msfconsole -q"
+ready_pattern = "msf6 >"
+startup_timeout_seconds = 60
+idle_timeout_seconds = 300
+session_timeout_seconds = 3600
+max_interactions = 100
+
+[session.interaction]
+input_sanitize = ["injection"]
+output_max_bytes = 1048576
+output_wait_ms = 500
+
+[session.commands.set_target]
+pattern = "set RHOSTS {target}"
+description = "Set the target"
+risk_tier = "low"
+human_approval = false
+extract_target = true
+
+[session.commands.set_target.args.target]
+position = 1
+required = true
+type = "scope_target"
+block_internal = true
+
+[session.child_detection]
+pattern = "^nmap "
+type = "oneshot"
+manifest = "nmap_scan.clad.toml"
+
+[browser]
+engine = "chromium"
+headless = true
+connect = "ws://localhost:9222"
+extract_mode = "text"
+startup_timeout_seconds = 30
+session_timeout_seconds = 600
+idle_timeout_seconds = 120
+max_interactions = 50
+
+[browser.defaults]
+extract_mode = "markdown"
+
+[browser.scope]
+allowed_domains = ["example.com"]
+blocked_domains = ["evil.example"]
+allow_external = false
+
+[browser.commands.navigate]
+description = "Open a page"
+risk_tier = "low"
+human_approval = false
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+
+[browser.state]
+fields = ["url", "title"]
+
+[output]
+format = "text"
+`)
+	m, err = LoadManifest(sessionBrowser)
+	if err != nil {
+		t.Fatalf("every allowlisted session/browser key must load: %v", err)
+	}
+	if m.Session == nil || m.Session.ChildDetection == nil ||
+		m.Session.ChildDetection.Pattern != "^nmap " ||
+		m.Session.ChildDetection.Type != "oneshot" ||
+		m.Session.ChildDetection.Manifest != "nmap_scan.clad.toml" {
+		t.Errorf("session.child_detection not decoded: %+v", m.Session)
+	}
+	if m.Browser == nil || m.Browser.Defaults == nil || m.Browser.Defaults.ExtractMode != "markdown" {
+		t.Errorf("browser.defaults not decoded: %+v", m.Browser)
+	}
+	if m.Tool.Mode != "session" {
+		t.Errorf("explicit tool.mode must be kept, got %q", m.Tool.Mode)
+	}
+}
+
+func TestToolModeValidation(t *testing.T) {
+	header := `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+%s
+
+[output]
+format = "text"
+`
+	derived := []struct {
+		name    string
+		backend string
+		want    string
+	}{
+		{"oneshot", "\n[command]\nexec = [\"echo\"]\n", "oneshot"},
+		{"session", "\n[session]\nstartup_command = \"sh\"\n", "session"},
+		{"browser", "\n[browser]\nengine = \"chromium\"\n", "browser"},
+	}
+	for _, c := range derived {
+		t.Run("derived_"+c.name, func(t *testing.T) {
+			p := writeTmp(t, strings.Replace(header, "%s", "", 1)+c.backend)
+			m, err := LoadManifest(p)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if m.Tool.Mode != c.want {
+				t.Errorf("want derived mode %q, got %q", c.want, m.Tool.Mode)
+			}
+		})
+	}
+
+	for _, mode := range ToolModes {
+		p := writeTmp(t, strings.Replace(header, "%s", "mode = \""+mode+"\"", 1)+"\n[command]\nexec = [\"echo\"]\n")
+		m, err := LoadManifest(p)
+		if err != nil {
+			t.Fatalf("mode %q must be accepted: %v", mode, err)
+		}
+		if m.Tool.Mode != mode {
+			t.Errorf("want mode %q, got %q", mode, m.Tool.Mode)
+		}
+	}
+
+	p := writeTmp(t, strings.Replace(header, "%s", "mode = \"rocket\"", 1)+"\n[command]\nexec = [\"echo\"]\n")
+	_, err := LoadManifest(p)
+	if err == nil || !strings.Contains(err.Error(), "invalid tool.mode 'rocket'") {
+		t.Fatalf("expected invalid tool.mode error, got %v", err)
+	}
+}
+
+func TestOutputMaxBytesDefault(t *testing.T) {
+	p := writeTmp(t, manifestHeader+`
+[command]
+exec = ["echo"]
+`)
+	m, err := LoadManifest(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m.Output.MaxBytes != nil {
+		t.Errorf("absent max_bytes must decode as nil, got %v", *m.Output.MaxBytes)
+	}
+	if m.Output.MaxBytesLimit() != DefaultOutputMaxBytes || DefaultOutputMaxBytes != 8388608 {
+		t.Errorf("want default 8388608, got %d", m.Output.MaxBytesLimit())
+	}
+}
+
+func TestCaseVariantKeyRefused(t *testing.T) {
+	// The decoder would fill TimeoutSeconds from a case-variant key; the
+	// allowlist is exact so the other runtimes and this one agree.
+	p := writeTmp(t, `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "echo"
+Timeout_Seconds = 5
+
+[command]
+exec = ["echo"]
+
+[output]
+format = "text"
+`)
+	_, err := LoadManifest(p)
+	if err == nil || !strings.Contains(err.Error(), "unknown key 'tool.Timeout_Seconds' in manifest") {
+		t.Fatalf("expected case-variant key to be refused, got %v", err)
+	}
+}
+
+func TestUnknownKeyInNestedCommandArgsRefused(t *testing.T) {
+	p := writeTmp(t, `
+[tool]
+name = "x"
+version = "1.0.0"
+binary = "sh"
+
+[session]
+startup_command = "sh"
+
+[session.commands.set_target]
+pattern = "set RHOSTS {target}"
+descriptionn = "typo"
+
+[session.commands.set_target.args.target]
+position = 1
+type = "scope_target"
+block_internal_typo = true
+
+[browser]
+engine = "chromium"
+
+[browser.commands.navigate]
+description = "x"
+risk = "low"
+
+[browser.commands.navigate.args.url]
+type = "url"
+schemas = ["https"]
+
+[output]
+format = "text"
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, w := range []string{
+		"unknown key 'session.commands.set_target.descriptionn' in manifest",
+		"unknown key 'session.commands.set_target.args.target.block_internal_typo' in manifest",
+		"unknown key 'browser.commands.navigate.risk' in manifest",
+		"unknown key 'browser.commands.navigate.args.url.schemas' in manifest",
+	} {
+		if strings.Count(err.Error(), w) != 1 {
+			t.Errorf("want %q exactly once in: %v", w, err)
+		}
+	}
+}

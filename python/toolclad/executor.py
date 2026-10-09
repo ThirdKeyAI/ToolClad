@@ -317,6 +317,24 @@ def _expand_tokens(
     return out
 
 
+def _check_declared_args(manifest: Manifest, args: Dict[str, str]) -> None:
+    """Refuse a supplied argument name that ``[args]`` does not declare.
+
+    An undeclared name never reaches the command, but dropping it silently
+    hides the gap between what the caller asked for and what ran.
+    """
+    unknown = sorted(name for name in args if name not in manifest.args)
+    if not unknown:
+        return
+    declared = ", ".join(a.name for a in manifest.args_sorted) or "none"
+    raise ValidationError(
+        "; ".join(
+            f"unknown argument '{name}' (declared arguments: {declared})"
+            for name in unknown
+        )
+    )
+
+
 def _resolve_context(
     manifest: Manifest, args: Dict[str, str]
 ) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
@@ -328,6 +346,7 @@ def _resolve_context(
         multi-token variables (``_<arg>_flags`` from mappings, ``_<cond>``
         from conditionals), each already split into argv tokens.
     """
+    _check_declared_args(manifest, args)
     exec_mode = manifest.command.exec_was_declared
     single: Dict[str, str] = {}
     absent: Set[str] = set()
@@ -621,6 +640,7 @@ def _execute_http(
     """Execute an HTTP-based manifest using urllib.request (no extra deps)."""
     http = manifest.http
     assert http is not None
+    _check_declared_args(manifest, args)
 
     scan_id = _generate_scan_id()
     effective_timeout = timeout or manifest.tool.timeout_seconds
@@ -778,6 +798,7 @@ def execute(
     # Handle custom executor escape hatch.
     if manifest.command.executor:
         # Validate args manually since build_command() isn't called for executor mode
+        _check_declared_args(manifest, args)
         validated_args: Dict[str, str] = {}
         for arg_name, arg_def in manifest.args.items():
             if arg_name in args:

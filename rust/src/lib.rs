@@ -29,6 +29,14 @@
 //! never re-split and `end_of_options = "--"` can fence user values off from
 //! option parsing entirely.
 //!
+//! A manifest key the runtime does not know is a load error
+//! (`unknown key 'tool.tiemout_seconds' in manifest`), never a silently
+//! ignored control. The only escape hatch is
+//! `toolclad validate --allow-unknown-keys`, which [`load_manifest_with`]
+//! exposes through [`LoadOptions`]; [`load_manifest`] and [`parse_manifest`]
+//! are always strict. At call time an argument name the manifest does not
+//! declare is refused the same way.
+//!
 //! ## Core Types
 //!
 //! | Type | Validates |
@@ -100,24 +108,301 @@ pub mod validator;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use types::{CustomTypeDef, Manifest, ToolCladError};
+use types::{CustomTypeDef, Manifest, ToolCladError, MODES};
+
+/// Loader options. The default is strict; see [`load_manifest_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Downgrade unknown manifest keys from a load error to a warning on
+    /// stderr (`warning: unknown key '<section>.<key>' in manifest`) and drop
+    /// them. An authoring aid for `toolclad validate --allow-unknown-keys`;
+    /// the plain loaders never set it.
+    pub allow_unknown_keys: bool,
+}
 
 /// Load and parse a `.clad.toml` manifest from the given path.
+///
+/// Strict: an unknown key anywhere in the manifest is a load error.
 pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, ToolCladError> {
+    load_manifest_with(path, LoadOptions::default())
+}
+
+/// [`load_manifest`] with explicit [`LoadOptions`].
+pub fn load_manifest_with<P: AsRef<Path>>(
+    path: P,
+    options: LoadOptions,
+) -> Result<Manifest, ToolCladError> {
     let path = path.as_ref();
     let content = std::fs::read_to_string(path).map_err(|e| {
         ToolCladError::ManifestError(format!("failed to read '{}': {e}", path.display()))
     })?;
-    parse_manifest(&content)
+    parse_manifest_with(&content, options)
 }
 
 /// Parse a manifest from a TOML string.
+///
+/// Strict: an unknown key anywhere in the manifest is a load error.
 pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
-    let mut manifest: Manifest = toml::from_str(toml_str)
-        .map_err(|e| ToolCladError::ManifestError(format!("TOML parse error: {e}")))?;
+    parse_manifest_with(toml_str, LoadOptions::default())
+}
+
+/// [`parse_manifest`] with explicit [`LoadOptions`].
+pub fn parse_manifest_with(
+    toml_str: &str,
+    options: LoadOptions,
+) -> Result<Manifest, ToolCladError> {
+    let parse_err =
+        |e: toml::de::Error| ToolCladError::ManifestError(format!("TOML parse error: {e}"));
+
+    // Walk the raw document against the key allowlist first so every unknown
+    // key is reported by its full path. `deny_unknown_fields` on the types is
+    // the second layer and catches anything the table and the structs disagree
+    // on.
+    let mut doc: toml::Table = toml::from_str(toml_str).map_err(parse_err)?;
+    let unknown = prune_unknown_keys(&mut doc);
+
+    let mut manifest: Manifest = if unknown.is_empty() {
+        // Deserialize from the text so a structural error keeps its position.
+        toml::from_str(toml_str).map_err(parse_err)?
+    } else if options.allow_unknown_keys {
+        for key in &unknown {
+            eprintln!("warning: unknown key '{key}' in manifest");
+        }
+        toml::Value::Table(doc).try_into().map_err(parse_err)?
+    } else {
+        return Err(ToolCladError::ManifestError(unknown_keys_message(&unknown)));
+    };
+
     compile_command(&mut manifest)?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+/// Keys every argument table accepts (`[args.<n>]`, `[session.commands.<n>.args.<n>]`,
+/// `[browser.commands.<n>.args.<n>]`).
+const ARG_KEYS: &[&str] = &[
+    "position",
+    "required",
+    "type",
+    "description",
+    "default",
+    "allowed",
+    "pattern",
+    "sanitize",
+    "min",
+    "max",
+    "min_float",
+    "max_float",
+    "clamp",
+    "schemes",
+    "scope_check",
+    "block_internal",
+    "allow_leading_dash",
+    "allow_whitespace",
+];
+
+/// The manifest key allowlist, one entry per section: `(section, keys)`.
+///
+/// This is the Rust copy of the cross-runtime allowlist and is meant to be
+/// diffed against it line by line. A `*` segment stands for a user-chosen
+/// name (`[args.<n>]`, `[command.conditionals.<n>]`, ...). A table that is not
+/// listed here is an open map whose keys are user data (`command.defaults`,
+/// `command.mappings`, `output.schema`, `http.headers`, `mcp.field_map`) and
+/// is not walked.
+const KNOWN_KEYS: &[(&str, &[&str])] = &[
+    (
+        "",
+        &[
+            "tool", "args", "command", "output", "http", "mcp", "session", "browser",
+        ],
+    ),
+    (
+        "tool",
+        &[
+            "name",
+            "version",
+            "binary",
+            "description",
+            "timeout_seconds",
+            "risk_tier",
+            "human_approval",
+            "dispatch",
+            "mode",
+            "network_egress",
+            "allow_interpreter",
+            "cedar",
+            "evidence",
+            "limits",
+        ],
+    ),
+    ("tool.cedar", &["resource", "action"]),
+    (
+        "tool.evidence",
+        &["output_dir", "capture", "hash", "screenshots"],
+    ),
+    (
+        "tool.limits",
+        &[
+            "nproc",
+            "nofile",
+            "fsize_bytes",
+            "address_space_bytes",
+            "cpu_seconds",
+        ],
+    ),
+    ("args.*", ARG_KEYS),
+    (
+        "command",
+        &[
+            "template",
+            "exec",
+            "executor",
+            "defaults",
+            "mappings",
+            "conditionals",
+            "end_of_options",
+        ],
+    ),
+    ("command.conditionals.*", &["when", "template"]),
+    (
+        "output",
+        &["format", "parser", "envelope", "schema", "max_bytes"],
+    ),
+    (
+        "http",
+        &[
+            "method",
+            "url",
+            "headers",
+            "body_template",
+            "success_status",
+            "error_status",
+        ],
+    ),
+    ("mcp", &["server", "tool", "field_map"]),
+    (
+        "session",
+        &[
+            "startup_command",
+            "ready_pattern",
+            "startup_timeout_seconds",
+            "idle_timeout_seconds",
+            "session_timeout_seconds",
+            "max_interactions",
+            "interaction",
+            "commands",
+            "child_detection",
+        ],
+    ),
+    (
+        "session.interaction",
+        &["input_sanitize", "output_max_bytes", "output_wait_ms"],
+    ),
+    (
+        "session.commands.*",
+        &[
+            "pattern",
+            "description",
+            "risk_tier",
+            "human_approval",
+            "extract_target",
+            "args",
+        ],
+    ),
+    ("session.commands.*.args.*", ARG_KEYS),
+    ("session.child_detection", &["pattern", "type", "manifest"]),
+    (
+        "browser",
+        &[
+            "engine",
+            "headless",
+            "connect",
+            "extract_mode",
+            "startup_timeout_seconds",
+            "session_timeout_seconds",
+            "idle_timeout_seconds",
+            "max_interactions",
+            "scope",
+            "commands",
+            "state",
+            "defaults",
+        ],
+    ),
+    ("browser.defaults", &["extract_mode"]),
+    (
+        "browser.scope",
+        &["allowed_domains", "blocked_domains", "allow_external"],
+    ),
+    (
+        "browser.commands.*",
+        &["description", "risk_tier", "human_approval", "args"],
+    ),
+    ("browser.commands.*.args.*", ARG_KEYS),
+    ("browser.state", &["fields"]),
+];
+
+fn known_keys(section: &str) -> Option<&'static [&'static str]> {
+    KNOWN_KEYS
+        .iter()
+        .find(|(name, _)| *name == section)
+        .map(|(_, keys)| *keys)
+}
+
+fn join_path(base: &str, key: &str) -> String {
+    if base.is_empty() {
+        key.to_string()
+    } else {
+        format!("{base}.{key}")
+    }
+}
+
+/// Remove every key [`KNOWN_KEYS`] does not list from the document and return
+/// the concrete dotted path of each removed key, sorted.
+fn prune_unknown_keys(doc: &mut toml::Table) -> Vec<String> {
+    let mut unknown = Vec::new();
+    prune_section(doc, "", "", &mut unknown);
+    unknown.sort();
+    unknown
+}
+
+/// `section` is the allowlist pattern (`session.commands.*`), `path` the
+/// concrete location in this document (`session.commands.select`).
+fn prune_section(table: &mut toml::Table, section: &str, path: &str, unknown: &mut Vec<String>) {
+    let Some(allowed) = known_keys(section) else {
+        return;
+    };
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        let key_path = join_path(path, &key);
+        if !allowed.contains(&key.as_str()) {
+            table.remove(&key);
+            unknown.push(key_path);
+            continue;
+        }
+        let Some(toml::Value::Table(child)) = table.get_mut(&key) else {
+            continue;
+        };
+        let child_section = join_path(section, &key);
+        if known_keys(&child_section).is_some() {
+            prune_section(child, &child_section, &key_path, unknown);
+            continue;
+        }
+        let named_section = join_path(&child_section, "*");
+        if known_keys(&named_section).is_some() {
+            for (name, entry) in child.iter_mut() {
+                if let toml::Value::Table(sub) = entry {
+                    prune_section(sub, &named_section, &join_path(&key_path, name), unknown);
+                }
+            }
+        }
+    }
+}
+
+fn unknown_keys_message(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| format!("unknown key '{k}' in manifest"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Compile the `[command]` section into its canonical exec form.
@@ -271,6 +556,16 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
             manifest.tool.dispatch,
             valid_dispatch.join(", ")
         )));
+    }
+
+    // Validate the advisory mode when declared.
+    if let Some(ref mode) = manifest.tool.mode {
+        if !MODES.contains(&mode.as_str()) {
+            return Err(ToolCladError::ManifestError(format!(
+                "invalid mode '{mode}', must be one of: {}",
+                MODES.join(", ")
+            )));
+        }
     }
 
     let is_callback = manifest.tool.dispatch == "callback";
@@ -951,6 +1246,7 @@ type = "object"
 name = "psql_session"
 version = "1.0.0"
 binary = "psql"
+mode = "session"
 description = "Interactive PostgreSQL session"
 timeout_seconds = 300
 risk_tier = "medium"
@@ -990,6 +1286,8 @@ type = "object"
 "#;
         let m = parse_manifest(toml_str).unwrap();
         assert_eq!(m.tool.name, "psql_session");
+        assert_eq!(m.tool.mode.as_deref(), Some("session"));
+        assert_eq!(m.mode(), "session");
         assert!(m.session.is_some());
         let session = m.session.as_ref().unwrap();
         assert_eq!(
@@ -1018,6 +1316,7 @@ type = "object"
 name = "web_scraper"
 version = "1.0.0"
 binary = "chrome"
+mode = "browser"
 description = "Browser-based web scraper"
 timeout_seconds = 120
 risk_tier = "medium"
@@ -1066,6 +1365,7 @@ type = "object"
 "#;
         let m = parse_manifest(toml_str).unwrap();
         assert_eq!(m.tool.name, "web_scraper");
+        assert_eq!(m.mode(), "browser");
         assert!(m.browser.is_some());
         let browser = m.browser.as_ref().unwrap();
         assert_eq!(browser.engine, "cdp");
@@ -1523,5 +1823,526 @@ format = "text"
         .to_string();
         assert!(err.contains("mapping for 'label'"), "unexpected: {err}");
         assert!(err.contains("unbalanced quote"), "unexpected: {err}");
+    }
+
+    // ----- unknown manifest keys -----------------------------------------
+
+    /// Smallest valid oneshot manifest with a hole in each section to drop
+    /// extra lines into.
+    fn oneshot(tool: &str, arg: &str, command: &str, output: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "t"
+version = "1.0.0"
+binary = "echo"
+description = "d"
+{tool}
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+{arg}
+
+[command]
+exec = ["echo", "{{target}}"]
+{command}
+
+[output]
+format = "text"
+{output}
+"#
+        )
+    }
+
+    #[test]
+    fn test_unknown_tool_key_refused() {
+        let err = parse_manifest(&oneshot("tiemout_seconds = 5", "", "", ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'tool.tiemout_seconds' in manifest"
+        );
+    }
+
+    #[test]
+    fn test_unknown_arg_key_refused() {
+        let err = parse_manifest(&oneshot("", "block_internal_typo = true", "", ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'args.target.block_internal_typo' in manifest"
+        );
+    }
+
+    #[test]
+    fn test_unknown_command_output_http_conditional_keys_refused() {
+        let err = parse_manifest(&oneshot("", "", "shell = true", ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'command.shell' in manifest"
+        );
+
+        let err = parse_manifest(&oneshot("", "", "", "max_byte = 1"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'output.max_byte' in manifest"
+        );
+
+        let cond = "[command.conditionals.rate_flag]\nwhen = \"target != ''\"\ntemplate = \"-x\"\nwhenn = \"y\"";
+        let err = parse_manifest(&oneshot("", "", cond, ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'command.conditionals.rate_flag.whenn' in manifest"
+        );
+        // Inline-table form of the same conditional.
+        let cond = "[command.conditionals]\nrate_flag = { when = \"target != ''\", template = \"-x\", whenn = \"y\" }";
+        let err = parse_manifest(&oneshot("", "", cond, ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'command.conditionals.rate_flag.whenn' in manifest"
+        );
+
+        let http = oneshot("", "", "", "")
+            + "\n[http]\nmethod = \"GET\"\nurl = \"https://example.com/\"\nverb = \"GET\"\n";
+        let err = parse_manifest(&http).unwrap_err().to_string();
+        assert_eq!(err, "manifest error: unknown key 'http.verb' in manifest");
+    }
+
+    #[test]
+    fn test_several_unknown_keys_reported_together_sorted() {
+        let bad = oneshot(
+            "tiemout_seconds = 5",
+            "block_internal_typo = true",
+            "shell = true",
+            "max_byte = 1",
+        ) + "\n[toolz]\nx = 1\n";
+        let err = parse_manifest(&bad).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "manifest error: \
+             unknown key 'args.target.block_internal_typo' in manifest; \
+             unknown key 'command.shell' in manifest; \
+             unknown key 'output.max_byte' in manifest; \
+             unknown key 'tool.tiemout_seconds' in manifest; \
+             unknown key 'toolz' in manifest"
+        );
+    }
+
+    #[test]
+    fn test_allow_unknown_keys_downgrades_to_warning() {
+        let text = oneshot("tiemout_seconds = 5", "block_internal_typo = true", "", "");
+        let strict = LoadOptions::default();
+        assert!(!strict.allow_unknown_keys);
+        assert!(parse_manifest_with(&text, strict).is_err());
+
+        let lenient = LoadOptions {
+            allow_unknown_keys: true,
+        };
+        let m = parse_manifest_with(&text, lenient).unwrap();
+        // The unknown keys were dropped, not applied under another name.
+        assert_eq!(m.tool.timeout_seconds, 60);
+        assert!(!m.args["target"].block_internal);
+    }
+
+    #[test]
+    fn test_open_maps_are_not_walked() {
+        // Keys inside these tables are user-chosen names, never unknown keys.
+        let command = "\n[command.defaults]\nrate = 1\nmax_byte = 2\n\n\
+                       [command.mappings.target]\nanything = \"-x\"\n";
+        let output = "\n[output.schema]\ntype = \"object\"\nshell = true\n\n\
+                      [output.schema.properties.whenn]\ntype = \"string\"\n";
+        let m = parse_manifest(&oneshot("", "", command, output)).unwrap();
+        assert!(m.command.defaults.unwrap().contains_key("max_byte"));
+
+        let remote = oneshot("", "", "", "")
+            + "\n[http]\nmethod = \"GET\"\nurl = \"https://example.com/\"\n\
+               [http.headers]\nX-Anything = \"1\"\n\n\
+               [mcp]\nserver = \"s\"\ntool = \"t\"\n[mcp.field_map]\nwhatever = \"x\"\n";
+        let m = parse_manifest(&remote).unwrap();
+        assert!(m.http.unwrap().headers.contains_key("X-Anything"));
+        assert!(m.mcp.unwrap().field_map.contains_key("whatever"));
+    }
+
+    #[test]
+    fn test_serde_is_the_second_layer() {
+        // Even without the allowlist walk, the types refuse unknown fields.
+        let err = toml::from_str::<types::ArgDef>("type = \"string\"\nblock_internal_typo = true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "unexpected: {err}");
+        let err = toml::from_str::<types::ToolMeta>(
+            "name = \"t\"\nversion = \"1\"\nbinary = \"b\"\ndescription = \"d\"\ntiemout_seconds = 5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_tool_mode_validated_and_derived() {
+        for mode in MODES {
+            let m = parse_manifest(&oneshot(&format!("mode = \"{mode}\""), "", "", "")).unwrap();
+            assert_eq!(m.tool.mode.as_deref(), Some(*mode));
+            // Advisory: the declared value wins even without a matching section.
+            assert_eq!(m.mode(), *mode);
+        }
+        let err = parse_manifest(&oneshot("mode = \"sessionz\"", "", "", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid mode 'sessionz', must be one of: oneshot, session, browser"),
+            "unexpected: {err}"
+        );
+
+        // Derived from the backend section when absent.
+        let m = parse_manifest(&oneshot("", "", "", "")).unwrap();
+        assert!(m.tool.mode.is_none());
+        assert_eq!(m.mode(), "oneshot");
+        let m = parse_manifest(
+            ALL_SESSION_BROWSER_KEYS
+                .replace("mode = \"session\"\n", "")
+                .as_str(),
+        )
+        .unwrap();
+        assert!(m.tool.mode.is_none());
+        assert_eq!(m.mode(), "session");
+        let m = parse_manifest(
+            ALL_SESSION_BROWSER_KEYS
+                .replace("mode = \"session\"\n", "")
+                .replace("startup_command", "startup_command_")
+                .as_str(),
+        );
+        assert!(m.is_err()); // sanity: the replacement above hit a real key
+    }
+
+    // Every key in the manifest allowlist, spread over three manifests. These are
+    // the drift guard between this runtime's allowlist and the others'.
+
+    const ALL_ONESHOT_KEYS: &str = r#"
+[tool]
+name = "all_oneshot_keys"
+version = "1.0.0"
+binary = "echo"
+description = "exercises every tool, cedar, evidence, limits, args, command and output key"
+timeout_seconds = 30
+risk_tier = "low"
+human_approval = false
+dispatch = "exec"
+mode = "oneshot"
+network_egress = false
+allow_interpreter = false
+
+[tool.cedar]
+resource = "Tool::AllKeys"
+action = "execute_tool"
+
+[tool.evidence]
+output_dir = "{evidence_dir}/{scan_id}"
+capture = false
+hash = "sha256"
+screenshots = false
+
+[tool.limits]
+nproc = 64
+nofile = 256
+fsize_bytes = 1048576
+address_space_bytes = 268435456
+cpu_seconds = 30
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+description = "host"
+sanitize = ["injection"]
+scope_check = false
+block_internal = true
+allow_leading_dash = false
+allow_whitespace = false
+
+[args.level]
+position = 2
+required = false
+type = "enum"
+allowed = ["low", "high"]
+default = "low"
+description = "level"
+
+[args.count]
+position = 3
+required = false
+type = "integer"
+min = 1
+max = 10
+clamp = true
+default = 5
+description = "count"
+
+[args.ratio]
+position = 4
+required = false
+type = "number"
+min_float = 0.0
+max_float = 1.0
+default = 0.5
+description = "ratio"
+
+[args.site]
+position = 5
+required = false
+type = "url"
+schemes = ["https"]
+pattern = "^https://"
+default = "https://example.com/"
+description = "site"
+
+[command]
+exec = ["echo", "{_level_flags}", "{count}", "{ratio}", "{site}", "{rate}", "{_verbose}", "{target}"]
+template = "echo {target}"
+executor = "/usr/local/bin/all-keys-runner"
+end_of_options = "--"
+
+[command.defaults]
+rate = 100
+
+[command.mappings.level]
+low = "-l"
+high = "-h"
+
+[command.conditionals.verbose]
+when = "count != '5'"
+template = "-v {count}"
+
+[output]
+format = "json"
+parser = "builtin:json"
+envelope = true
+max_bytes = 1048576
+
+[output.schema]
+type = "object"
+"#;
+
+    const ALL_SESSION_BROWSER_KEYS: &str = r#"
+[tool]
+name = "all_session_browser_keys"
+version = "1.0.0"
+binary = "psql"
+mode = "session"
+description = "exercises every session and browser key"
+
+[command]
+
+[session]
+startup_command = "psql"
+ready_pattern = "=>"
+startup_timeout_seconds = 15
+idle_timeout_seconds = 600
+session_timeout_seconds = 3600
+max_interactions = 200
+
+[session.interaction]
+input_sanitize = ["injection"]
+output_max_bytes = 2097152
+output_wait_ms = 3000
+
+[session.commands.select]
+pattern = "^SELECT\\b"
+description = "Run a SELECT query"
+risk_tier = "low"
+human_approval = false
+extract_target = false
+
+[session.commands.select.args.query]
+position = 1
+required = true
+type = "string"
+description = "SQL"
+
+[session.child_detection]
+pattern = "session (\\d+) opened"
+type = "meterpreter"
+manifest = "tools/meterpreter.clad.toml"
+
+[browser]
+engine = "cdp"
+headless = true
+connect = "launch"
+extract_mode = "html"
+startup_timeout_seconds = 10
+session_timeout_seconds = 600
+idle_timeout_seconds = 120
+max_interactions = 200
+
+[browser.defaults]
+extract_mode = "accessibility_tree"
+
+[browser.scope]
+allowed_domains = ["example.com"]
+blocked_domains = ["evil.example"]
+allow_external = false
+
+[browser.commands.navigate]
+description = "Navigate"
+risk_tier = "low"
+human_approval = false
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+description = "URL"
+
+[browser.state]
+fields = ["current_url"]
+
+[output]
+format = "text"
+envelope = true
+"#;
+
+    const ALL_HTTP_MCP_KEYS: &str = r#"
+[tool]
+name = "all_http_mcp_keys"
+version = "1.0.0"
+binary = "curl"
+description = "exercises every http and mcp key"
+
+[args.endpoint]
+position = 1
+required = true
+type = "string"
+description = "API endpoint path"
+
+[command]
+exec = ["curl", "{endpoint}"]
+
+[http]
+method = "POST"
+url = "https://api.example.com/{endpoint}"
+headers = { "Accept" = "application/json" }
+body_template = "{\"q\": \"{endpoint}\"}"
+success_status = [200, 201]
+error_status = [500]
+
+[mcp]
+server = "search"
+tool = "query"
+field_map = { endpoint = "q" }
+
+[output]
+format = "json"
+envelope = true
+"#;
+
+    /// Keys present at every concrete location matching `section` in `doc`.
+    fn keys_at(doc: &toml::Table, section: &str) -> HashSet<String> {
+        fn walk(table: &toml::Table, segments: &[&str], out: &mut HashSet<String>) {
+            let Some((head, rest)) = segments.split_first() else {
+                out.extend(table.keys().cloned());
+                return;
+            };
+            if *head == "*" {
+                for value in table.values() {
+                    if let toml::Value::Table(t) = value {
+                        walk(t, rest, out);
+                    }
+                }
+            } else if let Some(toml::Value::Table(t)) = table.get(*head) {
+                walk(t, rest, out);
+            }
+        }
+        let segments: Vec<&str> = section.split('.').filter(|s| !s.is_empty()).collect();
+        let mut out = HashSet::new();
+        walk(doc, &segments, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_every_allowlisted_key_is_accepted() {
+        let docs = [
+            ALL_ONESHOT_KEYS,
+            ALL_SESSION_BROWSER_KEYS,
+            ALL_HTTP_MCP_KEYS,
+        ];
+        for doc in docs {
+            parse_manifest(doc).unwrap_or_else(|e| panic!("{e}\n{doc}"));
+        }
+
+        // Drift guard: every key in KNOWN_KEYS must appear in one of the
+        // manifests above at its own section, so adding a key to the table
+        // forces it into a manifest that the structs then have to accept.
+        // Argument tables share one allowlist, so their coverage is pooled.
+        const ARG_SECTIONS: &[&str] = &[
+            "args.*",
+            "session.commands.*.args.*",
+            "browser.commands.*.args.*",
+        ];
+        let tables: Vec<toml::Table> = docs.iter().map(|d| toml::from_str(d).unwrap()).collect();
+        let mut missing = Vec::new();
+        for (section, keys) in KNOWN_KEYS {
+            let sections: &[&str] = if ARG_SECTIONS.contains(section) {
+                ARG_SECTIONS
+            } else {
+                std::slice::from_ref(section)
+            };
+            let mut seen = HashSet::new();
+            for s in sections {
+                for t in &tables {
+                    seen.extend(keys_at(t, s));
+                }
+            }
+            for key in *keys {
+                if !seen.contains(*key) {
+                    missing.push(join_path(section, key));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "allowlisted keys not exercised by the drift-guard manifests: {missing:?}"
+        );
+
+        // And the new keys land in their fields, not just past the gate.
+        let m = parse_manifest(ALL_ONESHOT_KEYS).unwrap();
+        assert_eq!(m.mode(), "oneshot");
+        assert!(!m.tool.network_egress);
+        assert!(!m.tool.allow_interpreter);
+        let limits = m.tool.limits.as_ref().unwrap();
+        assert_eq!(limits.nproc, Some(64));
+        assert_eq!(limits.nofile, Some(256));
+        assert_eq!(limits.fsize_bytes, Some(1_048_576));
+        assert_eq!(limits.address_space_bytes, Some(268_435_456));
+        assert_eq!(limits.cpu_seconds, Some(30));
+        assert!(!m.tool.evidence.as_ref().unwrap().screenshots);
+        assert_eq!(m.output.as_ref().unwrap().max_bytes, 1_048_576);
+        assert_eq!(m.command.end_of_options.as_deref(), Some("--"));
+
+        let m = parse_manifest(ALL_SESSION_BROWSER_KEYS).unwrap();
+        let child = m
+            .session
+            .as_ref()
+            .unwrap()
+            .child_detection
+            .as_ref()
+            .unwrap();
+        assert_eq!(child.type_name, "meterpreter");
+        assert_eq!(child.manifest, "tools/meterpreter.clad.toml");
+        let defaults = m.browser.as_ref().unwrap().defaults.as_ref().unwrap();
+        assert_eq!(defaults.extract_mode.as_deref(), Some("accessibility_tree"));
+        // Defaults for the registered-but-inert keys.
+        assert_eq!(m.output.as_ref().unwrap().max_bytes, 8_388_608);
     }
 }

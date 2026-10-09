@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -13,6 +14,15 @@ import (
 
 	"github.com/BurntSushi/toml"
 )
+
+// The manifest structs below ARE the key allowlist. Every key a .clad.toml
+// may contain is a tagged field on one of them, and loading refuses any key
+// without a field (see unknownKeys, which reads these tags by reflection).
+// The tagged fields must match the "Complete key allowlist" in SEMANTICS.md
+// section W2 exactly, section by section; add a key there before adding a
+// field here. A map-typed field whose values are not structs ([command]
+// defaults and mappings, [output] schema, [http] headers, [mcp] field_map)
+// is an open map: its keys are the author's to choose and are not checked.
 
 // CedarDef holds Cedar policy integration metadata.
 type CedarDef struct {
@@ -25,6 +35,20 @@ type EvidenceDef struct {
 	OutputDir string `toml:"output_dir"`
 	Capture   bool   `toml:"capture"`
 	Hash      string `toml:"hash"`
+	// Screenshots requests screenshot capture for browser-mode tools.
+	// Registered as a known key; capture itself is not implemented here.
+	Screenshots bool `toml:"screenshots"`
+}
+
+// ToolLimitsDef holds the optional [tool.limits] resource ceilings for the
+// child process. Nil means "no limit requested" for each field. Registered as
+// known keys; enforcement is not implemented here.
+type ToolLimitsDef struct {
+	Nproc             *int64 `toml:"nproc"`
+	Nofile            *int64 `toml:"nofile"`
+	FsizeBytes        *int64 `toml:"fsize_bytes"`
+	AddressSpaceBytes *int64 `toml:"address_space_bytes"`
+	CPUSeconds        *int64 `toml:"cpu_seconds"`
 }
 
 // ToolMeta holds the top-level [tool] section metadata.
@@ -40,10 +64,24 @@ type ToolMeta struct {
 	// declares the manifest as validator-only — no [output] block or backend
 	// is required. Useful for in-process embeddings where ToolClad is the
 	// typed-argument fence and dispatch happens elsewhere.
-	Dispatch string       `toml:"dispatch"`
-	Cedar    *CedarDef    `toml:"cedar"`
-	Evidence *EvidenceDef `toml:"evidence"`
+	Dispatch string `toml:"dispatch"`
+	// Mode is advisory: "oneshot", "session", or "browser". When absent it
+	// is derived at load from which backend section is present.
+	Mode string `toml:"mode"`
+	// NetworkEgress declares that the tool reaches the network. Registered
+	// as a known key; the egress lint is not implemented here.
+	NetworkEgress bool `toml:"network_egress"`
+	// AllowInterpreter permits argv[0] to be a shell or language
+	// interpreter. Registered as a known key; the denylist is not
+	// implemented here.
+	AllowInterpreter bool           `toml:"allow_interpreter"`
+	Cedar            *CedarDef      `toml:"cedar"`
+	Evidence         *EvidenceDef   `toml:"evidence"`
+	Limits           *ToolLimitsDef `toml:"limits"`
 }
+
+// ToolModes are the accepted values of [tool] mode.
+var ToolModes = []string{"oneshot", "session", "browser"}
 
 // ArgDef defines a single tool argument from [args.*].
 type ArgDef struct {
@@ -64,6 +102,10 @@ type ArgDef struct {
 	Sanitize   []string `toml:"sanitize"`
 	Schemes    []string `toml:"schemes"`
 	ScopeCheck bool     `toml:"scope_check"`
+	// BlockInternal rejects loopback, private, link-local and other
+	// non-public targets for network-typed arguments. Registered as a known
+	// key; the host policy is not implemented here.
+	BlockInternal bool `toml:"block_internal"`
 	// AllowLeadingDash permits a value that starts with '-' or '+'. Off by
 	// default so a user value can never be parsed as an option by the tool.
 	AllowLeadingDash bool `toml:"allow_leading_dash"`
@@ -103,12 +145,20 @@ type CommandDef struct {
 	ExecWasDeclared bool `toml:"-"`
 }
 
+// DefaultOutputMaxBytes is the [output] max_bytes value used when the
+// manifest does not set one (8 MiB).
+const DefaultOutputMaxBytes int64 = 8388608
+
 // OutputDef holds the [output] section.
 type OutputDef struct {
 	Format   string         `toml:"format"`
 	Parser   string         `toml:"parser"`
 	Envelope *bool          `toml:"envelope"`
 	Schema   map[string]any `toml:"schema"`
+	// MaxBytes caps captured tool output. Nil means DefaultOutputMaxBytes;
+	// use MaxBytesLimit. Registered as a known key; the cap is not enforced
+	// here.
+	MaxBytes *int64 `toml:"max_bytes"`
 }
 
 // EnvelopeEnabled returns whether the evidence envelope is enabled (default true).
@@ -117,6 +167,14 @@ func (o *OutputDef) EnvelopeEnabled() bool {
 		return true
 	}
 	return *o.Envelope
+}
+
+// MaxBytesLimit returns the output cap, defaulting to DefaultOutputMaxBytes.
+func (o *OutputDef) MaxBytesLimit() int64 {
+	if o.MaxBytes == nil {
+		return DefaultOutputMaxBytes
+	}
+	return *o.MaxBytes
 }
 
 // HttpDef holds the [http] section for HTTP-based tool execution.
@@ -146,6 +204,16 @@ type SessionDef struct {
 	MaxInteractions    int                          `toml:"max_interactions"`
 	Interaction        *SessionInteractionDef       `toml:"interaction"`
 	Commands           map[string]SessionCommandDef `toml:"commands"`
+	ChildDetection     *SessionChildDetectionDef    `toml:"child_detection"`
+}
+
+// SessionChildDetectionDef describes how a session recognizes a child
+// process it spawns and which manifest governs it. Registered as known keys;
+// detection is not implemented here.
+type SessionChildDetectionDef struct {
+	Pattern  string `toml:"pattern"`
+	Type     string `toml:"type"`
+	Manifest string `toml:"manifest"`
 }
 
 // SessionInteractionDef holds session interaction constraints.
@@ -178,6 +246,12 @@ type BrowserDef struct {
 	Scope              *BrowserScopeDef             `toml:"scope"`
 	Commands           map[string]BrowserCommandDef `toml:"commands"`
 	State              *BrowserStateDef             `toml:"state"`
+	Defaults           *BrowserDefaultsDef          `toml:"defaults"`
+}
+
+// BrowserDefaultsDef holds per-command defaults for browser mode.
+type BrowserDefaultsDef struct {
+	ExtractMode string `toml:"extract_mode"`
 }
 
 // BrowserScopeDef defines domain scope restrictions for browser mode.
@@ -512,8 +586,118 @@ func (m *Manifest) compileCommand(warn bool) error {
 	return nil
 }
 
-// LoadManifest parses a .clad.toml file and returns a Manifest.
+// unknownKeys walks the raw document against the Manifest struct type and
+// returns the dotted path of every key that no tagged field accepts, sorted.
+// Matching is exact (case-sensitive). A wholly unknown table is reported once,
+// by its own path, rather than once per entry beneath it. Nothing beneath an
+// open map is checked.
+//
+// The walk is deliberately independent of toml.MetaData.Undecoded(): in the
+// pinned decoder release that list is built from aliased key slices and drops
+// or repeats entries for any table header with three or more segments, such
+// as [command.conditionals.<n>] or [session.commands.<n>].
+func unknownKeys(doc map[string]any) []string {
+	var out []string
+	walkUnknownKeys(reflect.TypeOf(Manifest{}), doc, nil, &out)
+	sort.Strings(out)
+	return out
+}
+
+// walkUnknownKeys checks table against struct type t at path, appending the
+// path of each key t has no field for. It descends into struct-typed fields
+// and into map-typed fields whose values are structs (the [args.*],
+// [command.conditionals.*], [session.commands.*] and [browser.commands.*]
+// families). A map whose values are not structs is an open map: its keys are
+// the author's to choose and its contents are not checked.
+func walkUnknownKeys(t reflect.Type, table map[string]any, path toml.Key, out *[]string) {
+	fields := tomlFields(t)
+	keys := make([]string, 0, len(table))
+	for k := range table {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		// Three-index slicing forces a copy so sibling paths never share a
+		// backing array.
+		kpath := append(path[:len(path):len(path)], k)
+		ft, known := fields[k]
+		if !known {
+			*out = append(*out, kpath.String())
+			continue
+		}
+		sub, isTable := table[k].(map[string]any)
+		if !isTable {
+			continue
+		}
+		switch elem := derefType(ft); elem.Kind() {
+		case reflect.Struct:
+			walkUnknownKeys(elem, sub, kpath, out)
+		case reflect.Map:
+			vt := derefType(elem.Elem())
+			if vt.Kind() != reflect.Struct {
+				continue // open map
+			}
+			names := make([]string, 0, len(sub))
+			for name := range sub {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				if vsub, ok := sub[name].(map[string]any); ok {
+					walkUnknownKeys(vt, vsub, append(kpath[:len(kpath):len(kpath)], name), out)
+				}
+			}
+		}
+	}
+}
+
+// tomlFields returns the TOML key each exported, non-skipped field of struct
+// type t decodes from, mapped to the field's type.
+func tomlFields(t reflect.Type) map[string]reflect.Type {
+	fields := make(map[string]reflect.Type, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported: the decoder never fills it
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		fields[name] = f.Type
+	}
+	return fields
+}
+
+// derefType strips pointer indirections from a type.
+func derefType(t reflect.Type) reflect.Type {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t
+}
+
+// LoadOptions controls how LoadManifestWithOptions treats a manifest. The
+// zero value is the strict behavior of LoadManifest.
+type LoadOptions struct {
+	// AllowUnknownKeys downgrades unknown manifest keys from a load error to
+	// a `warning: unknown key '…' in manifest` line on WarningOutput. It
+	// exists for the CLI's `validate --allow-unknown-keys`; library callers
+	// should load strictly.
+	AllowUnknownKeys bool
+}
+
+// LoadManifest parses a .clad.toml file and returns a Manifest. Loading is
+// strict: a key the manifest schema does not know is a load error.
 func LoadManifest(path string) (*Manifest, error) {
+	return LoadManifestWithOptions(path, LoadOptions{})
+}
+
+// LoadManifestWithOptions parses a .clad.toml file with explicit LoadOptions.
+func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
@@ -524,8 +708,47 @@ func LoadManifest(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("parsing manifest: %w", err)
 	}
 
+	// Refuse keys the schema does not know. A misspelled key would otherwise
+	// silently disable the control it was meant to set. The document is
+	// re-read as a raw table so the check sees every key the author wrote.
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
+	if unknown := unknownKeys(raw); len(unknown) > 0 {
+		msgs := make([]string, len(unknown))
+		for i, k := range unknown {
+			msgs[i] = fmt.Sprintf("unknown key '%s' in manifest", k)
+		}
+		if !opts.AllowUnknownKeys {
+			return nil, fmt.Errorf("manifest %s: %s", path, strings.Join(msgs, "; "))
+		}
+		for _, msg := range msgs {
+			fmt.Fprintf(WarningOutput, "warning: %s\n", msg)
+		}
+	}
+
 	if m.Tool.Name == "" {
 		return nil, fmt.Errorf("manifest %s: missing required tool.name", path)
+	}
+
+	// tool.mode is advisory: validate it when set, derive it when absent.
+	switch m.Tool.Mode {
+	case "":
+		switch {
+		case m.Session != nil:
+			m.Tool.Mode = "session"
+		case m.Browser != nil:
+			m.Tool.Mode = "browser"
+		default:
+			m.Tool.Mode = "oneshot"
+		}
+	case "oneshot", "session", "browser":
+	default:
+		return nil, fmt.Errorf(
+			"manifest %s: invalid tool.mode '%s', must be one of %s",
+			path, m.Tool.Mode, strings.Join(ToolModes, ", "),
+		)
 	}
 
 	// Set default timeout if not specified.

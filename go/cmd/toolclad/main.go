@@ -32,13 +32,17 @@ func main() {
 }
 
 func validateCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowUnknownKeys bool
+
+	cmd := &cobra.Command{
 		Use:   "validate <manifest>",
 		Short: "Validate a .clad.toml manifest file",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := manifest.LoadManifestWithOptions(path, manifest.LoadOptions{
+				AllowUnknownKeys: allowUnknownKeys,
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s  ERROR: %v\n", path, err)
 				return err
@@ -76,6 +80,10 @@ func validateCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&allowUnknownKeys, "allow-unknown-keys", false,
+		"Report unknown manifest keys as warnings instead of refusing to load")
+	return cmd
 }
 
 func runCmd() *cobra.Command {

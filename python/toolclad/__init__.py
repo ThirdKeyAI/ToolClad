@@ -3,6 +3,8 @@
 __version__ = "0.6.1"
 
 from toolclad.manifest import (
+    MANIFEST_KEYS,
+    LoadOptions,
     Manifest,
     HttpDef,
     McpProxyDef,
@@ -13,7 +15,9 @@ from toolclad.manifest import (
     BrowserCommandDef,
     BrowserScopeDef,
     BrowserStateDef,
+    find_unknown_keys,
     load_manifest,
+    load_manifest_with_options,
 )
 from toolclad.validator import (
     ValidationError,
@@ -32,6 +36,8 @@ from toolclad.executor import (
 )
 
 __all__ = [
+    "MANIFEST_KEYS",
+    "LoadOptions",
     "Manifest",
     "HttpDef",
     "McpProxyDef",
@@ -42,7 +48,9 @@ __all__ = [
     "BrowserCommandDef",
     "BrowserScopeDef",
     "BrowserStateDef",
+    "find_unknown_keys",
     "load_manifest",
+    "load_manifest_with_options",
     "ValidationError",
     "validate_arg",
     "validate_arg_mode",

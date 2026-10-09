@@ -65,6 +65,10 @@ func evidenceDir() string {
 //     here). A whole-token placeholder naming one of these splices its
 //     token vector into argv.
 func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (map[string]string, map[string][]string, error) {
+	if err := checkDeclaredArgs(m, args); err != nil {
+		return nil, nil, err
+	}
+
 	// allow_whitespace is honored only for a manifest that declared exec
 	// itself; the executor escape hatch always validates in strict mode.
 	execMode := m.Command.ExecWasDeclared && m.Command.Executor == ""
@@ -157,6 +161,35 @@ func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (m
 	}
 
 	return vars, trusted, nil
+}
+
+// checkDeclaredArgs refuses a supplied argument name that the manifest does
+// not declare in [args]. An undeclared name never reaches the command, so
+// this is not an injection boundary; it closes the gap between what the
+// caller asked for and what ran, instead of silently dropping the argument.
+// Names are checked in sorted order so the reported one is deterministic.
+func checkDeclaredArgs(m *manifest.Manifest, args map[string]string) error {
+	supplied := make([]string, 0, len(args))
+	for name := range args {
+		supplied = append(supplied, name)
+	}
+	sort.Strings(supplied)
+	for _, name := range supplied {
+		if _, ok := m.Args[name]; ok {
+			continue
+		}
+		declared := make([]string, 0, len(m.Args))
+		for d := range m.Args {
+			declared = append(declared, d)
+		}
+		sort.Strings(declared)
+		list := strings.Join(declared, ", ")
+		if list == "" {
+			list = "none"
+		}
+		return fmt.Errorf("unknown argument '%s' (declared arguments: %s)", name, list)
+	}
+	return nil
 }
 
 // evaluateCondition evaluates a [command.conditionals.<n>].when expression
@@ -771,6 +804,9 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	if m.Http == nil || m.Http.URL == "" {
 		return nil, fmt.Errorf("manifest %q has no [http] section or http.url", m.Tool.Name)
 	}
+	if err := checkDeclaredArgs(m, args); err != nil {
+		return nil, err
+	}
 
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
@@ -905,6 +941,9 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
 	if m.Mcp == nil || m.Mcp.Server == "" || m.Mcp.Tool == "" {
 		return nil, fmt.Errorf("manifest %q has no [mcp] section or mcp.server/mcp.tool", m.Tool.Name)
+	}
+	if err := checkDeclaredArgs(m, args); err != nil {
+		return nil, err
 	}
 
 	start := time.Now()

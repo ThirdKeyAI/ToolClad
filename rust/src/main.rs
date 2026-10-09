@@ -19,6 +19,10 @@ enum Commands {
     Validate {
         /// Path to the manifest file
         manifest: String,
+        /// Report unknown manifest keys as warnings instead of refusing the
+        /// manifest (authoring aid; library loading is always strict)
+        #[arg(long)]
+        allow_unknown_keys: bool,
     },
     /// Execute a tool defined by a manifest
     Run {
@@ -58,7 +62,10 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Validate { manifest } => cmd_validate(&manifest),
+        Commands::Validate {
+            manifest,
+            allow_unknown_keys,
+        } => cmd_validate(&manifest, allow_unknown_keys),
         Commands::Run { manifest, args } => cmd_run(&manifest, &args),
         Commands::Schema { manifest } => cmd_schema(&manifest),
         Commands::Test { manifest, args } => cmd_test(&manifest, &args),
@@ -70,12 +77,14 @@ fn main() {
     }
 }
 
-fn cmd_validate(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = toolclad::load_manifest(path)?;
+fn cmd_validate(path: &str, allow_unknown_keys: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest =
+        toolclad::load_manifest_with(path, toolclad::LoadOptions { allow_unknown_keys })?;
     println!("Manifest:     {path}");
     println!("Tool:         {}", manifest.tool.name);
     println!("Version:      {}", manifest.tool.version);
     println!("Binary:       {}", manifest.tool.binary);
+    println!("Mode:         {}", manifest.mode());
     println!("Risk tier:    {}", manifest.tool.risk_tier);
     println!("Timeout:      {}s", manifest.tool.timeout_seconds);
     println!("Arguments:    {}", manifest.args.len());

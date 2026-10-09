@@ -961,3 +961,75 @@ func TestEndOfOptionsIgnoresSplicedTokens(t *testing.T) {
 	}
 	assertArgv(t, argv, []string{"echo", "-H", "X-Trace", "--", "example.com"})
 }
+
+func TestUnknownArgumentRefused(t *testing.T) {
+	declared := map[string]*manifest.ArgDef{
+		"target": {Name: "target", Position: 1, Required: true, Type: "scope_target"},
+		"scan_type": {
+			Name: "scan_type", Position: 2, Required: false, Type: "enum",
+			Allowed: []string{"ping"},
+		},
+	}
+	// An argument the manifest no longer declares must not be dropped
+	// silently: the caller would otherwise get a successful run with no
+	// indication that extra_flags never reached the command.
+	args := map[string]string{"target": "example.com", "extra_flags": "-iL /etc/passwd"}
+	want := "unknown argument 'extra_flags' (declared arguments: scan_type, target)"
+
+	m := &manifest.Manifest{
+		Tool:    manifest.ToolMeta{Name: "echo_tool", TimeoutSeconds: 5},
+		Args:    declared,
+		Command: manifest.CommandDef{Exec: []string{"echo", "{target}"}},
+	}
+	if _, err := BuildCommandArgv(m, args); err == nil || err.Error() != want {
+		t.Fatalf("dry run: want %q, got %v", want, err)
+	}
+	env, err := Execute(m, args)
+	if err == nil || err.Error() != want {
+		t.Fatalf("execute: want %q, got %v", want, err)
+	}
+	if env == nil || env.Status != "error" || env.Command != "" {
+		t.Errorf("execute must return an error envelope without running: %+v", env)
+	}
+
+	hm := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "http_tool", TimeoutSeconds: 5},
+		Args: declared,
+		Http: &manifest.HttpDef{Method: "GET", URL: "http://127.0.0.1:9/never-contacted"},
+	}
+	if _, err := ExecuteHTTP(hm, args); err == nil || err.Error() != want {
+		t.Fatalf("http: want %q, got %v", want, err)
+	}
+
+	mm := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "mcp_tool"},
+		Args: declared,
+		Mcp:  &manifest.McpProxyDef{Server: "mcp://example.com", Tool: "scan"},
+	}
+	if _, err := ExecuteMCP(mm, args); err == nil || err.Error() != want {
+		t.Fatalf("mcp: want %q, got %v", want, err)
+	}
+
+	// Several unknown names: the first in sorted order is reported.
+	many := map[string]string{"target": "example.com", "zeta": "1", "alpha": "2"}
+	wantFirst := "unknown argument 'alpha' (declared arguments: scan_type, target)"
+	if _, err := BuildCommandArgv(m, many); err == nil || err.Error() != wantFirst {
+		t.Fatalf("want %q, got %v", wantFirst, err)
+	}
+
+	// A manifest with no [args] at all.
+	none := &manifest.Manifest{
+		Tool:    manifest.ToolMeta{Name: "noargs"},
+		Args:    map[string]*manifest.ArgDef{},
+		Command: manifest.CommandDef{Exec: []string{"true"}},
+	}
+	wantNone := "unknown argument 'x' (declared arguments: none)"
+	if _, err := BuildCommandArgv(none, map[string]string{"x": "1"}); err == nil || err.Error() != wantNone {
+		t.Fatalf("want %q, got %v", wantNone, err)
+	}
+
+	// Declared arguments only: still builds.
+	if _, err := BuildCommandArgv(m, map[string]string{"target": "example.com"}); err != nil {
+		t.Fatalf("declared-only args must build: %v", err)
+	}
+}

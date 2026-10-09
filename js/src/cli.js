@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { loadManifest } from "./manifest.js";
+import { loadManifest, loadManifestWithOptions } from "./manifest.js";
 import { buildCommand, execute, generateMcpSchema } from "./executor.js";
 
 const program = new Command();
@@ -14,9 +14,15 @@ program
 program
   .command("validate <manifest>")
   .description("Validate a .clad.toml manifest file")
-  .action((manifestPath) => {
+  .option(
+    "--allow-unknown-keys",
+    "Downgrade unknown manifest keys from an error to a warning on stderr"
+  )
+  .action((manifestPath, opts) => {
     try {
-      const manifest = loadManifest(manifestPath);
+      const manifest = loadManifestWithOptions(manifestPath, {
+        allowUnknownKeys: opts.allowUnknownKeys === true,
+      });
       console.log(`${manifestPath}  OK  (tool: ${manifest.tool.name})`);
     } catch (err) {
       console.error(`${manifestPath}  ERROR: ${err.message}`);

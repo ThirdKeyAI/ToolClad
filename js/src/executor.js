@@ -280,7 +280,8 @@ function checkPlaceholders(manifest) {
 }
 
 /**
- * Resolve all argument values: apply defaults, validate types.
+ * Resolve all argument values: refuse undeclared names, apply defaults,
+ * validate types.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
@@ -289,10 +290,24 @@ function checkPlaceholders(manifest) {
  */
 function resolveArgs(manifest, args, execMode = false) {
   const argDefs = manifest.args || {};
+  const supplied = args || {};
   const resolved = {};
 
+  // A supplied name that [args] does not declare is refused rather than
+  // silently dropped, so a caller learns when its argument never reached the
+  // command.
+  const declared = Object.keys(argDefs).sort();
+  for (const name of Object.keys(supplied).sort()) {
+    if (!Object.hasOwn(argDefs, name)) {
+      const list = declared.length > 0 ? declared.join(", ") : "none";
+      throw new Error(
+        `unknown argument '${name}' (declared arguments: ${list})`
+      );
+    }
+  }
+
   for (const [name, def] of Object.entries(argDefs)) {
-    let value = args[name];
+    let value = supplied[name];
 
     // Apply default if missing
     if (value === undefined || value === null) {

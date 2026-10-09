@@ -1,4 +1,10 @@
-export { loadManifest, loadCustomTypes } from "./manifest.js";
+export {
+  loadManifest,
+  loadManifestWithOptions,
+  loadCustomTypes,
+  findUnknownKeys,
+  MANIFEST_KEYS,
+} from "./manifest.js";
 export {
   validateArg,
   validateArgMode,

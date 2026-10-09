@@ -892,11 +892,41 @@ fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, Too
     }
 }
 
+/// Refuse a supplied argument name the manifest does not declare in `[args]`.
+///
+/// An undeclared argument never reaches the command, but dropping it without
+/// a word lets a caller believe it took effect: `extra_flags=-iL /etc/passwd`
+/// against a manifest that no longer declares `extra_flags` would otherwise
+/// run successfully and say nothing.
+fn check_declared_args(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+) -> Result<(), ToolCladError> {
+    let mut unknown: Vec<&str> = args
+        .keys()
+        .filter(|name| !manifest.args.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let mut declared: Vec<&str> = manifest.args.keys().map(String::as_str).collect();
+    declared.sort_unstable();
+    Err(ToolCladError::ValidationError(format!(
+        "unknown argument '{}' (declared arguments: {})",
+        unknown[0],
+        declared.join(", ")
+    )))
+}
+
 /// Validate all arguments, build the command, execute it, and return an evidence envelope.
 pub fn execute(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<EvidenceEnvelope, ToolCladError> {
+    check_declared_args(manifest, args)?;
+
     // Phase 1: Validate all arguments. `allow_whitespace` is honored only when
     // the manifest declared `exec` directly; a compiled template stays strict,
     // and so does the `executor` escape hatch (it takes precedence over
@@ -1120,6 +1150,8 @@ pub fn dry_run(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<DryRunResult, ToolCladError> {
+    check_declared_args(manifest, args)?;
+
     // Validate all arguments (strict for the executor escape hatch).
     let exec_mode = manifest.command.executor.is_none() && manifest.command.exec_was_declared;
     let mut validated = HashMap::new();
@@ -1197,8 +1229,12 @@ mod tests {
                 risk_tier: "low".to_string(),
                 human_approval: false,
                 dispatch: "exec".to_string(),
+                mode: None,
+                network_egress: false,
+                allow_interpreter: false,
                 cedar: None,
                 evidence: None,
+                limits: None,
             },
             args: HashMap::from([(
                 "target".to_string(),
@@ -1219,6 +1255,7 @@ mod tests {
                 parser: None,
                 envelope: true,
                 schema: serde_json::json!({"type": "object"}),
+                max_bytes: 8_388_608,
             }),
             http: None,
             mcp: None,
@@ -1310,6 +1347,38 @@ mod tests {
             "username != '' and username_file == ''",
             &vars
         ));
+    }
+
+    #[test]
+    fn test_undeclared_argument_refused_at_call_time() {
+        // `extra_flags` is not in [args]; it must be refused, not dropped.
+        let m = minimal_manifest();
+        let mut args = HashMap::new();
+        args.insert("target".to_string(), "10.0.1.1".to_string());
+        args.insert("extra_flags".to_string(), "-iL /etc/passwd".to_string());
+
+        let err = dry_run(&m, &args).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "validation error: unknown argument 'extra_flags' (declared arguments: target)"
+        );
+        let err = execute(&m, &args).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown argument 'extra_flags'"),
+            "unexpected: {err}"
+        );
+
+        // Several unknown names: the first in sorted order is named, so the
+        // message is deterministic regardless of map iteration order.
+        args.insert("zz".to_string(), "1".to_string());
+        args.insert("aa".to_string(), "1".to_string());
+        let err = dry_run(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("unknown argument 'aa'"), "unexpected: {err}");
+
+        // Only declared names: still fine.
+        let mut ok = HashMap::new();
+        ok.insert("target".to_string(), "10.0.1.1".to_string());
+        assert!(dry_run(&m, &ok).is_ok());
     }
 
     #[test]
