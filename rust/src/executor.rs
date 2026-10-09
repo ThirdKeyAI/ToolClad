@@ -115,6 +115,107 @@ struct HttpRequestParts {
     body: Option<String>,
 }
 
+/// The literal host (authority minus userinfo and port) of a manifest
+/// `http.url`. The scheme and host must not contain a placeholder: the host
+/// is the SSRF boundary and stays manifest-controlled.
+pub fn http_url_literal_host(url: &str) -> Result<String, ToolCladError> {
+    let interp_err = || {
+        ToolCladError::ManifestError(
+            "http.url may not interpolate into the scheme or host".to_string(),
+        )
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        if url
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .contains('{')
+        {
+            return Err(interp_err());
+        }
+        return Err(ToolCladError::ManifestError(format!(
+            "http.url '{url}' must be an absolute http or https URL"
+        )));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if scheme.contains('{') || authority.contains('{') || authority.contains('}') {
+        return Err(interp_err());
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(ToolCladError::ManifestError(format!(
+            "http.url scheme '{scheme}' is not allowed (use http or https)"
+        )));
+    }
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if hostport.starts_with('[') {
+        hostport
+            .find(']')
+            .map_or(hostport, |i| &hostport[..=i])
+            .to_string()
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map_or(hostport, |(h, _)| h)
+            .to_string()
+    };
+    if host.is_empty() {
+        return Err(ToolCladError::ManifestError(format!(
+            "http.url '{url}' has no host"
+        )));
+    }
+    Ok(host)
+}
+
+/// Refuse an HTTP header name that is not an RFC 9110 token.
+pub fn check_header_name(name: &str) -> Result<(), ToolCladError> {
+    let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if name.is_empty() || !name.bytes().all(tchar) {
+        return Err(ToolCladError::ManifestError(format!(
+            "http header name '{}' is not a valid token",
+            name.escape_default()
+        )));
+    }
+    Ok(())
+}
+
+/// Percent-encode every byte outside the RFC 3986 `unreserved` set, so an
+/// interpolated value can never add a `/`, `?`, `#`, `&`, `=` or `%` to the
+/// URL's structure. Used for both path and query positions.
+pub fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Matches a `{name}` argument placeholder in an HTTP template.
+static HTTP_PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{(\w+)\}").unwrap());
+
+/// Substitute validated arguments into `template` in one left-to-right pass
+/// (a value is never rescanned for placeholders), passing each value through
+/// `encode`. A placeholder that names no validated argument is left as
+/// written.
+fn interpolate(
+    template: &str,
+    validated: &HashMap<String, String>,
+    encode: impl Fn(&str) -> String,
+) -> String {
+    HTTP_PLACEHOLDER_RE
+        .replace_all(template, |caps: &regex::Captures| {
+            match validated.get(&caps[1]) {
+                Some(v) => encode(v),
+                None => caps[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
 /// Build the URL, headers and body of an HTTP backend request.
 ///
 /// Order matters: `{_secret:name}` references are expanded on the manifest
@@ -123,6 +224,10 @@ struct HttpRequestParts {
 /// has already happened and stays a literal: it can never pull a secret into
 /// an attacker-chosen URL, header or body. The `url` validator independently
 /// rejects `{` and `}`; this ordering does not rely on that.
+///
+/// URL values are percent-encoded (path and query alike), header values are
+/// refused when they contain CR, LF or NUL after interpolation, and body
+/// values are JSON-escaped.
 fn build_http_request(
     manifest: &Manifest,
     validated: &HashMap<String, String>,
@@ -130,20 +235,24 @@ fn build_http_request(
     let http = manifest.http.as_ref().ok_or_else(|| {
         ToolCladError::ExecutionError("manifest has no [http] section".to_string())
     })?;
+    // Also enforced at load; repeated for a manifest built in code.
+    http_url_literal_host(&http.url)?;
     let mut secrets = SecretSource::default();
 
-    // URL: secrets on the template, then arguments.
-    let mut url = inject_template_vars(&http.url, &mut secrets)?;
-    for (k, v) in validated {
-        url = url.replace(&format!("{{{k}}}"), v);
-    }
+    // URL: secrets on the template, then percent-encoded arguments.
+    let url_tmpl = inject_template_vars(&http.url, &mut secrets)?;
+    let url = interpolate(&url_tmpl, validated, percent_encode);
 
     // Headers: same order for every value.
     let mut headers: Vec<(String, String)> = Vec::with_capacity(http.headers.len());
     for (hk, hv) in &http.headers {
-        let mut val = inject_template_vars(hv, &mut secrets)?;
-        for (k, v) in validated {
-            val = val.replace(&format!("{{{k}}}"), v);
+        check_header_name(hk)?;
+        let tmpl = inject_template_vars(hv, &mut secrets)?;
+        let val = interpolate(&tmpl, validated, |v| v.to_string());
+        if val.contains(['\r', '\n', '\0']) {
+            return Err(ToolCladError::ValidationError(format!(
+                "http header '{hk}' contains a CR, LF or NUL after interpolation"
+            )));
         }
         headers.push((hk.clone(), val));
     }
@@ -151,16 +260,11 @@ fn build_http_request(
     // Body: secrets on the template, then JSON-escaped arguments.
     let body = match http.body_template {
         Some(ref body_tmpl) => {
-            let mut b = inject_template_vars(body_tmpl, &mut secrets)?;
-            for (k, v) in validated {
-                // JSON-escape the value to prevent injection into JSON body.
-                let escaped = serde_json::to_string(v)
-                    .unwrap_or_else(|_| format!("\"{}\"", v))
-                    .trim_matches('"')
-                    .to_string();
-                b = b.replace(&format!("{{{k}}}"), &escaped);
-            }
-            Some(b)
+            let tmpl = inject_template_vars(body_tmpl, &mut secrets)?;
+            Some(interpolate(&tmpl, validated, |v| {
+                let quoted = serde_json::to_string(v).unwrap_or_default();
+                quoted[1..quoted.len() - 1].to_string()
+            }))
         }
         None => None,
     };
@@ -169,6 +273,10 @@ fn build_http_request(
 }
 
 /// Execute an HTTP backend tool, returning an evidence envelope.
+///
+/// Redirects are never followed (an allowed host could otherwise 302 to an
+/// internal address); a 3xx is reported as `redirect_blocked`. The body is
+/// read up to `[output] max_bytes`.
 fn execute_http(
     manifest: &Manifest,
     validated: &HashMap<String, String>,
@@ -180,11 +288,11 @@ fn execute_http(
 
     let HttpRequestParts { url, headers, body } = build_http_request(manifest, validated)?;
 
-    // Execute the HTTP request with timeout.
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(
             manifest.tool.timeout_seconds,
         ))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ToolCladError::ExecutionError(format!("HTTP client error: {e}")))?;
     let method_upper = http.method.to_uppercase();
@@ -205,8 +313,8 @@ fn execute_http(
     for (hk, hv) in &headers {
         req = req.header(hk, hv);
     }
-    if let Some(ref b) = body {
-        req = req.body(b.clone());
+    if let Some(b) = body {
+        req = req.body(b);
     }
 
     let resp = req
@@ -214,11 +322,48 @@ fn execute_http(
         .map_err(|e| ToolCladError::ExecutionError(format!("HTTP request failed: {e}")))?;
 
     let status_code = resp.status().as_u16();
-    let resp_body = resp
-        .text()
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    let max = max_output_bytes(manifest);
+    let mut bytes = Vec::new();
+    resp.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| ToolCladError::ExecutionError(format!("failed to read response: {e}")))?;
+    let truncated = bytes.len() > max;
+    let resp_body = capped_text(bytes, max);
 
     let duration_ms = start.elapsed().as_millis() as u64;
+
+    let output_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(resp_body.as_bytes());
+        format!("sha256:{:x}", hasher.finalize())
+    };
+    let command = format!("{} {}", method_upper, http.url);
+
+    if (300..400).contains(&status_code) {
+        return Ok(EvidenceEnvelope {
+            status: "redirect_blocked".to_string(),
+            scan_id,
+            tool: manifest.tool.name.clone(),
+            command,
+            duration_ms,
+            timestamp,
+            output_file: None,
+            output_hash: Some(output_hash),
+            exit_code: 1,
+            stderr: String::new(),
+            results: serde_json::json!({
+                "location": location,
+                "raw_output": resp_body,
+                "http_status": status_code,
+                "http_method": method_upper,
+            }),
+            output_truncated: truncated,
+        });
+    }
 
     // Determine success/error based on configured status codes.
     let is_success = if !http.success_status.is_empty() {
@@ -239,12 +384,6 @@ fn execute_http(
         format!("error (HTTP {})", status_code)
     };
 
-    let output_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(resp_body.as_bytes());
-        format!("sha256:{:x}", hasher.finalize())
-    };
-
     let results = serde_json::json!({
         "raw_output": resp_body,
         "http_status": status_code,
@@ -255,7 +394,7 @@ fn execute_http(
         status: status_str,
         scan_id,
         tool: manifest.tool.name.clone(),
-        command: format!("{} {}", method_upper, url),
+        command,
         duration_ms,
         timestamp,
         output_file: None,
@@ -263,6 +402,7 @@ fn execute_http(
         exit_code: if is_success { 0 } else { 1 },
         stderr: String::new(),
         results,
+        output_truncated: truncated,
     })
 }
 
@@ -300,6 +440,7 @@ fn execute_mcp_proxy(
         exit_code: 0,
         stderr: String::new(),
         results,
+        output_truncated: false,
     })
 }
 
@@ -782,11 +923,17 @@ fn split_csv_line(line: &str, delimiter: char) -> Vec<String> {
 ///
 /// Produces nested structures: `{ "tag": { "@attr": "val", "#text": "content", "child": [...] } }`.
 /// For repeated child elements with the same tag name, values are collected into arrays.
-/// Falls back to `{"raw_output": ...}` on parse failure.
+/// Input containing a `<!DOCTYPE` or `<!ENTITY` declaration is refused.
 fn parse_xml_to_json(xml: &str) -> Result<serde_json::Value, ToolCladError> {
     let xml = xml.trim();
     if xml.is_empty() {
         return Ok(serde_json::json!({"raw_output": ""}));
+    }
+    // No DTDs: entity declarations are how entity-expansion attacks start, and
+    // no tool output needs them.
+    let lower = xml.to_ascii_lowercase();
+    if lower.contains("<!doctype") || lower.contains("<!entity") {
+        return Err(ToolCladError::ExecutionError(XML_DTD_REFUSED.to_string()));
     }
 
     // Strip XML declaration if present
@@ -913,8 +1060,67 @@ fn parse_xml_to_json(xml: &str) -> Result<serde_json::Value, ToolCladError> {
     }
 }
 
+/// The XML refusal message, shared by every runtime.
+pub const XML_DTD_REFUSED: &str =
+    "XML output contains a DOCTYPE or ENTITY declaration; refusing to parse";
+
+/// `[output] max_bytes`, or the 8 MiB default when there is no `[output]`.
+fn max_output_bytes(manifest: &Manifest) -> usize {
+    manifest.output.as_ref().map_or(8_388_608, |o| o.max_bytes) as usize
+}
+
+/// Decode captured bytes, trimmed to at most `max` bytes on a character
+/// boundary (lossy decoding can lengthen a cut multibyte sequence).
+fn capped_text(mut bytes: Vec<u8>, max: usize) -> String {
+    bytes.truncate(max);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// Parse `raw` and check it against `[output.schema]`, failing closed.
+///
+/// Returns the status override (`parse_error` / `schema_error`, or `None`)
+/// and the results: the parsed object, or
+/// `{"parse_error"|"schema_error": "<message>", "raw_output": "<raw>"}`.
+fn checked_results(manifest: &Manifest, raw: &str) -> (Option<&'static str>, serde_json::Value) {
+    let parsed = match parse_output(manifest, raw) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                Some("parse_error"),
+                serde_json::json!({ "parse_error": msg, "raw_output": raw }),
+            )
+        }
+    };
+    let default_schema = serde_json::json!({"type": "object"});
+    let schema = manifest
+        .output
+        .as_ref()
+        .map_or(&default_schema, |o| &o.schema);
+    match crate::schema::validate(schema, &parsed) {
+        Ok(()) => (None, parsed),
+        Err(msg) => (
+            Some("schema_error"),
+            serde_json::json!({ "schema_error": msg, "raw_output": raw }),
+        ),
+    }
+}
+
 /// Parse raw command output according to the manifest's output format/parser.
-fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, ToolCladError> {
+///
+/// The result is always a JSON object: `builtin:jsonl` and `builtin:csv`
+/// produce `{"parsed_output": [...]}`, `builtin:text` produces
+/// `{"raw_output": "..."}`, and `builtin:json` passes an object through and
+/// wraps anything else as `{"parsed_output": ...}`. An error is the parse
+/// failure message.
+fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, String> {
     // Callback-mode manifests may omit [output]; treat as text in that case.
     let (parser, format) = match manifest.output.as_ref() {
         Some(o) => (o.parser.as_deref(), o.format.as_str()),
@@ -929,16 +1135,23 @@ fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, Too
     });
 
     match parser {
-        "builtin:json" => serde_json::from_str(raw)
-            .map_err(|e| ToolCladError::ExecutionError(format!("JSON parse failed: {e}"))),
+        "builtin:json" => {
+            let v: serde_json::Value =
+                serde_json::from_str(raw).map_err(|e| format!("JSON parse failed: {e}"))?;
+            Ok(if v.is_object() {
+                v
+            } else {
+                serde_json::json!({ "parsed_output": v })
+            })
+        }
         "builtin:jsonl" => {
             let lines: Vec<serde_json::Value> = raw
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(serde_json::from_str)
                 .collect::<Result<_, _>>()
-                .map_err(|e| ToolCladError::ExecutionError(format!("JSONL parse failed: {e}")))?;
-            Ok(serde_json::json!(lines))
+                .map_err(|e| format!("JSONL parse failed: {e}"))?;
+            Ok(serde_json::json!({ "parsed_output": lines }))
         }
         "builtin:csv" => {
             let mut lines = raw.lines();
@@ -982,20 +1195,20 @@ fn parse_output(manifest: &Manifest, raw: &str) -> Result<serde_json::Value, Too
                         serde_json::Value::Object(obj)
                     })
                     .collect();
-                Ok(serde_json::json!(rows))
+                Ok(serde_json::json!({ "parsed_output": rows }))
             } else {
-                Ok(serde_json::json!([]))
+                Ok(serde_json::json!({ "parsed_output": [] }))
             }
         }
-        "builtin:xml" => parse_xml_to_json(raw),
+        "builtin:xml" => parse_xml_to_json(raw).map_err(|e| match e {
+            ToolCladError::ExecutionError(m) => m,
+            other => other.to_string(),
+        }),
         "builtin:text" => Ok(serde_json::json!({"raw_output": raw})),
-        other => {
-            // Custom parser: not supported in reference implementation.
-            Ok(serde_json::json!({
-                "raw_output": raw,
-                "parser_note": format!("custom parser '{}' not executed in reference impl", other)
-            }))
-        }
+        // Refused at load; repeated for a manifest built in code.
+        other => Err(format!(
+            "custom output parsers are not supported by the reference runtimes (parser = \"{other}\")"
+        )),
     }
 }
 
@@ -1041,19 +1254,58 @@ fn call_scope(manifest: &Manifest) -> Result<Option<Cow<'_, ScopeDef>>, ToolClad
     Ok(None)
 }
 
-/// Validate all arguments, build the command, execute it, and return an evidence envelope.
-pub fn execute(
+/// The policy gate's verdict on one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateDecision {
+    Allow,
+    Deny(String),
+}
+
+/// The policy gate seam: consulted after argument validation (it sees the
+/// cleaned values) and before anything is spawned, any HTTP request is made
+/// or any MCP envelope is built. A denial fails the call with
+/// [`ToolCladError::PolicyDenied`] (`policy gate denied: <reason>`).
+///
+/// ToolClad does not evaluate policy. `[tool.cedar]` declares the resource
+/// and action for an embedding runtime's Cedar evaluator; wiring that
+/// evaluator into a gate passed to [`execute_with_gate`] is the embedder's
+/// job.
+pub type Gate<'a> = dyn Fn(&Manifest, &HashMap<String, String>) -> GateDecision + 'a;
+
+/// Deny-by-default gate: refuses a manifest that sets `human_approval = true`
+/// or has `risk_tier` `high` or `critical`; allows everything else.
+pub fn default_gate(manifest: &Manifest, _validated: &HashMap<String, String>) -> GateDecision {
+    if manifest.tool.human_approval {
+        return GateDecision::Deny(
+            "manifest requires human approval (human_approval = true)".to_string(),
+        );
+    }
+    let tier = manifest.tool.risk_tier.as_str();
+    if tier == "high" || tier == "critical" {
+        return GateDecision::Deny(format!("risk_tier '{tier}' requires explicit approval"));
+    }
+    GateDecision::Allow
+}
+
+/// Allow-all gate, for a caller that has obtained approval itself.
+pub fn approve_gate(_manifest: &Manifest, _validated: &HashMap<String, String>) -> GateDecision {
+    GateDecision::Allow
+}
+
+/// Validate every declared argument (defaults included) for a call, refusing
+/// undeclared names and missing required values. One routine for every
+/// backend.
+fn validate_call_args(
     manifest: &Manifest,
     args: &HashMap<String, String>,
-) -> Result<EvidenceEnvelope, ToolCladError> {
+) -> Result<HashMap<String, String>, ToolCladError> {
     check_declared_args(manifest, args)?;
 
-    // Phase 1: Validate all arguments. `allow_whitespace` is honored only when
-    // the manifest declared `exec` directly; a compiled template stays strict,
-    // and so does the `executor` escape hatch (it takes precedence over
-    // exec/template and its argument handling is opaque to us).
-    // A default is validated like a supplied value (it was type-checked at
-    // load; the scope check can only run here).
+    // `allow_whitespace` is honored only when the manifest declared `exec`
+    // directly; a compiled template stays strict, and so does the `executor`
+    // escape hatch (it takes precedence over exec/template and its argument
+    // handling is opaque to us). A default is validated like a supplied value
+    // (it was type-checked at load; the scope check can only run here).
     let exec_mode = manifest.command.executor.is_none() && manifest.command.exec_was_declared;
     let scope = call_scope(manifest)?;
     let scope = scope.as_deref();
@@ -1071,6 +1323,54 @@ pub fn execute(
                 "missing required argument '{name}'"
             )));
         }
+    }
+    Ok(validated)
+}
+
+/// The declared, unexpanded command for the evidence envelope: the `exec`
+/// array as written joined by single spaces, or a legacy `template` as
+/// written. Executor-injected paths and argument values never appear.
+fn declared_command(manifest: &Manifest) -> String {
+    let cmd = &manifest.command;
+    if !cmd.exec_was_declared {
+        if let Some(ref t) = cmd.template {
+            return t.clone();
+        }
+    }
+    cmd.exec.as_ref().map(|e| e.join(" ")).unwrap_or_default()
+}
+
+/// Validate, consult [`default_gate`], execute, and return an evidence
+/// envelope. A `human_approval` or high/critical-risk manifest is denied;
+/// use [`execute_approved`] or [`execute_with_gate`] once approval exists.
+pub fn execute(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+) -> Result<EvidenceEnvelope, ToolCladError> {
+    execute_with_gate(manifest, args, &default_gate)
+}
+
+/// [`execute`] with the allow-all gate.
+pub fn execute_approved(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+) -> Result<EvidenceEnvelope, ToolCladError> {
+    execute_with_gate(manifest, args, &approve_gate)
+}
+
+/// Validate all arguments, consult `gate`, then build the command, execute
+/// it, and return an evidence envelope.
+pub fn execute_with_gate(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+    gate: &Gate<'_>,
+) -> Result<EvidenceEnvelope, ToolCladError> {
+    // Phase 1: Validate all arguments.
+    let validated = validate_call_args(manifest, args)?;
+
+    // Phase 1b: The policy gate, before any backend acts.
+    if let GateDecision::Deny(reason) = gate(manifest, &validated) {
+        return Err(ToolCladError::PolicyDenied(reason));
     }
 
     // Route to HTTP or MCP backend if configured.
@@ -1121,7 +1421,7 @@ pub fn execute(
             // `template` was tokenized at load into the same array, so there is
             // no string→split round-trip anywhere on the spawn path.
             let mut argv = build_argv_with(manifest, &validated, &paths)?;
-            let display = argv.join(" ");
+            let display = declared_command(manifest);
             let rest = argv.split_off(1);
             (argv.remove(0), rest, Vec::new(), display)
         };
@@ -1139,7 +1439,11 @@ pub fn execute(
     apply_child_limits(&mut cmd, manifest.tool.limits.as_ref());
 
     let start = Instant::now();
-    let run = run_command_with_timeout(cmd, manifest.tool.timeout_seconds);
+    let run = run_command_with_timeout(
+        cmd,
+        manifest.tool.timeout_seconds,
+        max_output_bytes(manifest),
+    );
     // Remove the scratch directory only when the tool left nothing in it: a
     // file there is evidence.
     let _ = std::fs::remove_dir(&work_dir);
@@ -1147,8 +1451,9 @@ pub fn execute(
         stdout: stdout_text,
         stderr: stderr_text,
         exit_code,
-        status: status_str,
+        status: mut status_str,
         timed_out,
+        truncated,
     } = run?;
     let scan_id = paths.scan_id;
 
@@ -1161,24 +1466,19 @@ pub fn execute(
         format!("sha256:{:x}", hasher.finalize())
     };
 
-    // Phase 3b: Parse output. A timed-out run's output is partial, so it is
-    // returned raw rather than parsed.
-    let has_custom_schema = manifest
-        .output
-        .as_ref()
-        .is_some_and(|o| o.schema != serde_json::json!({"type": "object"}));
+    // Phase 3b: Parse and schema-check the output, failing closed. A timed-out
+    // run's output is partial, so it is returned raw rather than parsed. A
+    // failed run keeps its error status; its results are still checked.
     let results = if timed_out {
         serde_json::json!({"raw_output": stdout_text})
     } else {
-        let parsed = parse_output(manifest, &stdout_text)?;
-        // Phase 3c: Validate against output schema if defined.
-        // (basic type check — full JSON Schema validation would require a dedicated crate)
-        if has_custom_schema {
-            // Schema is declared, use parsed output.
-            parsed
-        } else {
-            serde_json::json!({"raw_output": stdout_text})
+        let (override_status, results) = checked_results(manifest, &stdout_text);
+        if let Some(st) = override_status {
+            if status_str == "success" {
+                status_str = st.to_string();
+            }
         }
+        results
     };
 
     Ok(EvidenceEnvelope {
@@ -1193,6 +1493,7 @@ pub fn execute(
         exit_code,
         stderr: stderr_text,
         results,
+        output_truncated: truncated,
     })
 }
 
@@ -1458,39 +1759,59 @@ struct RunOutput {
     exit_code: i32,
     status: String,
     timed_out: bool,
+    /// stdout or stderr exceeded the cap.
+    truncated: bool,
 }
 
-/// Read a pipe to EOF into a shared buffer, so partial output stays available
-/// even if the reader never finishes; signal `done` at EOF.
+/// One captured pipe: the bytes kept (at most the cap) and whether more
+/// arrived.
+#[derive(Default)]
+struct Capture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Read a pipe into a shared buffer, keeping at most `max` bytes, so partial
+/// output stays available even if the reader never finishes; signal `done`
+/// at EOF. Past the cap the pipe is drained and discarded, so the child never
+/// blocks on a full pipe.
 fn spawn_reader<R: Read + Send + 'static>(
     pipe: Option<R>,
     done: mpsc::Sender<()>,
-) -> Arc<Mutex<Vec<u8>>> {
-    let buf = Arc::new(Mutex::new(Vec::new()));
+    max: usize,
+) -> Arc<Mutex<Capture>> {
+    let buf = Arc::new(Mutex::new(Capture::default()));
     let sink = Arc::clone(&buf);
     std::thread::spawn(move || {
         if let Some(mut pipe) = pipe {
+            let mut limited = (&mut pipe).take(max as u64 + 1);
             let mut chunk = [0u8; 8192];
             loop {
-                match pipe.read(&mut chunk) {
+                match limited.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => sink
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        let mut cap = sink.lock().unwrap_or_else(|e| e.into_inner());
+                        let room = max.saturating_sub(cap.bytes.len());
+                        if n > room {
+                            cap.truncated = true;
+                        }
+                        cap.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
+            let _ = std::io::copy(&mut pipe, &mut std::io::sink());
         }
         let _ = done.send(());
     });
     buf
 }
 
-fn take_text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-    let bytes = std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()));
-    String::from_utf8_lossy(&bytes).into_owned()
+/// The captured text (capped) and whether the pipe overflowed.
+fn take_text(buf: &Arc<Mutex<Capture>>, max: usize) -> (String, bool) {
+    let cap = std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()));
+    (capped_text(cap.bytes, max), cap.truncated)
 }
 
 #[cfg(unix)]
@@ -1514,6 +1835,7 @@ fn signal_group(pid: u32, sig: libc::c_int) {
 fn run_command_with_timeout(
     mut cmd: Command,
     timeout_seconds: u64,
+    max_bytes: usize,
 ) -> Result<RunOutput, ToolCladError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1531,8 +1853,8 @@ fn run_command_with_timeout(
 
     // Read stdout/stderr in separate threads to avoid pipe buffer deadlock.
     let (done_tx, done_rx) = mpsc::channel();
-    let stdout_buf = spawn_reader(child.stdout.take(), done_tx.clone());
-    let stderr_buf = spawn_reader(child.stderr.take(), done_tx);
+    let stdout_buf = spawn_reader(child.stdout.take(), done_tx.clone(), max_bytes);
+    let stderr_buf = spawn_reader(child.stderr.take(), done_tx, max_bytes);
 
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let poll = Duration::from_millis(20);
@@ -1595,18 +1917,21 @@ fn run_command_with_timeout(
                 readers_done += 1;
             }
         }
+        let (stdout, out_trunc) = take_text(&stdout_buf, max_bytes);
+        let (stderr, err_trunc) = take_text(&stderr_buf, max_bytes);
         return Ok(RunOutput {
-            stdout: take_text(&stdout_buf),
-            stderr: take_text(&stderr_buf),
+            stdout,
+            stderr,
             exit_code: -1,
             status: "timeout".to_string(),
             timed_out: true,
+            truncated: out_trunc || err_trunc,
         });
     }
 
     let status = status.expect("exit status present when not timed out");
-    let stdout = take_text(&stdout_buf);
-    let stderr = take_text(&stderr_buf);
+    let (stdout, out_trunc) = take_text(&stdout_buf, max_bytes);
+    let (stderr, err_trunc) = take_text(&stderr_buf, max_bytes);
     let exit_code = status.code().unwrap_or(-1);
     let status = if status.success() {
         "success".to_string()
@@ -1619,6 +1944,7 @@ fn run_command_with_timeout(
         exit_code,
         status,
         timed_out: false,
+        truncated: out_trunc || err_trunc,
     })
 }
 
@@ -1897,7 +2223,7 @@ mod tests {
         m.command = CommandDef::default();
         m.http = Some(HttpDef {
             method: "POST".to_string(),
-            url: "{target}".to_string(),
+            url: "https://api.example.com/{target}".to_string(),
             headers: HashMap::from([
                 (
                     "Authorization".to_string(),
@@ -1930,7 +2256,10 @@ mod tests {
             "secret leaked into url: {}",
             parts.url
         );
-        assert_eq!(parts.url, smuggle);
+        assert_eq!(
+            parts.url,
+            format!("https://api.example.com/{}", percent_encode(smuggle))
+        );
         let header = |name: &str| {
             parts
                 .headers
@@ -2976,5 +3305,556 @@ mod tests {
             });
             assert!(gone, "pid {pid} survived the timeout");
         }
+    }
+
+    // ---- W7: policy gate -------------------------------------------------
+
+    /// An `echo` manifest with a `target` argument; `tool_extra` lands in
+    /// `[tool]`.
+    fn gated_manifest(tool_extra: &str) -> Manifest {
+        crate::parse_manifest(&format!(
+            "[tool]\nname = \"gate_test\"\nversion = \"1.0.0\"\nbinary = \"echo\"\n\
+             description = \"d\"\n{tool_extra}\n\n\
+             [args.target]\nposition = 1\nrequired = true\ntype = \"string\"\n\
+             description = \"t\"\n\n\
+             [args.flag]\nposition = 2\nrequired = false\ntype = \"boolean\"\n\
+             default = \"FALSE\"\ndescription = \"f\"\n\n\
+             [command]\nexec = [\"echo\", \"{{target}}\", \"{{_output_file}}\"]\n\n\
+             [output]\nformat = \"text\"\n"
+        ))
+        .unwrap_or_else(|e| panic!("manifest should load: {e}"))
+    }
+
+    fn target(v: &str) -> HashMap<String, String> {
+        HashMap::from([("target".to_string(), v.to_string())])
+    }
+
+    #[test]
+    fn test_gate_denies_human_approval_and_nothing_runs() {
+        let env = SpawnEnv::new();
+        let m = gated_manifest("human_approval = true");
+        let err = execute(&m, &target("hello")).unwrap_err();
+        assert!(matches!(err, ToolCladError::PolicyDenied(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "policy gate denied: manifest requires human approval (human_approval = true)"
+        );
+        // Nothing was prepared or spawned: the evidence root was never created.
+        assert!(!env.evidence().exists());
+    }
+
+    #[test]
+    fn test_gate_risk_tiers() {
+        for tier in ["high", "critical"] {
+            let m = gated_manifest(&format!("risk_tier = \"{tier}\""));
+            let err = execute(&m, &target("x")).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("policy gate denied: risk_tier '{tier}' requires explicit approval")
+            );
+        }
+        for tier in ["info", "low", "medium"] {
+            let m = gated_manifest(&format!("risk_tier = \"{tier}\""));
+            assert_eq!(default_gate(&m, &HashMap::new()), GateDecision::Allow);
+        }
+        let _env = SpawnEnv::new();
+        let m = gated_manifest("risk_tier = \"medium\"");
+        assert_eq!(execute(&m, &target("x")).unwrap().status, "success");
+    }
+
+    #[test]
+    fn test_gate_approved_runs() {
+        let _env = SpawnEnv::new();
+        let m = gated_manifest("human_approval = true\nrisk_tier = \"critical\"");
+        let out = execute_approved(&m, &target("hello")).unwrap();
+        assert_eq!(out.status, "success");
+        assert!(raw(&out).starts_with("hello "), "{}", raw(&out));
+        let out = execute_with_gate(&m, &target("hello"), &approve_gate).unwrap();
+        assert_eq!(out.status, "success");
+    }
+
+    #[test]
+    fn test_custom_gate_sees_validated_values_and_its_reason_reaches_caller() {
+        let _env = SpawnEnv::new();
+        let m = gated_manifest("");
+        let seen = Mutex::new(None);
+        let gate = |_: &Manifest, v: &HashMap<String, String>| {
+            *seen.lock().unwrap() = Some(v.clone());
+            if v.get("target").map(String::as_str) == Some("forbidden") {
+                GateDecision::Deny("target 'forbidden' is off limits".to_string())
+            } else {
+                GateDecision::Allow
+            }
+        };
+        let err = execute_with_gate(&m, &target("forbidden"), &gate)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "policy gate denied: target 'forbidden' is off limits");
+        // The gate saw the cleaned values, default applied and normalized.
+        let v = seen.lock().unwrap().take().unwrap();
+        assert_eq!(v.get("flag").map(String::as_str), Some("false"));
+        assert!(execute_with_gate(&m, &target("fine"), &gate).is_ok());
+    }
+
+    #[test]
+    fn test_gate_runs_after_validation() {
+        let m = gated_manifest("human_approval = true");
+        let called = std::cell::Cell::new(false);
+        let gate = |_: &Manifest, _: &HashMap<String, String>| {
+            called.set(true);
+            GateDecision::Deny("no".to_string())
+        };
+        let err = execute_with_gate(&m, &target("a;b"), &gate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("validation error"), "{err}");
+        assert!(!called.get());
+        let err = execute(&m, &HashMap::new()).unwrap_err().to_string();
+        assert!(err.contains("missing required argument"), "{err}");
+    }
+
+    #[test]
+    fn test_gate_applies_to_http_and_mcp() {
+        use crate::types::McpProxyDef;
+        let mut m = minimal_manifest();
+        m.tool.human_approval = true;
+        m.mcp = Some(McpProxyDef {
+            server: "s".to_string(),
+            tool: "t".to_string(),
+            field_map: HashMap::new(),
+        });
+        let err = execute(&m, &target("example.com")).unwrap_err();
+        assert!(matches!(err, ToolCladError::PolicyDenied(_)), "{err:?}");
+
+        // HTTP: denied before any request (the port would refuse anyway).
+        let mut m = minimal_manifest();
+        m.tool.risk_tier = "high".to_string();
+        m.command = CommandDef::default();
+        m.http = Some(HttpDef {
+            method: "GET".to_string(),
+            url: "http://127.0.0.1:1/{target}".to_string(),
+            headers: HashMap::new(),
+            body_template: None,
+            success_status: vec![],
+            error_status: vec![],
+        });
+        let err = execute(&m, &target("example.com")).unwrap_err();
+        assert!(matches!(err, ToolCladError::PolicyDenied(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_dry_run_is_not_gated() {
+        let m = gated_manifest("human_approval = true\nrisk_tier = \"critical\"");
+        let dry = dry_run(&m, &target("hello")).unwrap();
+        assert!(dry.command.starts_with("echo hello "), "{}", dry.command);
+    }
+
+    // ---- W9: output caps, parsing and fail-closed schema ------------------
+
+    /// An `echo` manifest printing `json_text` with output `[output]` extras.
+    fn echo_manifest(json_text: &str, output: &str) -> Manifest {
+        spawn_manifest(
+            "echo",
+            &["echo", &json_text.replace('{', "{{").replace('}', "}}")],
+            "",
+            "",
+        )
+        .with_output(output)
+    }
+
+    trait WithOutput {
+        fn with_output(self, output: &str) -> Manifest;
+    }
+
+    impl WithOutput for Manifest {
+        fn with_output(mut self, output: &str) -> Manifest {
+            let o: OutputDef = toml::from_str(output).unwrap();
+            self.output = Some(o);
+            self
+        }
+    }
+
+    #[test]
+    fn test_output_cap_truncates_and_flags() {
+        let _env = SpawnEnv::new();
+        let m = spawn_manifest("seq", &["seq", "1", "5000"], "", "")
+            .with_output("format = \"text\"\nmax_bytes = 1024");
+        let start = Instant::now();
+        let out = execute(&m, &HashMap::new()).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.status, "success");
+        assert!(out.output_truncated);
+        assert_eq!(raw(&out).len(), 1024);
+        assert!(raw(&out).starts_with("1\n2\n3\n"));
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["output_truncated"], true);
+
+        // Under the cap: no flag, and the field is omitted.
+        let m = spawn_manifest("seq", &["seq", "1", "5"], "", "");
+        let out = execute(&m, &HashMap::new()).unwrap();
+        assert!(!out.output_truncated);
+        let json = serde_json::to_value(&out).unwrap();
+        assert!(json.get("output_truncated").is_none());
+    }
+
+    #[test]
+    fn test_capped_text_respects_char_boundaries() {
+        let text = capped_text("\u{e9}\u{e9}".as_bytes().to_vec(), 3);
+        assert_eq!(text, "\u{e9}");
+        assert!(capped_text(vec![0xff, 0xff, 0xff], 2).len() <= 2);
+    }
+
+    #[test]
+    fn test_fail_closed_schema_end_to_end() {
+        let _env = SpawnEnv::new();
+        let output = "format = \"json\"\n[schema]\ntype = \"object\"\nrequired = [\"ok\"]\n\
+                      [schema.properties.ok]\ntype = \"boolean\"\n";
+
+        let out = execute(&echo_manifest(r#"{"ok": "yes"}"#, output), &HashMap::new()).unwrap();
+        assert_eq!(out.status, "schema_error");
+        assert_eq!(
+            out.results["schema_error"],
+            "/ok: expected boolean, got string"
+        );
+        assert_eq!(out.results["raw_output"], "{\"ok\": \"yes\"}\n");
+        assert_eq!(out.exit_code, 0);
+
+        let out = execute(&echo_manifest(r#"{"ok": true}"#, output), &HashMap::new()).unwrap();
+        assert_eq!(out.status, "success");
+        assert_eq!(out.results, serde_json::json!({"ok": true}));
+
+        let out = execute(&echo_manifest("not json", output), &HashMap::new()).unwrap();
+        assert_eq!(out.status, "parse_error");
+        assert!(
+            out.results["parse_error"]
+                .as_str()
+                .unwrap()
+                .starts_with("JSON parse failed"),
+            "{}",
+            out.results
+        );
+        assert_eq!(out.results["raw_output"], "not json\n");
+
+        // No declared schema: the default {"type": "object"} still applies,
+        // and a non-object JSON value is wrapped so it satisfies it.
+        let out = execute(
+            &echo_manifest("[1, 2]", "format = \"json\""),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out.status, "success");
+        assert_eq!(out.results, serde_json::json!({"parsed_output": [1, 2]}));
+    }
+
+    #[test]
+    fn test_xml_doctype_refused_plain_xml_parses() {
+        let _env = SpawnEnv::new();
+        let evil = r#"<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY a "aaaa">]><foo>&a;</foo>"#;
+        let out = execute(&echo_manifest(evil, "format = \"xml\""), &HashMap::new()).unwrap();
+        assert_eq!(out.status, "parse_error");
+        assert_eq!(out.results["parse_error"], XML_DTD_REFUSED);
+        let lower = "<!entity a \"x\"><foo/>";
+        assert!(parse_xml_to_json(lower).is_err());
+
+        let out = execute(
+            &echo_manifest(
+                r#"<root><item name="a">t</item></root>"#,
+                "format = \"xml\"",
+            ),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out.status, "success");
+        assert_eq!(out.results["root"]["item"]["@name"], "a");
+    }
+
+    #[test]
+    fn test_jsonl_and_csv_results_are_objects() {
+        let m = minimal_manifest().with_output("format = \"jsonl\"");
+        assert_eq!(
+            parse_output(&m, "{\"a\":1}\n\n{\"a\":2}\n").unwrap(),
+            serde_json::json!({"parsed_output": [{"a": 1}, {"a": 2}]})
+        );
+        let m = minimal_manifest().with_output("format = \"csv\"");
+        assert_eq!(
+            parse_output(&m, "name,age,ok\nAlice,30,true\n").unwrap(),
+            serde_json::json!({"parsed_output": [{"name": "Alice", "age": 30, "ok": true}]})
+        );
+        assert_eq!(
+            parse_output(&m, "").unwrap(),
+            serde_json::json!({"parsed_output": []})
+        );
+        let m = minimal_manifest().with_output("format = \"text\"");
+        assert_eq!(
+            parse_output(&m, "hi").unwrap(),
+            serde_json::json!({"raw_output": "hi"})
+        );
+        // A custom parser on a manifest built in code fails rather than
+        // passing output through unchecked.
+        let m = minimal_manifest().with_output("format = \"json\"\nparser = \"x.py\"");
+        assert!(parse_output(&m, "{}")
+            .unwrap_err()
+            .contains("not supported"));
+    }
+
+    // ---- W10: HTTP hardening and the declared envelope command -------------
+
+    fn http_get_manifest(url: &str) -> Manifest {
+        let mut m = minimal_manifest();
+        m.args.get_mut("target").unwrap().type_name = "string".to_string();
+        m.command = CommandDef::default();
+        m.http = Some(HttpDef {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: HashMap::new(),
+            body_template: None,
+            success_status: vec![],
+            error_status: vec![],
+        });
+        m
+    }
+
+    #[test]
+    fn test_http_path_values_are_percent_encoded() {
+        let m = http_get_manifest("https://api.example.com/{target}");
+        let parts = build_http_request(&m, &target("../admin?role=admin")).unwrap();
+        assert_eq!(
+            parts.url,
+            "https://api.example.com/..%2Fadmin%3Frole%3Dadmin"
+        );
+        let rest = parts.url.strip_prefix("https://").unwrap();
+        let (host, path) = rest.split_once('/').unwrap();
+        assert_eq!(host, "api.example.com");
+        assert!(!path.contains("/admin") && !path.contains('?'), "{path}");
+    }
+
+    #[test]
+    fn test_http_query_values_are_percent_encoded() {
+        let m = http_get_manifest("https://api.example.com/search?q={target}&limit=5");
+        let parts = build_http_request(&m, &target("a&admin=true #x%")).unwrap();
+        assert_eq!(
+            parts.url,
+            "https://api.example.com/search?q=a%26admin%3Dtrue%20%23x%25&limit=5"
+        );
+    }
+
+    #[test]
+    fn test_http_value_is_not_rescanned_for_placeholders() {
+        let mut m = http_get_manifest("https://api.example.com/{target}/{other}");
+        m.args.insert(
+            "other".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                ..Default::default()
+            },
+        );
+        let v = HashMap::from([
+            ("target".to_string(), "{other}".to_string()),
+            ("other".to_string(), "x".to_string()),
+        ]);
+        let parts = build_http_request(&m, &v).unwrap();
+        assert_eq!(parts.url, "https://api.example.com/%7Bother%7D/x");
+    }
+
+    #[test]
+    fn test_http_url_host_placeholder_is_load_error() {
+        for url in [
+            "https://{host}/x",
+            "{scheme}://example.com/x",
+            "https://api.{host}.com/x",
+            "https://user@{host}:8080/",
+            "{base}/x",
+        ] {
+            let err = http_url_literal_host(url).unwrap_err().to_string();
+            assert!(
+                err.contains("http.url may not interpolate into the scheme or host"),
+                "{url}: {err}"
+            );
+        }
+        assert_eq!(
+            http_url_literal_host("https://u@api.example.com:8443/{p}?q={q}").unwrap(),
+            "api.example.com"
+        );
+        assert_eq!(http_url_literal_host("http://[::1]:80/").unwrap(), "[::1]");
+        assert!(http_url_literal_host("ftp://example.com/").is_err());
+    }
+
+    #[test]
+    fn test_http_header_crlf_and_bad_name_refused() {
+        let mut m = http_get_manifest("https://api.example.com/");
+        m.http
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("X-Echo".to_string(), "v={target}".to_string());
+        let err = build_http_request(&m, &target("a\r\nX-Admin: 1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CR, LF or NUL"), "{err}");
+
+        let mut m = http_get_manifest("https://api.example.com/");
+        m.http
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("Bad Name".to_string(), "v".to_string());
+        let err = build_http_request(&m, &target("a"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid token"), "{err}");
+    }
+
+    /// A one-thread HTTP responder on 127.0.0.1: answers every connection
+    /// with `response(path)` and records the request paths. Stops after
+    /// `stop` is set.
+    struct TestServer {
+        port: u16,
+        paths: Arc<Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start(response: fn(&str, u16) -> String) -> Self {
+            use std::io::Write;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (p, st) = (Arc::clone(&paths), Arc::clone(&stop));
+            let handle = std::thread::spawn(move || {
+                while !st.load(std::sync::atomic::Ordering::SeqCst) {
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    sock.set_nonblocking(false).unwrap();
+                    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                    p.lock().unwrap().push(path.clone());
+                    let _ = sock.write_all(response(&path, port).as_bytes());
+                }
+            });
+            Self {
+                port,
+                paths,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            std::thread::sleep(Duration::from_millis(100));
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.handle.take().unwrap().join().unwrap();
+            self.paths.lock().unwrap().clone()
+        }
+    }
+
+    fn http_toml(port: u16, url_path: &str, output_extra: &str) -> Manifest {
+        crate::parse_manifest(&format!(
+            "[tool]\nname = \"http_test\"\nversion = \"1.0.0\"\nbinary = \"http\"\n\
+             description = \"d\"\ntimeout_seconds = 5\n\n\
+             [http]\nmethod = \"GET\"\nurl = \"http://127.0.0.1:{port}{url_path}\"\n\n\
+             [output]\nformat = \"text\"\n{output_extra}"
+        ))
+        .unwrap_or_else(|e| panic!("manifest should load: {e}"))
+    }
+
+    #[test]
+    fn test_http_redirect_is_not_followed() {
+        let server = TestServer::start(|path, port| {
+            if path == "/start" {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/followed\r\n\
+                     Content-Length: 5\r\nConnection: close\r\n\r\nmoved"
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+            }
+        });
+        let m = http_toml(server.port, "/start", "");
+        let out = execute(&m, &HashMap::new());
+        let port = server.port;
+        let paths = server.finish();
+        let out = out.unwrap();
+        assert_eq!(out.status, "redirect_blocked");
+        assert_eq!(
+            out.results["location"],
+            format!("http://127.0.0.1:{port}/followed")
+        );
+        assert_eq!(out.results["raw_output"], "moved");
+        assert_eq!(
+            paths,
+            vec!["/start".to_string()],
+            "a second request was made"
+        );
+    }
+
+    #[test]
+    fn test_http_body_is_capped_and_command_is_declared() {
+        let _guard = env_lock();
+        std::env::set_var("TOOLCLAD_SECRET_HTTP_TOK", "tok-value-123");
+        let server = TestServer::start(|_, _| {
+            let body = "x".repeat(4096);
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let m = http_toml(
+            server.port,
+            "/x?key={_secret:http_tok}",
+            "max_bytes = 1024\n",
+        );
+        let out = execute(&m, &HashMap::new());
+        std::env::remove_var("TOOLCLAD_SECRET_HTTP_TOK");
+        let paths = server.finish();
+        let out = out.unwrap();
+        assert_eq!(out.status, "success");
+        assert!(out.output_truncated);
+        assert_eq!(out.results["raw_output"].as_str().unwrap().len(), 1024);
+        // The secret reached the server but not the envelope.
+        assert_eq!(paths, vec!["/x?key=tok-value-123".to_string()]);
+        assert!(
+            out.command.contains("{_secret:http_tok}"),
+            "{}",
+            out.command
+        );
+        assert!(!out.command.contains("tok-value-123"));
+        assert!(!serde_json::to_string(&out)
+            .unwrap()
+            .contains("tok-value-123"));
+    }
+
+    #[test]
+    fn test_oneshot_envelope_command_is_declared_form() {
+        let env = SpawnEnv::new();
+        let m = gated_manifest("");
+        let out = execute(&m, &target("hello")).unwrap();
+        assert_eq!(out.command, "echo {target} {_output_file}");
+        let evidence = path_string(&env.evidence());
+        assert!(!out.command.contains(&evidence));
+        assert!(raw(&out).contains(&evidence), "the tool still got the path");
+
+        // A legacy template is reported as written.
+        let mut m = minimal_manifest();
+        m.command.exec = Some(tokenize_template("echo {target}").unwrap());
+        let out = execute(&m, &target("example.com")).unwrap();
+        assert_eq!(out.command, "echo {target}");
+
+        // The dry run keeps the resolved argv.
+        let dry = dry_run(&m, &target("example.com")).unwrap();
+        assert_eq!(dry.command, "echo example.com");
     }
 }

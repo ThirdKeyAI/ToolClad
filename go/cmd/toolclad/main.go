@@ -88,6 +88,7 @@ func validateCmd() *cobra.Command {
 
 func runCmd() *cobra.Command {
 	var argFlags []string
+	var approve bool
 
 	cmd := &cobra.Command{
 		Use:   "run <manifest> [--arg key=value ...]",
@@ -105,10 +106,21 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
-			envelope, err := executor.Execute(m, toolArgs)
+			// Without --approve the default policy gate decides: a
+			// manifest with human_approval = true or a high/critical
+			// risk_tier is refused before anything runs.
+			gate := executor.Gate(executor.DefaultGate)
+			if approve {
+				gate = executor.ApproveGate
+			}
+			cmd.SilenceUsage = true
+			envelope, err := executor.ExecuteWithGate(m, toolArgs, gate)
 			if err != nil {
-				// Still print the envelope for diagnostics.
-				printJSON(envelope)
+				// Still print the envelope for diagnostics. A gate
+				// denial has none: nothing was executed.
+				if envelope != nil {
+					printJSON(envelope)
+				}
 				return err
 			}
 
@@ -118,6 +130,8 @@ func runCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringArrayVar(&argFlags, "arg", nil, "Tool argument in key=value format (repeatable)")
+	cmd.Flags().BoolVar(&approve, "approve", false,
+		"Approve this run explicitly, bypassing the default policy gate (human_approval, high/critical risk_tier)")
 	return cmd
 }
 
@@ -222,6 +236,11 @@ func testCmd() *cobra.Command {
 			}
 			fmt.Printf("  Timeout:   %ds\n", m.Tool.TimeoutSeconds)
 			fmt.Printf("  Risk:      %s\n", m.Tool.RiskTier)
+			approval := "not required"
+			if d := executor.DefaultGate(m, nil); !d.Allowed {
+				approval = "required (" + d.Reason + "); pass --approve to run"
+			}
+			fmt.Printf("  Approval:  %s\n", approval)
 			fmt.Println()
 			fmt.Println("  [dry run -- command not executed]")
 			return firstFailure

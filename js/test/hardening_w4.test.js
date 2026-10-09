@@ -505,7 +505,7 @@ description = "u"
 
 [http]
 method = "GET"
-url = "{target}"
+url = "https://api.example.com/fetch?u={target}"
 
 [output]
 format = "json"
@@ -515,7 +515,7 @@ format = "json"
     const m = {
       tool: { name: "api", description: "d" },
       args: { target: { type: "url", required: true } },
-      http: { method: "GET", url: "{target}" },
+      http: { method: "GET", url: "https://api.example.com/fetch?u={target}" },
     };
     assert.equal(isEgressManifest(m), true);
     await assert.rejects(executeHttp(m, { target: "https://93.184.216.34/" }, { dryRun: true }), LINT_TARGET);
@@ -524,7 +524,10 @@ format = "json"
     m.args.target.block_internal = true;
     const r = await executeHttp(m, { target: "https://93.184.216.34/" }, { dryRun: true });
     assert.equal(r.status, "dry_run");
-    assert.equal(r.http_url, "https://93.184.216.34/");
+    assert.equal(
+      r.http_url,
+      `https://api.example.com/fetch?u=${encodeURIComponent("https://93.184.216.34/")}`
+    );
     assert.equal((await execute(m, { target: "https://93.184.216.34/" }, { dryRun: true })).status, "dry_run");
   });
 

@@ -434,7 +434,8 @@ class TestWiring:
     def test_http_path_enforces_scope(self):
         m = self._http(_scope(allowed_domains=["*.example.com"]))
         env = execute(m, {"target": "https://a.example.com/"}, dry_run=True)
-        assert env["command"] == "GET https://api.example.com/?u=https://a.example.com/"
+        # Values are percent-encoded into the URL (W10).
+        assert env["command"] == "GET https://api.example.com/?u=https%3A%2F%2Fa.example.com%2F"
         with pytest.raises(ValidationError, match="target 'evil.com' is not in scope"):
             execute(m, {"target": "https://evil.com/"}, dry_run=True)
 

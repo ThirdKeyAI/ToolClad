@@ -1,7 +1,14 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import TOML from "@iarna/toml";
-import { compileCommand, lintNetworkEgress, timeoutSeconds } from "./executor.js";
+import {
+  checkHttpDefinition,
+  checkOutputParser,
+  compileCommand,
+  lintNetworkEgress,
+  outputMaxBytes,
+  timeoutSeconds,
+} from "./executor.js";
 import { validateDefaultValue } from "./validator.js";
 import { MANIFEST_DIR, SCOPE_CHECK_TYPES } from "./scope.js";
 
@@ -78,7 +85,6 @@ SECTION_KEYS.set(
 
 const TOOL_MODES = ["oneshot", "session", "browser"];
 const LIMIT_KEYS = ["nproc", "nofile", "fsize_bytes", "address_space_bytes", "cpu_seconds"];
-const DEFAULT_OUTPUT_MAX_BYTES = 8388608;
 
 function isTable(value) {
   return (
@@ -235,12 +241,22 @@ export function loadManifestWithOptions(path, options = {}) {
     }
   }
   if (requireTable(manifest.output, "output")) {
-    manifest.output.max_bytes = takeInt(
-      manifest.output,
-      "output",
-      "max_bytes",
-      DEFAULT_OUTPUT_MAX_BYTES
-    );
+    // 1..=1 GiB, default 8 MiB; a custom parser is refused (TC-12, TC-14).
+    try {
+      manifest.output.max_bytes = outputMaxBytes(manifest);
+      checkOutputParser(manifest);
+    } catch (err) {
+      throw new Error(`Invalid manifest: ${err.message}`);
+    }
+  }
+  if (requireTable(manifest.http, "http")) {
+    // No interpolation into the scheme or host; literal host policy; header
+    // names are tokens (TC-16).
+    try {
+      checkHttpDefinition(manifest);
+    } catch (err) {
+      throw new Error(`Invalid manifest: ${err.message}`);
+    }
   }
 
   // Per-argument policy keys. `block_internal` is a real field with a false

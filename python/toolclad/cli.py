@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 import click
 
-from toolclad.executor import build_command_argv, execute
+from toolclad.executor import PolicyDenied, build_command_argv, default_gate, execute
 from toolclad.manifest import (
     LoadOptions,
     Manifest,
@@ -92,13 +92,19 @@ def validate(manifest_path: str, allow_unknown_keys: bool) -> None:
 @main.command()
 @click.argument("manifest_path", type=click.Path(exists=True))
 @click.option("--arg", "-a", "arg_pairs", multiple=True, help="Argument as key=value")
-def run(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
+@click.option(
+    "--approve",
+    is_flag=True,
+    help="Approve this call: run it even when the manifest requires human "
+    "approval or declares a high/critical risk tier.",
+)
+def run(manifest_path: str, arg_pairs: Tuple[str, ...], approve: bool) -> None:
     """Execute a tool through its .clad.toml manifest."""
     try:
         manifest = load_manifest(manifest_path)
         args = _parse_args(arg_pairs)
-        envelope = execute(manifest, args)
-    except (ValueError, FileNotFoundError, ValidationError) as e:
+        envelope = execute(manifest, args, approve=approve)
+    except (ValueError, FileNotFoundError, ValidationError, PolicyDenied) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 
@@ -240,6 +246,13 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
                 f"{manifest.tool.cedar.action}"
             )
         click.echo(f"  Timeout:   {manifest.tool.timeout_seconds}s")
+        click.echo(f"  Risk tier: {manifest.tool.risk_tier}")
+        # A dry run is not gated; show what the default gate would decide.
+        needs_approval = not default_gate(manifest, {}).allowed
+        click.echo(
+            "  Approval:  "
+            + ("required (run with --approve)" if needs_approval else "not required")
+        )
         click.echo()
         click.echo("  [dry run -- command not executed]")
 

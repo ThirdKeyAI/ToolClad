@@ -21,6 +21,7 @@ import (
 // error rather than a confusing refusal at run time. Types this package does
 // not know (custom types) are left for ValidateManifestWithCustomTypes.
 func init() {
+	manifest.HostPolicy = CheckLiteralHost
 	manifest.DefaultValidator = func(def *manifest.ArgDef, value string, s *scope.ScopeDef) error {
 		d := *def
 		if d.Type == "" {

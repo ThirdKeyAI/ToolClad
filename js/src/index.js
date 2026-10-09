@@ -80,4 +80,16 @@ export {
   executeMcp,
   injectTemplateVars,
   generateMcpSchema,
+  GateDecision,
+  PolicyGateError,
+  defaultGate,
+  approveGate,
+  declaredCommand,
+  checkHttpDefinition,
+  checkOutputParser,
+  outputMaxBytes,
+  BUILTIN_PARSERS,
+  DEFAULT_OUTPUT_MAX_BYTES,
+  OUTPUT_MAX_BYTES_LIMIT,
 } from "./executor.js";
+export { validateJsonSchema } from "./schema.js";

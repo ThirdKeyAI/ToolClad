@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import {
   accessSync,
@@ -19,6 +19,8 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import TOML from "@iarna/toml";
 import { validateArgIn } from "./validator.js";
 import { scopeForManifest } from "./scope.js";
+import { validateJsonSchema } from "./schema.js";
+import { parseCanonicalIp, enforceIpPolicy, internalNameReason, embeddedIpv4Literal } from "./hostpolicy.js";
 
 /**
  * One left-to-right pass over a token: `{{` and `}}` are escapes for literal
@@ -162,7 +164,19 @@ export const INTERPRETER_BINARIES = Object.freeze([
 
 const DEFAULT_TIMEOUT_SECONDS = 60;
 const DEFAULT_KILL_GRACE_MS = 2000;
-const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
+/** Default `[output] max_bytes`: 8 MiB for stdout and for stderr, each. */
+export const DEFAULT_OUTPUT_MAX_BYTES = 8388608;
+/** Upper bound for `[output] max_bytes`: 1 GiB. */
+export const OUTPUT_MAX_BYTES_LIMIT = 1073741824;
+
+/** The `builtin:*` output parsers; any other `parser` value is refused. */
+export const BUILTIN_PARSERS = Object.freeze([
+  "builtin:json",
+  "builtin:jsonl",
+  "builtin:csv",
+  "builtin:xml",
+  "builtin:text",
+]);
 
 /**
  * Build a child environment from the allowlist: the fixed PATH, plus HOME,
@@ -303,6 +317,40 @@ export function timeoutSeconds(manifest) {
     throw new Error("timeout_seconds must be greater than zero");
   }
   return value;
+}
+
+/**
+ * The manifest's `[output] max_bytes` (default 8 MiB). An integer outside
+ * 1..=1 GiB is refused here as well as at load, for in-memory manifests.
+ *
+ * @param {object} manifest
+ * @returns {number} bytes
+ */
+export function outputMaxBytes(manifest) {
+  const value = (manifest.output || {}).max_bytes;
+  if (value === undefined || value === null) return DEFAULT_OUTPUT_MAX_BYTES;
+  if (!Number.isInteger(value) || value < 1 || value > OUTPUT_MAX_BYTES_LIMIT) {
+    throw new Error(
+      `output.max_bytes must be an integer between 1 and ${OUTPUT_MAX_BYTES_LIMIT}`
+    );
+  }
+  return value;
+}
+
+/**
+ * Refuse an `[output] parser` that is not one of the `builtin:*` names.
+ *
+ * @param {object} manifest
+ * @throws {Error} on a custom parser
+ */
+export function checkOutputParser(manifest) {
+  const parser = (manifest.output || {}).parser;
+  if (parser === undefined || parser === null) return;
+  if (!BUILTIN_PARSERS.includes(parser)) {
+    throw new Error(
+      `custom output parsers are not supported by the reference runtimes (parser = "${parser}")`
+    );
+  }
 }
 
 /** `TOOLCLAD_KILL_GRACE_MS` as a non-negative integer; anything else -> 2000. */
@@ -933,17 +981,84 @@ export function buildCommand(manifest, args, opts = {}) {
 
 /**
  * Interpolate {placeholder} references in an HTTP template string.
- * `{{`/`}}` are literal braces; an unknown placeholder throws.
+ * `{{`/`}}` are literal braces; an unknown placeholder throws. Each value is
+ * passed through `encode` (identity for headers and the JSON-escaped body).
  */
-function interpolate(template, context) {
+function interpolate(template, context, encode = (v) => v) {
   return template.replace(BRACE_PASS_RE, (m, key) => {
     if (m === "{{") return "{";
     if (m === "}}") return "}";
     if (!Object.hasOwn(context, key) || context[key] === undefined) {
       throw new Error(`unresolved placeholder '{${key}}' in template`);
     }
-    return String(context[key]);
+    return encode(String(context[key]));
   });
+}
+
+/** RFC 7230 token: the only shape an HTTP header name may take. */
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Load-time (and pre-request) checks on `[http]`:
+ *
+ * - `http.url` may not interpolate into the scheme or the host. The host is
+ *   the SSRF boundary and must be manifest-controlled, so any `{` other
+ *   than a `{{` escape before the end of the authority is refused (this
+ *   covers `{_secret:…}` too).
+ * - The literal host is held to the host policy: always-blocked addresses
+ *   are refused, and when any argument declares `block_internal = true` the
+ *   internal ranges and internal names are refused as well. Loopback is
+ *   allowed by default.
+ * - Every header name must be an RFC 7230 token.
+ *
+ * @param {object} manifest - Manifest with an [http] section
+ * @throws {Error} on the first violation
+ */
+export function checkHttpDefinition(manifest) {
+  const httpDef = manifest.http;
+  if (!httpDef || typeof httpDef.url !== "string") return;
+  const url = httpDef.url;
+
+  const schemeEnd = url.indexOf("://");
+  const authorityStart = schemeEnd === -1 ? 0 : schemeEnd + 3;
+  const rest = url.slice(authorityStart);
+  const pathStart = rest.search(/[/?#]/);
+  const authorityEnd = authorityStart + (pathStart === -1 ? rest.length : pathStart);
+  const head = url.slice(0, authorityEnd).replace(/\{\{|\}\}/g, "");
+  if (head.includes("{")) {
+    throw new Error("http.url may not interpolate into the scheme or host");
+  }
+  if (schemeEnd === -1) {
+    throw new Error(`http.url must be an absolute URL (scheme://host): ${url}`);
+  }
+
+  let host = url.slice(authorityStart, authorityEnd);
+  if (host.includes("@")) {
+    throw new Error("http.url must not contain userinfo (user:pass@host)");
+  }
+  if (host.startsWith("[")) {
+    host = host.slice(1, host.indexOf("]") === -1 ? host.length : host.indexOf("]"));
+  } else if (host.includes(":")) {
+    host = host.slice(0, host.indexOf(":"));
+  }
+  const blockInternal = Object.values(manifest.args || {}).some(
+    (def) => def && def.block_internal === true
+  );
+  const ip = parseCanonicalIp(host);
+  if (ip !== null) {
+    enforceIpPolicy(ip, blockInternal);
+  } else if (blockInternal) {
+    const embedded = embeddedIpv4Literal(host);
+    if (embedded !== null) enforceIpPolicy(embedded, true);
+    const internal = internalNameReason(host);
+    if (internal !== null) throw new Error(`http.url host ${internal}`);
+  }
+
+  for (const name of Object.keys(httpDef.headers || {})) {
+    if (!HEADER_NAME_RE.test(name)) {
+      throw new Error(`http.headers: header name '${name}' is not a valid token`);
+    }
+  }
 }
 
 /**
@@ -957,6 +1072,11 @@ function interpolate(template, context) {
  * every `http.headers` value and `http.body_template`, independently of the
  * metacharacter check that also refuses braces in most argument types.
  *
+ * Values interpolated into `http.url` are percent-encoded with
+ * `encodeURIComponent` in both the path and the query, so `/`, `?`, `#`,
+ * `&`, `=`, `%` and `..` can never change the URL's structure. Header values
+ * are refused if they contain CR or LF after interpolation.
+ *
  * @param {object} httpDef - The manifest's [http] section
  * @param {object} context - Validated arguments for url and headers
  * @param {object} bodyContext - Validated arguments for body_template
@@ -965,12 +1085,23 @@ function interpolate(template, context) {
 function buildHttpRequest(httpDef, context, bodyContext) {
   // One resolver per request: TOOLCLAD_SECRETS_FILE is read at most once.
   const secret = makeSecretResolver();
-  const url = interpolate(injectTemplateVars(httpDef.url, secret), context);
+  const url = interpolate(
+    injectTemplateVars(httpDef.url, secret),
+    context,
+    encodeURIComponent
+  );
 
   const headers = {};
   if (httpDef.headers) {
     for (const [key, val] of Object.entries(httpDef.headers)) {
-      headers[key] = interpolate(injectTemplateVars(String(val), secret), context);
+      if (!HEADER_NAME_RE.test(key)) {
+        throw new Error(`http.headers: header name '${key}' is not a valid token`);
+      }
+      const value = interpolate(injectTemplateVars(String(val), secret), context);
+      if (/[\r\n\0]/.test(value)) {
+        throw new Error(`header '${key}' contains CR, LF or NUL after interpolation`);
+      }
+      headers[key] = value;
     }
   }
 
@@ -1011,18 +1142,136 @@ function evaluateSingleCondition(expr, context) {
 }
 
 /**
+ * Policy gate seam (TC-9).
+ *
+ * A gate is `(manifest, validatedArgs) => GateDecision`. It is consulted
+ * after argument validation (so it sees the cleaned values and cannot be
+ * used to probe validity) and before anything is spawned, any HTTP request
+ * is made, or any MCP envelope is built. A dry run is not gated: it executes
+ * nothing, and it is how an operator decides whether to approve.
+ *
+ * `[tool.cedar]` declares the resource and action for an embedding
+ * runtime's Cedar evaluator. ToolClad does not evaluate Cedar policy itself;
+ * wiring such an evaluator into a gate passed to `execute` is the embedder's
+ * job.
+ */
+export const GateDecision = Object.freeze({
+  /** @returns {{ allowed: true }} */
+  allow() {
+    return Object.freeze({ allowed: true });
+  },
+  /**
+   * @param {string} reason
+   * @returns {{ allowed: false, reason: string }}
+   */
+  deny(reason) {
+    return Object.freeze({ allowed: false, reason: String(reason) });
+  },
+});
+
+/** Thrown when a gate denies a call; the message starts `policy gate denied: `. */
+export class PolicyGateError extends Error {
+  constructor(reason) {
+    super(`policy gate denied: ${reason}`);
+    this.name = "PolicyGateError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * The deny-by-default gate: denies a manifest that sets
+ * `human_approval = true` or whose `risk_tier` is `high` or `critical`.
+ *
+ * @param {object} manifest
+ * @param {object} _args - Validated arguments (unused)
+ * @returns {object} GateDecision
+ */
+export function defaultGate(manifest, _args) {
+  const tool = manifest.tool || {};
+  if (tool.human_approval === true) {
+    return GateDecision.deny("manifest requires human approval (human_approval = true)");
+  }
+  const tier = tool.risk_tier;
+  if (typeof tier === "string" && ["high", "critical"].includes(tier.toLowerCase())) {
+    return GateDecision.deny(`risk_tier '${tier}' requires explicit approval`);
+  }
+  return GateDecision.allow();
+}
+
+/** The allow-all gate behind `{ approve: true }` and `run --approve`. */
+export function approveGate(_manifest, _args) {
+  return GateDecision.allow();
+}
+
+function selectGate(options) {
+  const { gate, approve } = options || {};
+  const hasGate = gate !== undefined && gate !== null;
+  if (hasGate && approve) {
+    throw new Error("pass either a gate or approve: true, not both");
+  }
+  if (approve === true) return approveGate;
+  if (!hasGate) return defaultGate;
+  if (typeof gate !== "function") {
+    throw new TypeError("gate must be a function (manifest, args) => GateDecision");
+  }
+  return gate;
+}
+
+/**
+ * Consult the selected gate; throw PolicyGateError unless it allows.
+ * Anything other than an explicit allow decision denies (fail closed).
+ */
+function consultGate(manifest, resolvedArgs, options) {
+  const gate = selectGate(options);
+  const decision = gate(manifest, Object.freeze({ ...resolvedArgs }));
+  if (decision && typeof decision.then === "function") {
+    throw new PolicyGateError("gate must return a GateDecision synchronously");
+  }
+  if (!decision || decision.allowed !== true) {
+    const reason =
+      decision && typeof decision.reason === "string" && decision.reason !== ""
+        ? decision.reason
+        : "gate returned no allow decision";
+    throw new PolicyGateError(reason);
+  }
+}
+
+/**
+ * The declared, unexpanded command for an executed envelope (design issue
+ * 9): the `exec` array as written joined by single spaces, the legacy
+ * template string as written, or `<executor> (custom executor)`. Executor
+ * paths and secrets therefore never reach the agent or the evidence file.
+ *
+ * @param {object} manifest - A compiled manifest
+ * @returns {string}
+ */
+export function declaredCommand(manifest) {
+  const command = manifest.command || {};
+  if (command.executor) return `${command.executor} (custom executor)`;
+  if (command._execWasDeclared === true) return command.exec.join(" ");
+  if (typeof command.template === "string") return command.template;
+  return Array.isArray(command.exec) ? command.exec.join(" ") : "";
+}
+
+/**
  * Execute a tool using its manifest and supplied arguments.
- * Validates args, builds argv, spawns the process, and wraps its output in an
- * evidence envelope. Asynchronous: the deadline is enforced by a timer and a
- * process-group kill, which a synchronous spawn cannot do.
+ * Validates args, consults the policy gate, builds argv, spawns the process,
+ * and wraps its output in an evidence envelope. Asynchronous: the deadline is
+ * enforced by a timer and a process-group kill, which a synchronous spawn
+ * cannot do.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
  * @param {object} [options] - Execution options
- * @param {boolean} [options.dryRun=false] - If true, build command but don't execute
+ * @param {boolean} [options.dryRun=false] - If true, build command but don't execute (not gated)
+ * @param {Function} [options.gate] - `(manifest, validatedArgs) => GateDecision`; defaults to defaultGate
+ * @param {boolean} [options.approve=false] - Use the allow-all gate (exclusive with `gate`)
  * @returns {Promise<object>} Evidence envelope with results
+ * @throws {PolicyGateError} when the gate denies the call
  */
 export async function execute(manifest, args, options = {}) {
+  selectGate(options);
+
   // Gate unimplemented modes
   if (manifest.session) {
     throw new Error(
@@ -1042,10 +1291,12 @@ export async function execute(manifest, args, options = {}) {
 
   // Route to MCP proxy backend
   if (manifest.mcp) {
-    return executeMcp(manifest, args);
+    return executeMcp(manifest, args, options);
   }
 
   compileCommand(manifest);
+  checkOutputParser(manifest);
+  const maxBytes = outputMaxBytes(manifest);
   const timeoutMs = timeoutSeconds(manifest) * 1000;
   const built = buildCommand(manifest, args, { scanId: newScanId() });
   const { argv: cmdParts, command: commandDisplay, resolvedArgs, isExecutor, scanId, paths } = built;
@@ -1060,6 +1311,9 @@ export async function execute(manifest, args, options = {}) {
       resolvedArgs,
     };
   }
+
+  // After validation, before anything touches the filesystem or spawns.
+  consultGate(manifest, resolvedArgs, options);
 
   // Evidence root, output directory and per-invocation scratch cwd, all 0700
   // and created before the spawn. The output file is pre-created 0600 with
@@ -1098,6 +1352,7 @@ export async function execute(manifest, args, options = {}) {
       cwd: workDir,
       timeoutMs,
       graceMs: killGraceMs(),
+      maxBytes,
     });
   } finally {
     // Remove the scratch directory only when empty: anything the tool wrote
@@ -1110,22 +1365,24 @@ export async function execute(manifest, args, options = {}) {
   }
 
   const durationMs = Date.now() - startTime;
-  const { stdout, stderr, timedOut } = result;
+  const { stdout, stderr, timedOut, truncated } = result;
   const exitCode = timedOut ? -1 : result.exitCode;
   const outputHash = createHash("sha256").update(stdout).digest("hex");
 
-  // Build evidence envelope with exit_code and stderr on all paths.
+  // Build evidence envelope with exit_code and stderr on all paths. The
+  // command is the declared form, never the resolved argv.
   const envelope = {
     status: timedOut ? "timeout" : exitCode === 0 ? "success" : "error",
     scan_id: scanId,
     tool: manifest.tool.name,
-    command: commandDisplay,
+    command: declaredCommand(manifest),
     exit_code: exitCode ?? -1,
     stderr,
     duration_ms: durationMs,
     timestamp: new Date(startTime).toISOString(),
     output_hash: `sha256:${outputHash}`,
   };
+  if (truncated) envelope.output_truncated = true;
 
   if (timedOut) {
     envelope.error = `Process timed out after ${timeoutMs / 1000}s`;
@@ -1134,7 +1391,9 @@ export async function execute(manifest, args, options = {}) {
     envelope.error = stderr || `Process exited with code ${exitCode}`;
     envelope.results = { raw_output: stdout };
   } else {
-    envelope.results = parseOutputJs(manifest, stdout);
+    const finished = finishResults(manifest, stdout);
+    envelope.status = finished.status;
+    envelope.results = finished.results;
   }
 
   return envelope;
@@ -1148,21 +1407,43 @@ export function executeSync() {
   throw new Error("executeSync was removed: execute() is async; await execute(...)");
 }
 
+/** Length of the longest prefix of `buf` that ends on a UTF-8 boundary. */
+function utf8Boundary(buf) {
+  let i = buf.length - 1;
+  let continuation = 0;
+  while (i >= 0 && continuation < 3 && (buf[i] & 0xc0) === 0x80) {
+    i--;
+    continuation++;
+  }
+  if (i < 0) return buf.length;
+  const lead = buf[i];
+  const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return need > buf.length - i ? i : buf.length;
+}
+
+/** Decode captured chunks; a capped capture drops a split trailing character. */
+function decodeCapped(chunks, truncated) {
+  let buf = Buffer.concat(chunks);
+  if (truncated) buf = buf.subarray(0, utf8Boundary(buf));
+  return buf.toString("utf-8");
+}
+
 /**
  * Spawn `binary` with `args` in its own process group and enforce a deadline.
  *
- * stdin is /dev/null; stdout and stderr are captured up to MAX_CAPTURE_BYTES
- * each (appending stops at the cap). On the deadline: SIGTERM to the group,
- * then SIGKILL to the group after `graceMs`; resolves on `close`, keeping
- * whatever output was captured before the kill.
+ * stdin is /dev/null; stdout and stderr are captured up to `maxBytes` each.
+ * Past the cap, chunks are discarded but the pipe keeps being read so the
+ * child never blocks on a full pipe, and `truncated` is set. On the deadline:
+ * SIGTERM to the group, then SIGKILL to the group after `graceMs`; resolves
+ * on `close`, keeping whatever output was captured before the kill.
  *
  * Node cannot set a umask or resource limits for a child process portably
  * (there is no pre-exec hook), so neither is applied here; the Rust and
  * Python runtimes set them.
  *
- * @returns {Promise<{ stdout: string, stderr: string, exitCode: number|null, signal: string|null, timedOut: boolean }>}
+ * @returns {Promise<{ stdout: string, stderr: string, exitCode: number|null, signal: string|null, timedOut: boolean, truncated: boolean }>}
  */
-function runWithDeadline(binary, args, { env, cwd, timeoutMs, graceMs }) {
+function runWithDeadline(binary, args, { env, cwd, timeoutMs, graceMs, maxBytes = DEFAULT_OUTPUT_MAX_BYTES }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -1179,19 +1460,23 @@ function runWithDeadline(binary, args, { env, cwd, timeoutMs, graceMs }) {
     }
 
     const capture = (stream) => {
-      const chunks = [];
-      let size = 0;
+      const state = { chunks: [], size: 0, truncated: false };
       stream.on("data", (chunk) => {
-        if (size >= MAX_CAPTURE_BYTES) return;
-        const room = MAX_CAPTURE_BYTES - size;
-        const piece = chunk.length > room ? chunk.subarray(0, room) : chunk;
-        chunks.push(piece);
-        size += piece.length;
+        if (state.truncated) return;
+        const room = maxBytes - state.size;
+        if (chunk.length > room) {
+          if (room > 0) state.chunks.push(chunk.subarray(0, room));
+          state.size = maxBytes;
+          state.truncated = true;
+          return;
+        }
+        state.chunks.push(chunk);
+        state.size += chunk.length;
       });
-      return chunks;
+      return state;
     };
-    const outChunks = capture(child.stdout);
-    const errChunks = capture(child.stderr);
+    const out = capture(child.stdout);
+    const err = capture(child.stderr);
 
     const killGroup = (signal) => {
       try {
@@ -1218,10 +1503,10 @@ function runWithDeadline(binary, args, { env, cwd, timeoutMs, graceMs }) {
       }, graceMs);
     }, timeoutMs);
 
-    child.on("error", (err) => {
+    child.on("error", (spawnErr) => {
       clearTimeout(deadline);
       if (graceTimer) clearTimeout(graceTimer);
-      reject(err);
+      reject(spawnErr);
     });
 
     child.on("close", (code, signal) => {
@@ -1233,52 +1518,91 @@ function runWithDeadline(binary, args, { env, cwd, timeoutMs, graceMs }) {
         killGroup("SIGKILL");
       }
       resolve({
-        stdout: Buffer.concat(outChunks).toString("utf-8"),
-        stderr: Buffer.concat(errChunks).toString("utf-8"),
+        stdout: decodeCapped(out.chunks, out.truncated),
+        stderr: decodeCapped(err.chunks, err.truncated),
         exitCode: code,
         signal,
         timedOut,
+        truncated: out.truncated || err.truncated,
       });
     });
   });
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 /**
- * Parse tool output based on the manifest's output.format / output.parser.
+ * Parse tool output based on the manifest's output.format / output.parser,
+ * normalized so `results` is always an object: json objects pass through and
+ * any other json value is wrapped as `{parsed_output}`; jsonl and csv give
+ * `{parsed_output: [...]}`; text gives `{raw_output}`.
  *
  * @param {object} manifest - Parsed manifest
  * @param {string} raw - Raw output string
  * @returns {object} Parsed results
+ * @throws {Error} when the output does not parse
  */
 function parseOutputJs(manifest, raw) {
+  checkOutputParser(manifest);
   const format = manifest.output?.format || "text";
   const parser = manifest.output?.parser || `builtin:${format}`;
 
   switch (parser) {
     case "builtin:json": {
+      let value;
       try {
-        return JSON.parse(raw);
-      } catch {
-        return { raw_output: raw };
+        value = JSON.parse(raw);
+      } catch (err) {
+        throw new Error(`invalid JSON output: ${err.message}`);
       }
+      return isPlainObject(value) ? value : { parsed_output: value };
     }
     case "builtin:jsonl": {
-      try {
-        const lines = raw.trim().split("\n").filter(l => l.trim());
-        return { parsed_output: lines.map(l => JSON.parse(l)) };
-      } catch {
-        return { raw_output: raw };
-      }
+      const lines = raw.split("\n").filter((l) => l.trim());
+      return {
+        parsed_output: lines.map((line, i) => {
+          try {
+            return JSON.parse(line);
+          } catch (err) {
+            throw new Error(`invalid JSON on output line ${i + 1}: ${err.message}`);
+          }
+        }),
+      };
     }
-    case "builtin:csv": {
+    case "builtin:csv":
       return { parsed_output: parseCsv(raw) };
-    }
-    case "builtin:xml": {
+    case "builtin:xml":
       return parseXmlToJson(raw);
-    }
     default:
       return { raw_output: raw };
   }
+}
+
+/**
+ * Parse and schema-check raw output, fail closed (TC-14). A parse failure
+ * gives status `parse_error`, a schema mismatch `schema_error`; both keep the
+ * raw output under `results.raw_output`. Without `[output.schema]` the
+ * schema is `{type: "object"}`, which every normalized result satisfies.
+ *
+ * @param {object} manifest
+ * @param {string} raw
+ * @returns {{ status: string, results: object }}
+ */
+function finishResults(manifest, raw) {
+  let parsed;
+  try {
+    parsed = parseOutputJs(manifest, raw);
+  } catch (err) {
+    return { status: "parse_error", results: { parse_error: err.message, raw_output: raw } };
+  }
+  const schema = manifest.output?.schema ?? { type: "object" };
+  const failure = validateJsonSchema(schema, parsed);
+  if (failure !== null) {
+    return { status: "schema_error", results: { schema_error: failure, raw_output: raw } };
+  }
+  return { status: "success", results: parsed };
 }
 
 /**
@@ -1344,13 +1668,24 @@ function splitCsvLine(line, delimiter) {
 
 /**
  * Simple XML-to-JSON parser. Handles elements, attributes, text content,
- * and self-closing tags. Falls back to raw_output on parse failure.
+ * and self-closing tags. Input carrying a DOCTYPE or ENTITY declaration is
+ * refused before parsing, and a malformed document throws (fail closed).
  */
 function parseXmlToJson(xml) {
   const trimmed = xml.trim();
   if (!trimmed) return { raw_output: "" };
+  if (/<!\s*(DOCTYPE|ENTITY)/i.test(trimmed)) {
+    throw new Error(
+      "XML output contains a DOCTYPE or ENTITY declaration; refusing to parse"
+    );
+  }
+  const closeOf = (from) => {
+    const end = trimmed.indexOf(">", from);
+    if (end === -1) throw new Error("invalid XML output: unterminated tag");
+    return end;
+  };
 
-  try {
+  {
     let pos = 0;
     // Skip XML declaration
     if (trimmed.startsWith("<?xml")) {
@@ -1376,7 +1711,7 @@ function parseXmlToJson(xml) {
         if (trimmed[pos] === "/") {
           // Closing tag
           pos++;
-          const tagEnd = trimmed.indexOf(">", pos);
+          const tagEnd = closeOf(pos);
           pos = tagEnd + 1;
 
           const finishedObj = { ...currentObj };
@@ -1394,11 +1729,10 @@ function parseXmlToJson(xml) {
             currentObj = parentObj;
           }
         } else if (trimmed[pos] === "!" || trimmed[pos] === "?") {
-          const end = trimmed.indexOf(">", pos);
-          pos = end + 1;
+          pos = closeOf(pos) + 1;
         } else {
           // Opening tag
-          const tagEnd = trimmed.indexOf(">", pos);
+          const tagEnd = closeOf(pos);
           let tagContent = trimmed.substring(pos, tagEnd);
           const selfClosing = tagContent.endsWith("/");
           if (selfClosing) tagContent = tagContent.slice(0, -1);
@@ -1436,139 +1770,90 @@ function parseXmlToJson(xml) {
       }
     }
 
-    if (currentName) {
-      const root = {};
-      root[currentName] = currentObj;
-      return root;
+    if (stack.length > 0 || currentName) {
+      throw new Error(`invalid XML output: unclosed element <${currentName}>`);
     }
     return currentObj;
-  } catch {
-    return { raw_output: xml };
   }
 }
 
 /**
- * Execute an HTTP manifest synchronously using curl via spawnSync.
+ * Deprecated alias of `executeHttp`. The old implementation ran curl with
+ * every header and the URL on its command line, where any local user could
+ * read them from `/proc/<pid>/cmdline`. It now delegates to the fetch-based
+ * `executeHttp` and therefore returns a Promise: await it.
+ *
+ * @deprecated Use `await executeHttp(manifest, args, options)`.
+ * @param {object} manifest - Parsed manifest with http section
+ * @param {object} args - User-supplied arguments (key=value)
+ * @param {object} [options] - Same options as executeHttp
+ * @returns {Promise<object>} Evidence envelope with http_status
+ */
+export function executeHttpSync(manifest, args, options = {}) {
+  return executeHttp(manifest, args, options);
+}
+
+/**
+ * Read at most `maxBytes` of a fetch response body through its stream
+ * reader. If more arrives, the stream is cancelled and `truncated` is set.
+ */
+async function readCappedBody(response, maxBytes) {
+  if (!response.body) return { text: "", truncated: false };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const room = maxBytes - size;
+      if (value.length > room) {
+        if (room > 0) chunks.push(Buffer.from(value.subarray(0, room)));
+        size = maxBytes;
+        truncated = true;
+        break;
+      }
+      chunks.push(Buffer.from(value));
+      size += value.length;
+    }
+  } finally {
+    if (truncated) {
+      await reader.cancel().catch(() => {});
+    } else {
+      reader.releaseLock();
+    }
+  }
+  return { text: decodeCapped(chunks, truncated), truncated };
+}
+
+/**
+ * Execute a tool via HTTP when the manifest has an [http] section.
+ * Uses Node 18+ built-in fetch. Redirects are never followed: a 3xx gives
+ * status `redirect_blocked` with the `Location` header under
+ * `results.location`. The body is read up to `[output] max_bytes`.
  *
  * @param {object} manifest - Parsed manifest with http section
  * @param {object} args - User-supplied arguments (key=value)
  * @param {object} [options] - Execution options
- * @param {boolean} [options.dryRun=false] - If true, build request but don't execute
- * @returns {object} Evidence envelope with http_status
+ * @param {boolean} [options.dryRun=false] - If true, build request but don't execute (not gated)
+ * @param {Function} [options.gate] - Policy gate; defaults to defaultGate
+ * @param {boolean} [options.approve=false] - Use the allow-all gate
+ * @returns {Promise<object>} Evidence envelope with http_status
  */
-export function executeHttpSync(manifest, args, options = {}) {
+export async function executeHttp(manifest, args, options = {}) {
+  selectGate(options);
   const httpDef = manifest.http;
   if (!httpDef || !httpDef.url) {
     throw new Error("Manifest missing [http] section or http.url");
   }
 
   // An [http] manifest is an egress manifest by definition; an in-memory one
-  // never passes through loadManifest or compileCommand, so lint it here.
+  // never passes through loadManifest, so check and lint it here.
+  checkHttpDefinition(manifest);
   lintNetworkEgress(manifest);
-  const resolvedArgs = resolveArgs(manifest, args);
-  const context = { ...resolvedArgs };
-
-  // JSON-escape values for safe interpolation into body templates
-  const escaped = {};
-  for (const [k, v] of Object.entries(context)) {
-    escaped[k] = JSON.stringify(String(v)).slice(1, -1);
-  }
-
-  // Secrets are expanded on the template before any argument is
-  // interpolated (TC-7); see buildHttpRequest.
-  const { url, headers, body } = buildHttpRequest(httpDef, context, escaped);
-
-  const method = (httpDef.method || "GET").toUpperCase();
-  const scanId = newScanId();
-
-  if (options.dryRun) {
-    return {
-      status: "dry_run",
-      scan_id: scanId,
-      tool: manifest.tool.name,
-      command: `${method} ${url}`,
-      http_method: method,
-      http_url: url,
-      http_headers: headers,
-      http_body: body,
-      resolvedArgs,
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  // Build curl arguments for synchronous HTTP execution
-  const curlArgs = ["-s", "-S", "-X", method, "-w", "\n%{http_code}"];
-  for (const [k, v] of Object.entries(headers)) {
-    curlArgs.push("-H", `${k}: ${v}`);
-  }
-  if (body && method !== "GET" && method !== "HEAD") {
-    curlArgs.push("-d", body);
-  }
-  const timeout = timeoutSeconds(manifest);
-  curlArgs.push("--max-time", String(timeout));
-  curlArgs.push(url);
-
-  const startTime = Date.now();
-  const result = spawnSync("curl", curlArgs, {
-    encoding: "utf-8",
-    timeout: (timeout + 5) * 1000,
-  });
-
-  const durationMs = Date.now() - startTime;
-  const output = (result.stdout || "").trim();
-  const lines = output.split("\n");
-  const statusCode = parseInt(lines.pop(), 10) || 0;
-  const respBody = lines.join("\n");
-
-  const outputHash = createHash("sha256").update(respBody).digest("hex");
-
-  const successStatus = httpDef.success_status || [200, 201, 202, 204];
-  const isSuccess = successStatus.includes(statusCode);
-
-  let status;
-  if (isSuccess) {
-    status = "success";
-  } else if (statusCode >= 400 && statusCode < 500) {
-    status = `client_error (HTTP ${statusCode})`;
-  } else if (statusCode >= 500 && statusCode < 600) {
-    status = `server_error (HTTP ${statusCode})`;
-  } else {
-    status = `error (HTTP ${statusCode})`;
-  }
-
-  return {
-    status,
-    scan_id: scanId,
-    tool: manifest.tool.name,
-    command: `${method} ${url}`,
-    http_status: statusCode,
-    exit_code: result.status ?? -1,
-    stderr: result.stderr || "",
-    duration_ms: durationMs,
-    timestamp: new Date(startTime).toISOString(),
-    output_hash: `sha256:${outputHash}`,
-    results: parseOutputJs(manifest, respBody),
-  };
-}
-
-/**
- * Execute a tool via HTTP when the manifest has an [http] section.
- * Uses Node 18+ built-in fetch.
- *
- * @param {object} manifest - Parsed manifest with http section
- * @param {object} args - User-supplied arguments (key=value)
- * @param {object} [options] - Execution options
- * @param {boolean} [options.dryRun=false] - If true, build request but don't execute
- * @returns {Promise<object>} Evidence envelope with http_status
- */
-export async function executeHttp(manifest, args, options = {}) {
-  const httpDef = manifest.http;
-  if (!httpDef || !httpDef.url) {
-    throw new Error("Manifest missing [http] section or http.url");
-  }
-
-  // See executeHttpSync: in-memory [http] manifests are linted here.
-  lintNetworkEgress(manifest);
+  checkOutputParser(manifest);
+  const maxBytes = outputMaxBytes(manifest);
   const timeoutMs = timeoutSeconds(manifest) * 1000;
   const resolvedArgs = resolveArgs(manifest, args);
   const context = { ...resolvedArgs };
@@ -1600,33 +1885,53 @@ export async function executeHttp(manifest, args, options = {}) {
     };
   }
 
+  consultGate(manifest, resolvedArgs, options);
+
   const startTime = Date.now();
 
-  const fetchOptions = { method, headers, signal: AbortSignal.timeout(timeoutMs) };
+  const fetchOptions = {
+    method,
+    headers,
+    redirect: "manual",
+    signal: AbortSignal.timeout(timeoutMs),
+  };
   if (body && method !== "GET" && method !== "HEAD") {
     fetchOptions.body = body;
   }
 
   const response = await fetch(url, fetchOptions);
-  const responseBody = await response.text();
+  const { text: responseBody, truncated } = await readCappedBody(response, maxBytes);
   const durationMs = Date.now() - startTime;
   const outputHash = createHash("sha256").update(responseBody).digest("hex");
 
   const successStatus = httpDef.success_status || [200, 201, 202, 204];
   const isSuccess = successStatus.includes(response.status);
 
+  // The declared request, never the expanded URL: secrets and interpolated
+  // values stay out of the envelope.
   const envelope = {
     status: isSuccess ? "success" : "error",
     scan_id: scanId,
     tool: manifest.tool.name,
+    command: `${method} ${httpDef.url}`,
     http_status: response.status,
     duration_ms: durationMs,
     timestamp: new Date(startTime).toISOString(),
     output_hash: `sha256:${outputHash}`,
   };
+  if (truncated) envelope.output_truncated = true;
 
-  if (isSuccess) {
-    envelope.results = { raw_output: responseBody };
+  if (response.status >= 300 && response.status < 400) {
+    envelope.status = "redirect_blocked";
+    envelope.error = `HTTP ${response.status}: redirect not followed`;
+    envelope.results = {
+      location: response.headers.get("location") ?? "",
+      raw_output: responseBody,
+    };
+  } else if (isSuccess) {
+    const finished = finishResults(manifest, responseBody);
+    envelope.status = finished.status;
+    envelope.results = finished.results;
   } else {
     envelope.error = `HTTP ${response.status}: ${responseBody.slice(0, 500)}`;
     envelope.results = { raw_output: responseBody };
@@ -1637,19 +1942,23 @@ export async function executeHttp(manifest, args, options = {}) {
 
 /**
  * Proxy a tool invocation to an MCP server when the manifest has an [mcp] section.
- * Performs field mapping and returns a delegated envelope.
+ * Performs field mapping and returns a delegated envelope. The policy gate
+ * is consulted before the envelope is built.
  *
  * @param {object} manifest - Parsed manifest with mcp section
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {object} Evidence envelope with status "delegated"
+ * @param {object} [options] - `{ gate, approve }`, as for execute
+ * @returns {object} Evidence envelope with status "delegation_preview"
  */
-export function executeMcp(manifest, args) {
+export function executeMcp(manifest, args, options = {}) {
+  selectGate(options);
   const mcpDef = manifest.mcp;
   if (!mcpDef || !mcpDef.server || !mcpDef.tool) {
     throw new Error("Manifest missing [mcp] section or mcp.server/mcp.tool");
   }
 
   const resolvedArgs = resolveArgs(manifest, args);
+  consultGate(manifest, resolvedArgs, options);
 
   // Apply field_map: translate our arg names to the MCP tool's expected names
   const mappedArgs = {};
@@ -1671,6 +1980,7 @@ export function executeMcp(manifest, args) {
     status: "delegation_preview",
     scan_id: scanId,
     tool: manifest.tool.name,
+    command: `mcp://${mcpDef.server}/${mcpDef.tool}`,
     mcp_server: mcpDef.server,
     mcp_tool: mcpDef.tool,
     mapped_args: mappedArgs,
@@ -1765,7 +2075,10 @@ function buildOutputSchema(manifest) {
     return {
       type: "object",
       properties: {
-        status: { type: "string", enum: ["success", "error"] },
+        status: {
+          type: "string",
+          enum: ["success", "error", "timeout", "schema_error", "parse_error", "redirect_blocked"],
+        },
         scan_id: { type: "string" },
         tool: { type: "string" },
         command: { type: "string" },
@@ -1774,6 +2087,7 @@ function buildOutputSchema(manifest) {
         duration_ms: { type: "integer" },
         timestamp: { type: "string", format: "date-time" },
         output_hash: { type: "string" },
+        output_truncated: { type: "boolean" },
         results,
       },
     };

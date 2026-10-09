@@ -854,9 +854,12 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
       http,
     };
   }
+  // http.url may not interpolate into the scheme or host, so the value goes
+  // into the path, where it is percent-encoded.
+  const ENCODED_URL = `https://api.example.com/${encodeURIComponent(SMUGGLED)}`;
   const echoEverywhere = {
     method: "POST",
-    url: "{target}",
+    url: "https://api.example.com/{target}",
     headers: { "X-Echo": "{target}", Accept: "application/json" },
     body_template: "{target}",
   };
@@ -864,7 +867,7 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
   it("async path: an argument value never expands a secret", async () => {
     const r = await executeHttp(smugglingManifest(echoEverywhere), { target: SMUGGLED }, { dryRun: true });
     assert.equal(r.status, "dry_run");
-    assert.equal(r.http_url, SMUGGLED);
+    assert.equal(r.http_url, ENCODED_URL);
     assert.equal(r.http_headers["X-Echo"], SMUGGLED);
     assert.equal(r.http_body, SMUGGLED);
     assert.equal(JSON.stringify(r).includes(SECRET), false);
@@ -873,8 +876,8 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
   it("sync path: an argument value never expands a secret", async () => {
     const r = await execute(smugglingManifest(echoEverywhere), { target: SMUGGLED }, { dryRun: true });
     assert.equal(r.status, "dry_run");
-    assert.equal(r.command, `POST ${SMUGGLED}`);
-    assert.equal(r.http_url, SMUGGLED);
+    assert.equal(r.command, `POST ${ENCODED_URL}`);
+    assert.equal(r.http_url, ENCODED_URL);
     assert.equal(r.http_headers["X-Echo"], SMUGGLED);
     assert.equal(r.http_body, SMUGGLED);
     assert.equal(JSON.stringify(r).includes(SECRET), false);
@@ -902,7 +905,7 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
     const m = {
       tool: { name: "h", description: "http" },
       args: { target: { type: "url", required: true, block_internal: true } },
-      http: { method: "GET", url: "{target}" },
+      http: { method: "GET", url: "https://api.example.com/fetch?u={target}" },
     };
     await assert.rejects(executeHttp(m, { target: SMUGGLED }, { dryRun: true }), /Injection detected/);
     await assert.rejects(() => execute(m, { target: SMUGGLED }, { dryRun: true }), /Injection detected/);

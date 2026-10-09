@@ -516,6 +516,9 @@ pub struct EvidenceEnvelope {
     pub exit_code: i32,
     pub stderr: String,
     pub results: serde_json::Value,
+    /// True when stdout, stderr or an HTTP body was cut at `[output] max_bytes`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
 }
 
 /// Errors produced by ToolClad operations.
@@ -529,6 +532,9 @@ pub enum ToolCladError {
     CommandError(String),
     /// Execution error (timeout, process failure, etc.).
     ExecutionError(String),
+    /// The policy gate refused the call before anything ran. Displays as
+    /// `policy gate denied: <reason>`.
+    PolicyDenied(String),
 }
 
 impl std::fmt::Display for ToolCladError {
@@ -538,6 +544,7 @@ impl std::fmt::Display for ToolCladError {
             Self::ValidationError(msg) => write!(f, "validation error: {msg}"),
             Self::CommandError(msg) => write!(f, "command error: {msg}"),
             Self::ExecutionError(msg) => write!(f, "execution error: {msg}"),
+            Self::PolicyDenied(reason) => write!(f, "policy gate denied: {reason}"),
         }
     }
 }

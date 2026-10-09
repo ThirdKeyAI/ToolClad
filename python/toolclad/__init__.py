@@ -39,6 +39,10 @@ from toolclad.scope import (
     url_host_in_scope,
 )
 from toolclad.executor import (
+    GateDecision,
+    PolicyDenied,
+    approve_gate,
+    default_gate,
     build_command,
     build_command_argv,
     compile_command,
@@ -78,6 +82,10 @@ __all__ = [
     "validate_arg_mode",
     "validate_arg_with_custom_types",
     "validate_arg_with_custom_types_mode",
+    "GateDecision",
+    "PolicyDenied",
+    "approve_gate",
+    "default_gate",
     "build_command",
     "build_command_argv",
     "compile_command",

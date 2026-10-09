@@ -163,8 +163,8 @@ type OutputDef struct {
 	Envelope *bool          `toml:"envelope"`
 	Schema   map[string]any `toml:"schema"`
 	// MaxBytes caps captured tool output. Nil means DefaultOutputMaxBytes;
-	// use MaxBytesLimit. Registered as a known key; the cap is not enforced
-	// here.
+	// use MaxBytesLimit. Checked at load (CheckOutput) and enforced on
+	// stdout and stderr each, and on an HTTP response body.
 	MaxBytes *int64 `toml:"max_bytes"`
 }
 
@@ -619,6 +619,12 @@ func (m *Manifest) EnsureCompiled() error {
 		return err
 	}
 	if err := m.CheckSpawnPolicy(); err != nil {
+		return err
+	}
+	if err := m.CheckOutput(); err != nil {
+		return err
+	}
+	if err := m.CheckHTTP(); err != nil {
 		return err
 	}
 	m.compiled = true
@@ -1155,6 +1161,12 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 	if err := m.CheckSpawnPolicy(); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
+	if err := m.CheckOutput(); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
+	if err := m.CheckHTTP(); err != nil {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 	return &m, nil

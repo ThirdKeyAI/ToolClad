@@ -311,7 +311,9 @@ describe("evidence paths", () => {
 
     const r = await execute(m, {});
     const outputDir = join(evidenceRoot, `${r.scan_id}-ev`);
-    assert.equal(r.command.split(" ")[4], join(outputDir, "scan.json"));
+    // The envelope carries the declared command, never the resolved path.
+    assert.equal(r.command, "stat -c %a %F {_output_file} {_evidence_dir}");
+    assert.equal(r.command.includes(outputDir), false);
     // The tool saw a pre-created 0600 regular file and the 0700 root.
     assert.deepEqual(r.results.raw_output.trim().split("\n"), [
       "600 regular empty file",

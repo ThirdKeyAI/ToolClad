@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,9 @@ type EvidenceEnvelope struct {
 	OutputHash string         `json:"output_hash,omitempty"`
 	Results    map[string]any `json:"results"`
 	Error      string         `json:"error,omitempty"`
+	// Truncated is set when stdout, stderr or an HTTP response body
+	// exceeded [output] max_bytes and capture stopped at the cap.
+	Truncated bool `json:"output_truncated,omitempty"`
 }
 
 // newScanID returns a scan identifier for one invocation:
@@ -206,37 +210,18 @@ const minWaitDelay = 100 * time.Millisecond
 //     here). A whole-token placeholder naming one of these splices its
 //     token vector into argv.
 func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (map[string]string, map[string][]string, error) {
-	if err := checkDeclaredArgs(m, args); err != nil {
-		return nil, nil, err
-	}
-	if err := m.EnsureScope(); err != nil {
-		return nil, nil, err
-	}
-
 	// allow_whitespace is honored only for a manifest that declared exec
 	// itself; the executor escape hatch always validates in strict mode.
 	execMode := m.Command.ExecWasDeclared && m.Command.Executor == ""
-	vars := make(map[string]string)
-	for name, argDef := range m.Args {
-		val, provided := args[name]
-		if !provided {
-			if argDef.Required {
-				return nil, nil, fmt.Errorf("missing required argument: %q", name)
-			}
-			if argDef.Default == nil {
-				// Unset optional: resolves to the empty string so a
-				// whole-token placeholder for it disappears from argv.
-				vars[name] = ""
-				continue
-			}
-			val = fmt.Sprintf("%v", argDef.Default)
-		}
-
-		validated, err := validator.ValidateArgIn(argDef, val, execMode, m.Scope)
-		if err != nil {
-			return nil, nil, fmt.Errorf("argument %q: %w", name, err)
-		}
-		vars[name] = validated
+	cleaned, err := validateArgs(m, args, execMode)
+	if err != nil {
+		return nil, nil, err
+	}
+	vars := make(map[string]string, len(m.Args))
+	for name := range m.Args {
+		// An unset optional resolves to the empty string so a whole-token
+		// placeholder for it disappears from argv.
+		vars[name] = cleaned[name]
 	}
 
 	for k, v := range m.Command.Defaults {
@@ -305,6 +290,46 @@ func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (m
 	}
 
 	return vars, trusted, nil
+}
+
+// validateArgs is the one argument-validation routine every backend
+// calls: it refuses undeclared names, loads the manifest's scope, refuses a
+// missing required argument, applies declared defaults and validates every
+// supplied or defaulted value through validator.ValidateArgIn. The result
+// holds exactly those values; an unset optional without a default is
+// absent. execMode is true only for a manifest that declared exec itself.
+func validateArgs(m *manifest.Manifest, args map[string]string, execMode bool) (map[string]string, error) {
+	if err := checkDeclaredArgs(m, args); err != nil {
+		return nil, err
+	}
+	if err := m.EnsureScope(); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(m.Args))
+	for name := range m.Args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	cleaned := make(map[string]string, len(names))
+	for _, name := range names {
+		argDef := m.Args[name]
+		val, provided := args[name]
+		if !provided {
+			if argDef.Required {
+				return nil, fmt.Errorf("missing required argument: %q", name)
+			}
+			if argDef.Default == nil {
+				continue
+			}
+			val = fmt.Sprintf("%v", argDef.Default)
+		}
+		validated, err := validator.ValidateArgIn(argDef, val, execMode, m.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("argument %q: %w", name, err)
+		}
+		cleaned[name] = validated
+	}
+	return cleaned, nil
 }
 
 // checkDeclaredArgs refuses a supplied argument name that the manifest does
@@ -538,16 +563,27 @@ func quoteForDisplay(tok string) string {
 	return "'" + strings.ReplaceAll(tok, "'", `'\''`) + "'"
 }
 
-// Execute validates arguments, builds the command, executes it with a timeout,
-// captures output, and returns an EvidenceEnvelope.
+// Execute validates arguments, consults DefaultGate, builds the command,
+// executes it with a timeout, captures output, and returns an
+// EvidenceEnvelope. It is ExecuteWithGate(m, args, DefaultGate): a manifest
+// with human_approval = true or a high/critical risk_tier is denied; use
+// ExecuteWithGate with ApproveGate (or a gate of your own) to run it.
 func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	return ExecuteWithGate(m, args, DefaultGate)
+}
+
+// ExecuteWithGate is Execute with an explicit policy gate (nil means
+// DefaultGate). The gate is consulted after validation and before anything
+// runs on every backend; a denial returns a *GateDeniedError and no
+// envelope.
+func ExecuteWithGate(m *manifest.Manifest, args map[string]string, gate Gate) (*EvidenceEnvelope, error) {
 	// Route to HTTP backend
 	if m.Http != nil {
-		return ExecuteHTTP(m, args)
+		return executeHTTP(m, args, gate)
 	}
 	// Route to MCP proxy backend
 	if m.Mcp != nil {
-		return ExecuteMCP(m, args)
+		return executeMCP(m, args, gate)
 	}
 	// Gate unimplemented modes
 	if m.Session != nil {
@@ -576,7 +612,13 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	}
 	// build compiled the manifest, which ran the load-time spawn checks for
 	// a manifest constructed in memory; a loaded one ran them at load.
-	cmdStr := FormatArgv(cmdArgs)
+
+	// The gate sees the validated values and decides before anything is
+	// created or spawned. A denial is not an execution, so no envelope.
+	if err := consultGate(gate, m, gateView(m, args, vars)); err != nil {
+		return nil, err
+	}
+	cmdStr := declaredCommand(m)
 
 	timeoutSecs := m.Tool.TimeoutSeconds
 	if timeoutSecs == 0 {
@@ -668,9 +710,14 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	}
 	cmd.WaitDelay = max(grace, minWaitDelay)
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	// Each stream is capped at max_bytes; past the cap the writer keeps
+	// accepting (and discarding) so the pipe drains and the child never
+	// blocks on a full pipe.
+	limit := outputLimit(m)
+	stdoutBuf := &cappedBuffer{limit: limit}
+	stderrBuf := &cappedBuffer{limit: limit}
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
 	execErr := cmd.Run()
 	duration := time.Since(start)
@@ -685,8 +732,8 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 		killTimer.Stop()
 	}
 
-	stdoutBytes := stdoutBuf.Bytes()
-	stderrStr := stderrBuf.String()
+	stdoutBytes := stdoutBuf.buf.Bytes()
+	stderrStr := stderrBuf.buf.String()
 	exitCode := 0
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
@@ -702,6 +749,7 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 		Stderr:     stderrStr,
 		DurationMs: duration.Milliseconds(),
 		Timestamp:  start.UTC().Format(time.RFC3339),
+		Truncated:  stdoutBuf.truncated || stderrBuf.truncated,
 	}
 
 	if timedOut {
@@ -748,22 +796,102 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 		}
 	}
 
-	// Parse output based on format. Callback-only manifests have no [output];
-	// for the execute path we always have one (validated at load).
-	outFormat := "text"
-	if m.Output != nil {
-		outFormat = m.Output.Format
-	}
-	results, parseErr := parseOutput(outFormat, stdoutBytes)
-	if parseErr != nil {
-		envelope.Results = map[string]any{
-			"raw_output": string(stdoutBytes),
-		}
-	} else {
-		envelope.Results = results
-	}
-
+	applyResults(envelope, m, stdoutBytes)
 	return envelope, nil
+}
+
+// gateView returns the validated values a gate sees: every declared
+// argument that was supplied or has a default, as validateArgs produced it.
+func gateView(m *manifest.Manifest, args map[string]string, vars map[string]string) map[string]string {
+	out := make(map[string]string, len(m.Args))
+	for name, def := range m.Args {
+		if _, ok := args[name]; ok || def.Default != nil {
+			out[name] = vars[name]
+		}
+	}
+	return out
+}
+
+// declaredCommand is the envelope's command on the oneshot path: the exec
+// array as written in the manifest joined by single spaces, or the legacy
+// template string itself, with placeholders intact. Executor-injected paths
+// and secrets therefore never reach the agent or the evidence; the dry run
+// (BuildCommand) keeps the resolved argv.
+func declaredCommand(m *manifest.Manifest) string {
+	if m.Command.Executor != "" {
+		return m.Command.Executor + " (custom executor)"
+	}
+	if !m.Command.ExecWasDeclared && m.Command.Template != "" {
+		return m.Command.Template
+	}
+	return strings.Join(m.Command.Exec, " ")
+}
+
+// outputLimit returns [output] max_bytes, defaulting to 8 MiB.
+func outputLimit(m *manifest.Manifest) int64 {
+	if m.Output == nil {
+		return manifest.DefaultOutputMaxBytes
+	}
+	if n := m.Output.MaxBytesLimit(); n > 0 {
+		return n
+	}
+	return manifest.DefaultOutputMaxBytes
+}
+
+// cappedBuffer keeps the first limit bytes written to it and discards the
+// rest, recording that it did. Write always reports the full length so the
+// copy goroutine keeps draining the pipe.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	limit     int64
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	room := c.limit - int64(c.buf.Len())
+	if room <= 0 {
+		if len(p) > 0 {
+			c.truncated = true
+		}
+		return len(p), nil
+	}
+	if int64(len(p)) > room {
+		c.buf.Write(p[:room])
+		c.truncated = true
+		return len(p), nil
+	}
+	c.buf.Write(p)
+	return len(p), nil
+}
+
+// applyResults parses raw according to [output] format and validates the
+// result against [output.schema] (default {"type": "object"}), failing
+// closed: a parse failure sets status parse_error and a schema failure sets
+// status schema_error, each with the raw output preserved. On success the
+// envelope's status is left as it is.
+func applyResults(env *EvidenceEnvelope, m *manifest.Manifest, raw []byte) {
+	format := "text"
+	var schema any = map[string]any{"type": "object"}
+	if m.Output != nil {
+		format = m.Output.Format
+		if len(m.Output.Schema) > 0 {
+			schema = m.Output.Schema
+		}
+	}
+	results, err := parseOutput(format, raw)
+	if err != nil {
+		env.Status = "parse_error"
+		env.Error = err.Error()
+		env.Results = map[string]any{"parse_error": err.Error(), "raw_output": string(raw)}
+		return
+	}
+	if err := ValidateSchema(schema, results); err != nil {
+		env.Status = "schema_error"
+		env.Error = err.Error()
+		env.Results = map[string]any{"schema_error": err.Error(), "raw_output": string(raw)}
+		return
+	}
+	env.Results = results
 }
 
 // captureOutput writes captured stdout to path. When a regular file is
@@ -783,26 +911,43 @@ func captureOutput(path string, data []byte) error {
 }
 
 // parseOutput converts raw command output based on the declared format.
+// The result is always an object: jsonl and csv as {"parsed_output": [...]},
+// text as {"raw_output": "..."}, a JSON object as itself and any other JSON
+// value as {"parsed_output": value}. JSON numbers are kept exact
+// (json.Number).
 func parseOutput(format string, data []byte) (map[string]any, error) {
 	switch format {
 	case "json":
-		var result map[string]any
-		if err := json.Unmarshal(data, &result); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
 			return nil, fmt.Errorf("parsing JSON output: %w", err)
 		}
-		return result, nil
+		if _, err := dec.Token(); err != io.EOF {
+			return nil, fmt.Errorf("parsing JSON output: trailing data after the JSON value")
+		}
+		if obj, ok := v.(map[string]any); ok {
+			return obj, nil
+		}
+		return map[string]any{"parsed_output": v}, nil
 
 	case "jsonl":
 		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		var parsed []any
+		parsed := []any{}
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
 			}
+			dec := json.NewDecoder(strings.NewReader(line))
+			dec.UseNumber()
 			var obj any
-			if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			if err := dec.Decode(&obj); err != nil {
 				return nil, fmt.Errorf("parsing JSONL line: %w", err)
+			}
+			if _, err := dec.Token(); err != io.EOF {
+				return nil, fmt.Errorf("parsing JSONL line: trailing data after the JSON value")
 			}
 			parsed = append(parsed, obj)
 		}
@@ -812,14 +957,22 @@ func parseOutput(format string, data []byte) (map[string]any, error) {
 		return parseCsvOutput(data), nil
 
 	case "xml":
+		if xmlHasDeclarations(data) {
+			return nil, errors.New("XML output contains a DOCTYPE or ENTITY declaration; refusing to parse")
+		}
 		return parseXmlOutput(data), nil
-
-	case "text", "":
-		return map[string]any{"raw_output": string(data)}, nil
 
 	default:
 		return map[string]any{"raw_output": string(data)}, nil
 	}
+}
+
+// xmlHasDeclarations reports whether XML output carries a DOCTYPE or ENTITY
+// declaration anywhere (case-insensitive). Such output is refused before
+// parsing rather than given to any entity-aware parser.
+func xmlHasDeclarations(data []byte) bool {
+	lower := bytes.ToLower(data)
+	return bytes.Contains(lower, []byte("<!doctype")) || bytes.Contains(lower, []byte("<!entity"))
 }
 
 // parseCsvOutput parses CSV data with auto-delimiter detection and type inference.
@@ -1132,46 +1285,93 @@ func injectTemplateVars(template string) (string, error) {
 	return (&secretSource{}).expand(template)
 }
 
-// interpolateString replaces {key} placeholders with values from the context map.
+// interpolateString replaces {key} placeholders with values from the
+// context map, unencoded.
 func interpolateString(template string, ctx map[string]string) string {
-	result := template
-	for k, v := range ctx {
-		result = strings.ReplaceAll(result, "{"+k+"}", v)
-	}
-	return result
+	return interpolateWith(template, ctx, func(v string, _ int) string { return v })
 }
 
-// expandHTTPTemplate turns one [http] template string into its final form.
-// Secrets are expanded on the manifest template FIRST and argument values
-// are interpolated afterwards, so a validated argument can never introduce
-// a {_secret:name} reference of its own: by the time the argument text is
-// in place, no secret expansion happens any more. The url validator's
-// metacharacter blocklist also rejects braces, but the ordering here does
-// not rely on that check being the only defense.
-func expandHTTPTemplate(secrets *secretSource, template string, cleaned map[string]string) (string, error) {
-	withSecrets, err := secrets.expand(template)
-	if err != nil {
-		return "", err
+// interpolateWith replaces each {key} naming an entry of ctx with
+// encode(value, offset), offset being the placeholder's position in
+// template. Unknown placeholders are left as written. The template is
+// scanned once, so substituted text is never rescanned.
+func interpolateWith(template string, ctx map[string]string, encode func(v string, offset int) string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(template) {
+		if template[i] == '{' {
+			if end := strings.IndexByte(template[i+1:], '}'); end >= 0 {
+				name := template[i+1 : i+1+end]
+				if v, ok := ctx[name]; ok {
+					b.WriteString(encode(v, i))
+					i += end + 2
+					continue
+				}
+			}
+		}
+		b.WriteByte(template[i])
+		i++
 	}
-	return interpolateString(withSecrets, cleaned), nil
+	return b.String()
+}
+
+// interpolateURL interpolates validated values into an expanded http.url,
+// percent-encoding each by position: before the first "?" (or "#") as one
+// path segment, after it as a query value. "/", "?", "#", "%", "&" and "="
+// in a value therefore can never change the URL's structure, and a value of
+// "." or ".." is encoded so it cannot act as a dot segment. The scheme and
+// host never hold a placeholder (refused at load by CheckHTTP).
+func interpolateURL(template string, ctx map[string]string) string {
+	queryAt := strings.IndexAny(template, "?#")
+	return interpolateWith(template, ctx, func(v string, offset int) string {
+		if queryAt >= 0 && offset > queryAt {
+			return url.QueryEscape(v)
+		}
+		switch v {
+		case ".":
+			return "%2E"
+		case "..":
+			return "%2E%2E"
+		}
+		return url.PathEscape(v)
+	})
+}
+
+// jsonEscapeString returns v as the inside of a JSON string literal.
+func jsonEscapeString(v string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v) // encoding a string cannot fail
+	out := strings.TrimSuffix(buf.String(), "\n")
+	return out[1 : len(out)-1]
 }
 
 // buildHTTPRequest assembles the request for an [http] manifest from
-// already-validated arguments without sending it. The URL, every header
-// value and the body template each go through expandHTTPTemplate.
+// already-validated arguments without sending it. In the URL, every header
+// value and the body template, {_secret:name} references in the manifest
+// template are expanded FIRST and argument values interpolated afterwards,
+// so a validated argument can never introduce a secret reference of its
+// own. Values are percent-encoded by position in the URL and JSON-escaped
+// in the body; an assembled header value containing CR or LF is refused.
 func buildHTTPRequest(m *manifest.Manifest, cleaned map[string]string) (*http.Request, error) {
 	// One source per request: the secrets file is read at most once.
 	secrets := &secretSource{}
-	url, err := expandHTTPTemplate(secrets, m.Http.URL, cleaned)
+	urlTemplate, err := secrets.expand(m.Http.URL)
 	if err != nil {
 		return nil, err
 	}
+	target := interpolateURL(urlTemplate, cleaned)
 
 	headers := make(map[string]string)
 	for k, v := range m.Http.Headers {
-		hv, err := expandHTTPTemplate(secrets, v, cleaned)
+		withSecrets, err := secrets.expand(v)
 		if err != nil {
 			return nil, err
+		}
+		hv := interpolateString(withSecrets, cleaned)
+		if strings.ContainsAny(hv, "\r\n") {
+			return nil, fmt.Errorf("http header '%s' contains a CR or LF after interpolation", k)
 		}
 		headers[k] = hv
 	}
@@ -1182,14 +1382,15 @@ func buildHTTPRequest(m *manifest.Manifest, cleaned map[string]string) (*http.Re
 	}
 	var bodyReader io.Reader
 	if m.Http.BodyTemplate != "" && method != "GET" && method != "HEAD" {
-		body, err := expandHTTPTemplate(secrets, m.Http.BodyTemplate, cleaned)
+		withSecrets, err := secrets.expand(m.Http.BodyTemplate)
 		if err != nil {
 			return nil, err
 		}
+		body := interpolateWith(withSecrets, cleaned, func(v string, _ int) string { return jsonEscapeString(v) })
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
+	req, err := http.NewRequest(method, target, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("building HTTP request: %w", err)
 	}
@@ -1199,58 +1400,72 @@ func buildHTTPRequest(m *manifest.Manifest, cleaned map[string]string) (*http.Re
 	return req, nil
 }
 
-// ExecuteHTTP performs an HTTP request based on the manifest's [http] section.
-func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
-	if m.Http == nil || m.Http.URL == "" {
-		return nil, fmt.Errorf("manifest %q has no [http] section or http.url", m.Tool.Name)
-	}
+// prepareDelegated runs the checks shared by the HTTP and MCP backends for
+// a manifest that may have been built in memory, validates the arguments
+// through validateArgs and consults the gate.
+func prepareDelegated(m *manifest.Manifest, args map[string]string, gate Gate) (map[string]string, error) {
 	if err := checkDeclaredArgs(m, args); err != nil {
 		return nil, err
 	}
-	// Manifests built in memory never passed LoadManifest's egress lint;
-	// run it here so an [http] backend (always egress) and a
-	// network_egress tool get the same block_internal requirement.
+	// Manifests built in memory never passed LoadManifest's checks; run the
+	// egress lint (an [http] backend is always egress) and the [output] and
+	// [http] load rules here.
 	if err := m.LintEgress(nil); err != nil {
 		return nil, err
 	}
-	if err := m.EnsureScope(); err != nil {
+	if err := m.CheckOutput(); err != nil {
+		return nil, err
+	}
+	if err := m.CheckHTTP(); err != nil {
+		return nil, err
+	}
+	cleaned, err := validateArgs(m, args, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := consultGate(gate, m, cleaned); err != nil {
+		return nil, err
+	}
+	return cleaned, nil
+}
+
+// ExecuteHTTP performs an HTTP request based on the manifest's [http]
+// section, after consulting DefaultGate. Use ExecuteWithGate to supply a
+// different gate.
+func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	return executeHTTP(m, args, DefaultGate)
+}
+
+func executeHTTP(m *manifest.Manifest, args map[string]string, gate Gate) (*EvidenceEnvelope, error) {
+	if m.Http == nil || m.Http.URL == "" {
+		return nil, fmt.Errorf("manifest %q has no [http] section or http.url", m.Tool.Name)
+	}
+	cleaned, err := prepareDelegated(m, args, gate)
+	if err != nil {
 		return nil, err
 	}
 
 	start := time.Now()
 	scanID := newScanID(start)
 
-	// Validate args
-	cleaned := make(map[string]string)
-	for name, argDef := range m.Args {
-		val, provided := args[name]
-		if !provided {
-			if argDef.Required {
-				return nil, fmt.Errorf("missing required argument: %q", name)
-			}
-			if argDef.Default != nil {
-				val = fmt.Sprintf("%v", argDef.Default)
-			} else {
-				continue
-			}
-		}
-		validated, err := validator.ValidateArgIn(argDef, val, false, m.Scope)
-		if err != nil {
-			return nil, fmt.Errorf("argument %q: %w", name, err)
-		}
-		cleaned[name] = validated
-	}
-
 	req, err := buildHTTPRequest(m, cleaned)
 	if err != nil {
 		return nil, err
 	}
+	method := req.Method
+	// The declared request, placeholders and {_secret:...} intact.
+	cmdStr := method + " " + m.Http.URL
 
 	timeout := time.Duration(m.Tool.TimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = 60 * time.Second
 	}
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{
+		Timeout: timeout,
+		// Redirects are never followed: an allowed host could otherwise
+		// send the request on to an internal address unchecked.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1258,19 +1473,47 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 			Status:    "error",
 			ScanID:    scanID,
 			Tool:      m.Tool.Name,
+			Command:   cmdStr,
 			Timestamp: start.UTC().Format(time.RFC3339),
 			Error:     err.Error(),
 		}, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	limit := outputLimit(m)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	truncated := int64(len(respBody)) > limit
+	if truncated {
+		respBody = respBody[:limit]
 	}
 
 	duration := time.Since(start)
 	hash := sha256.Sum256(respBody)
+
+	envelope := &EvidenceEnvelope{
+		ScanID:     scanID,
+		Tool:       m.Tool.Name,
+		Command:    cmdStr,
+		DurationMs: duration.Milliseconds(),
+		Timestamp:  start.UTC().Format(time.RFC3339),
+		OutputHash: fmt.Sprintf("sha256:%x", hash),
+		ExitCode:   resp.StatusCode,
+		Truncated:  truncated,
+		Results: map[string]any{
+			"raw_output": string(respBody),
+		},
+	}
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := resp.Header.Get("Location")
+		envelope.Status = "redirect_blocked"
+		envelope.Error = fmt.Sprintf("HTTP %d redirect not followed (Location: %s)", resp.StatusCode, loc)
+		envelope.Results = map[string]any{"location": loc, "raw_output": string(respBody)}
+		return envelope, nil
+	}
 
 	successStatus := m.Http.SuccessStatus
 	if len(successStatus) == 0 {
@@ -1284,20 +1527,9 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 		}
 	}
 
-	envelope := &EvidenceEnvelope{
-		ScanID:     scanID,
-		Tool:       m.Tool.Name,
-		DurationMs: duration.Milliseconds(),
-		Timestamp:  start.UTC().Format(time.RFC3339),
-		OutputHash: fmt.Sprintf("sha256:%x", hash),
-		ExitCode:   resp.StatusCode,
-		Results: map[string]any{
-			"raw_output": string(respBody),
-		},
-	}
-
 	if isSuccess {
 		envelope.Status = "success"
+		applyResults(envelope, m, respBody)
 	} else {
 		envelope.Status = "error"
 		body := string(respBody)
@@ -1310,47 +1542,24 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	return envelope, nil
 }
 
-// ExecuteMCP performs field mapping and returns a delegated envelope for MCP proxy.
+// ExecuteMCP performs field mapping and returns a delegated envelope for MCP
+// proxy, after consulting DefaultGate. Use ExecuteWithGate to supply a
+// different gate.
 func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
+	return executeMCP(m, args, DefaultGate)
+}
+
+func executeMCP(m *manifest.Manifest, args map[string]string, gate Gate) (*EvidenceEnvelope, error) {
 	if m.Mcp == nil || m.Mcp.Server == "" || m.Mcp.Tool == "" {
 		return nil, fmt.Errorf("manifest %q has no [mcp] section or mcp.server/mcp.tool", m.Tool.Name)
 	}
-	if err := checkDeclaredArgs(m, args); err != nil {
-		return nil, err
-	}
-	// Manifests built in memory never passed LoadManifest's egress lint;
-	// run it here so an [http] backend (always egress) and a
-	// network_egress tool get the same block_internal requirement.
-	if err := m.LintEgress(nil); err != nil {
-		return nil, err
-	}
-	if err := m.EnsureScope(); err != nil {
+	cleaned, err := prepareDelegated(m, args, gate)
+	if err != nil {
 		return nil, err
 	}
 
 	start := time.Now()
 	scanID := newScanID(start)
-
-	// Validate args
-	cleaned := make(map[string]string)
-	for name, argDef := range m.Args {
-		val, provided := args[name]
-		if !provided {
-			if argDef.Required {
-				return nil, fmt.Errorf("missing required argument: %q", name)
-			}
-			if argDef.Default != nil {
-				val = fmt.Sprintf("%v", argDef.Default)
-			} else {
-				continue
-			}
-		}
-		validated, err := validator.ValidateArgIn(argDef, val, false, m.Scope)
-		if err != nil {
-			return nil, fmt.Errorf("argument %q: %w", name, err)
-		}
-		cleaned[name] = validated
-	}
 
 	// Apply field_map
 	mappedArgs := make(map[string]any)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import hashlib
 import io
@@ -15,19 +16,23 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import warnings
+from dataclasses import dataclass
 
 try:  # POSIX only; the spawn path requires it.
     import resource
 except ImportError:  # pragma: no cover - non-POSIX platforms
     resource = None  # type: ignore[assignment]
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from toolclad.manifest import LimitsDef, Manifest, _command_basename, _default_text
+from toolclad.schema import schema_error
 from toolclad.scope import manifest_scope
 from toolclad.validator import ValidationError, validate_arg_in
 
@@ -220,6 +225,79 @@ def _signal_group(pgid: int, sig: int) -> None:
         pass
 
 
+_READ_CHUNK = 1 << 16
+
+DEFAULT_MAX_BYTES = 8_388_608
+
+
+class _CappedReader:
+    """Drain one pipe in a thread, keeping at most ``limit`` bytes.
+
+    Reading continues past the cap (the excess is discarded) so the child
+    never blocks on a full pipe. The thread is a daemon: a descendant that
+    escaped the process group may hold the pipe open after the deadline,
+    and the caller then takes what has been collected so far.
+    """
+
+    def __init__(self, pipe: Any, limit: int) -> None:
+        self._fd = pipe.fileno()
+        self._pipe = pipe
+        self._limit = limit
+        self._chunks: List[bytes] = []
+        self._kept = 0
+        self.truncated = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                chunk = os.read(self._fd, _READ_CHUNK)
+                if not chunk:
+                    break
+                with self._lock:
+                    room = self._limit - self._kept
+                    if room <= 0:
+                        self.truncated = True
+                        continue
+                    if len(chunk) > room:
+                        chunk = chunk[:room]
+                        self.truncated = True
+                    self._chunks.append(chunk)
+                    self._kept += len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self._pipe.close()
+            except OSError:
+                pass
+
+    def join(self, timeout: Optional[float]) -> None:
+        self._thread.join(timeout)
+
+    def text(self) -> str:
+        """The captured bytes as text. When capped, an incomplete trailing
+        UTF-8 sequence is dropped rather than rendered as a replacement."""
+        with self._lock:
+            data = b"".join(self._chunks)
+            truncated = self.truncated
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        return decoder.decode(data, final=not truncated)
+
+
+@dataclass
+class ProcessResult:
+    """The outcome of :func:`_run_process`."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    truncated: bool
+
+
 def _run_process(
     argv: List[str],
     *,
@@ -227,16 +305,18 @@ def _run_process(
     cwd: str,
     timeout: float,
     limits: LimitsDef,
-) -> Tuple[int, str, str, bool]:
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> ProcessResult:
     """Spawn ``argv`` with the hardened settings and wait for it.
 
     stdin is ``/dev/null``, the environment is ``env`` (from
     :func:`child_env`), the working directory is ``cwd``, and the pre-exec
     hook puts the child in its own process group with umask 0077 and rlimits.
+    stdout and stderr are each capped at ``max_bytes``; the pipes are read in
+    threads with a running total and the excess is drained and discarded.
 
-    Returns:
-        ``(returncode, stdout, stderr, timed_out)``. On timeout the return
-        code is -1 and the output collected before the kill is kept.
+    On timeout the return code is -1 and the output collected before the
+    kill is kept.
     """
     argv = [resolve_binary(argv[0])] + list(argv[1:])
     proc = subprocess.Popen(
@@ -247,19 +327,38 @@ def _run_process(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         start_new_session=False,
         preexec_fn=_make_preexec(limits),
     )
+    out = _CappedReader(proc.stdout, max_bytes)
+    err = _CappedReader(proc.stderr, max_bytes)
+
+    def result(returncode: int, timed_out: bool) -> ProcessResult:
+        return ProcessResult(
+            returncode=returncode,
+            stdout=out.text(),
+            stderr=err.text(),
+            timed_out=timed_out,
+            truncated=out.truncated or err.truncated,
+        )
+
+    timed_out = False
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return proc.returncode, stdout or "", stderr or "", False
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        pass
+        timed_out = True
     except BaseException:
         _signal_group(proc.pid, signal.SIGKILL)
         proc.wait()
         raise
+
+    if not timed_out:
+        # The child exited; its pipes reach EOF unless a descendant still
+        # holds them, in which case the read is bounded by the kill grace.
+        grace = _kill_grace_seconds()
+        out.join(max(grace, 0.5))
+        err.join(max(grace, 0.5))
+        return result(proc.returncode, False)
 
     # Deadline: SIGTERM to the process group, a grace period, then SIGKILL to
     # the group. The hook made the child a group leader, so pgid == pid.
@@ -279,23 +378,10 @@ def _run_process(
     proc.wait()
 
     # Collect what the child wrote before the kill. A descendant outside the
-    # group may still hold the pipes open, so this read is bounded too.
-    try:
-        stdout, stderr = proc.communicate(timeout=max(grace, 0.5))
-    except subprocess.TimeoutExpired as exc:
-        stdout, stderr = _partial_text(exc.stdout), _partial_text(exc.stderr)
-        for pipe in (proc.stdout, proc.stderr):
-            if pipe is not None:
-                pipe.close()
-    return -1, stdout or "", stderr or "", True
-
-
-def _partial_text(data: Any) -> str:
-    if data is None:
-        return ""
-    if isinstance(data, bytes):
-        return data.decode("utf-8", errors="replace")
-    return str(data)
+    # group may still hold the pipes open, so this wait is bounded too.
+    out.join(max(grace, 0.5))
+    err.join(max(grace, 0.5))
+    return result(-1, True)
 
 
 def _check_argv0(manifest: Manifest) -> None:
@@ -649,7 +735,10 @@ def _validate_call_args(
 
 
 def _resolve_context(
-    manifest: Manifest, args: Dict[str, str], scan_id: Optional[str] = None
+    manifest: Manifest,
+    args: Dict[str, str],
+    scan_id: Optional[str] = None,
+    on_validated: Optional[Callable[[Dict[str, str]], None]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     """Validate arguments and build the two substitution maps.
 
@@ -662,6 +751,8 @@ def _resolve_context(
     single, absent = _validate_call_args(
         manifest, args, manifest.command.exec_was_declared
     )
+    if on_validated is not None:
+        on_validated(dict(single))
     for arg_name in absent:
         single[arg_name] = ""
 
@@ -710,6 +801,20 @@ def build_command_argv(
 ) -> List[str]:
     """Build the argv list from a manifest and raw argument values.
 
+    See :func:`_build_argv`; this public form consults no policy gate.
+    """
+    return _build_argv(manifest, args, scan_id=scan_id)
+
+
+def _build_argv(
+    manifest: Manifest,
+    args: Dict[str, str],
+    *,
+    scan_id: Optional[str] = None,
+    on_validated: Optional[Callable[[Dict[str, str]], None]] = None,
+) -> List[str]:
+    """Build the argv list from a manifest and raw argument values.
+
     The manifest is compiled to its exec form if needed, every argument is
     validated, and each exec token is substituted independently so argument
     boundaries are preserved: a value is always exactly one argv element.
@@ -744,7 +849,7 @@ def build_command_argv(
             f"Manifest '{manifest.tool.name}' has no exec array or command template."
         )
 
-    single, trusted = _resolve_context(manifest, args, scan_id)
+    single, trusted = _resolve_context(manifest, args, scan_id, on_validated)
     expanded = _expand_tokens(manifest.command.exec, single, trusted, set(manifest.args))
 
     argv: List[str] = []
@@ -888,10 +993,27 @@ def _xml_element_to_dict(elem) -> dict:
     return result
 
 
+XML_DECLARATION_REFUSAL = (
+    "XML output contains a DOCTYPE or ENTITY declaration; refusing to parse"
+)
+_XML_DECL_RE = re.compile(r"<!(?:DOCTYPE|ENTITY)", re.IGNORECASE)
+
+
 def _parse_xml_to_json(raw: str) -> dict:
-    """Parse XML string to a JSON-compatible dict."""
+    """Parse XML string to a JSON-compatible dict.
+
+    A DOCTYPE or ENTITY declaration anywhere in the input is refused before
+    ``ElementTree`` sees it: internal entities expand without limit there
+    (the "billion laughs" document), and tool output has no use for a DTD.
+    """
     import xml.etree.ElementTree as ET
-    root = ET.fromstring(raw)
+
+    if _XML_DECL_RE.search(raw):
+        raise OutputParseError(XML_DECLARATION_REFUSAL)
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise OutputParseError(f"XML parse failed: {exc}") from None
     return {root.tag: _xml_element_to_dict(root)}
 
 
@@ -930,49 +1052,153 @@ def _parse_csv(raw: str) -> list:
     return rows
 
 
-def _parse_output(manifest: Manifest, raw: str) -> dict:
-    """Parse raw output according to manifest output format/parser."""
+class OutputParseError(RuntimeError):
+    """The declared parser could not parse the tool's output."""
+
+
+def _parse_output(manifest: Manifest, raw: str) -> Dict[str, Any]:
+    """Parse raw output with the declared builtin parser and normalize it.
+
+    The result is always a JSON object so one schema shape fits every
+    runtime: ``builtin:jsonl`` and ``builtin:csv`` give
+    ``{"parsed_output": [...]}``, ``builtin:text`` gives
+    ``{"raw_output": "..."}``, ``builtin:json`` passes an object through
+    and wraps anything else as ``{"parsed_output": ...}``.
+
+    Raises:
+        OutputParseError: When the output does not parse.
+    """
     if manifest.output is None:
         return {"raw_output": raw}
     parser = manifest.output.parser or f"builtin:{manifest.output.format}"
 
     if parser == "builtin:json":
         try:
-            return json.loads(raw)
+            value = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise RuntimeError(f"JSON parse failed: {e}")
+            raise OutputParseError(f"JSON parse failed: {e}") from None
+        return value if isinstance(value, dict) else {"parsed_output": value}
 
-    elif parser == "builtin:jsonl":
-        lines = [l for l in raw.strip().splitlines() if l.strip()]
+    if parser == "builtin:jsonl":
+        lines = [line for line in raw.strip().splitlines() if line.strip()]
         try:
-            return [json.loads(l) for l in lines]
+            return {"parsed_output": [json.loads(line) for line in lines]}
         except json.JSONDecodeError as e:
-            raise RuntimeError(f"JSONL parse failed: {e}")
+            raise OutputParseError(f"JSONL parse failed: {e}") from None
 
-    elif parser == "builtin:csv":
-        return _parse_csv(raw)
-
-    elif parser == "builtin:xml":
+    if parser == "builtin:csv":
         try:
-            return _parse_xml_to_json(raw)
-        except Exception:
-            return {"raw_output": raw}
+            return {"parsed_output": _parse_csv(raw)}
+        except csv.Error as e:
+            raise OutputParseError(f"CSV parse failed: {e}") from None
 
-    else:  # builtin:text or custom
+    if parser == "builtin:xml":
+        return _parse_xml_to_json(raw)
+
+    if parser == "builtin:text":
         return {"raw_output": raw}
 
+    # The loader refuses any other parser; a manifest built in code is
+    # refused here rather than passed through unchecked.
+    raise OutputParseError(custom_parser_message(parser))
 
-def _validate_output_schema(manifest: Manifest, parsed: Any) -> None:
-    """Validate parsed output against manifest output schema, if jsonschema is available."""
-    if manifest.output is None or not manifest.output.schema:
-        return
+
+def custom_parser_message(parser: str) -> str:
+    """The load error for a parser that is not one of the builtins."""
+    return (
+        "custom output parsers are not supported by the reference runtimes "
+        f'(parser = "{parser}")'
+    )
+
+
+_DEFAULT_SCHEMA: Dict[str, Any] = {"type": "object"}
+
+
+def _apply_output(manifest: Manifest, envelope: Dict[str, Any], raw: str) -> None:
+    """Parse ``raw`` and check it against ``[output.schema]``, fail closed.
+
+    On success ``results`` is the normalized parse. A parse failure sets
+    status ``parse_error`` and a schema failure ``schema_error``; either
+    way ``results`` carries the message and the raw output, never an
+    unchecked pass-through. ``exit_code`` and ``stderr`` are untouched.
+    """
     try:
-        import jsonschema
-        jsonschema.validate(instance=parsed, schema=manifest.output.schema)
-    except ImportError:
-        pass  # jsonschema not installed, skip validation
-    except jsonschema.ValidationError as e:
-        raise RuntimeError(f"Output schema validation failed: {e.message}")
+        parsed = _parse_output(manifest, raw)
+    except OutputParseError as exc:
+        envelope["status"] = "parse_error"
+        envelope["results"] = {"parse_error": str(exc), "raw_output": raw}
+        return
+    schema = (manifest.output.schema if manifest.output else None) or _DEFAULT_SCHEMA
+    error = schema_error(parsed, schema)
+    if error is not None:
+        envelope["status"] = "schema_error"
+        envelope["results"] = {"schema_error": error, "raw_output": raw}
+        return
+    envelope["results"] = parsed
+
+
+def _max_bytes(manifest: Manifest) -> int:
+    return manifest.output.max_bytes if manifest.output else DEFAULT_MAX_BYTES
+
+
+# ---------------------------------------------------------------------------
+# Policy gate (W7)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class GateDecision:
+    """The policy gate's verdict: ``GateDecision.allow()`` or
+    ``GateDecision.deny(reason)``."""
+
+    allowed: bool
+    reason: str = ""
+
+    @classmethod
+    def allow(cls) -> "GateDecision":
+        return cls(True)
+
+    @classmethod
+    def deny(cls, reason: str) -> "GateDecision":
+        return cls(False, reason)
+
+
+#: A gate sees the manifest and the *validated* argument values.
+Gate = Callable[[Manifest, Dict[str, str]], GateDecision]
+
+
+class PolicyDenied(PermissionError):
+    """Raised when the policy gate denies a call. Nothing ran."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"policy gate denied: {reason}")
+
+
+# The gate is the seam where an embedding runtime enforces policy before
+# anything runs. ``[tool.cedar]`` declares the resource and action for that
+# runtime's Cedar evaluator; ToolClad does not evaluate Cedar policy itself,
+# and wiring an evaluator into a gate is the embedder's job.
+def default_gate(manifest: Manifest, args: Dict[str, str]) -> GateDecision:
+    """Deny ``human_approval = true`` and ``risk_tier`` high/critical."""
+    if manifest.tool.human_approval is True:
+        return GateDecision.deny("manifest requires human approval (human_approval = true)")
+    tier = manifest.tool.risk_tier
+    if tier in ("high", "critical"):
+        return GateDecision.deny(f"risk_tier '{tier}' requires explicit approval")
+    return GateDecision.allow()
+
+
+def approve_gate(manifest: Manifest, args: Dict[str, str]) -> GateDecision:
+    """Allow everything: the caller has approved the call out of band."""
+    return GateDecision.allow()
+
+
+def _consult_gate(gate: Gate, manifest: Manifest, values: Dict[str, str]) -> None:
+    decision = gate(manifest, dict(values))
+    if not isinstance(decision, GateDecision):
+        raise TypeError("policy gate must return a GateDecision")
+    if not decision.allowed:
+        raise PolicyDenied(decision.reason)
 
 
 def _interpolate_http(
@@ -989,10 +1215,88 @@ def _interpolate_http(
     return _interpolate(inject_template_vars(template, secrets_map), args)
 
 
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_URL_HOST_REFUSAL = "http.url may not interpolate into the scheme or host"
+
+
+def check_http_url(manifest: Manifest) -> None:
+    """Load-time checks on ``[http]``.
+
+    The scheme and host of ``http.url`` must be literal: the host is the
+    egress boundary and belongs to the manifest, never to an argument or a
+    secret. An IP-literal host gets the address policy (link-local and
+    metadata always refused; the non-public ranges too when any argument
+    declares ``block_internal``). Header names must be HTTP tokens.
+
+    Raises:
+        ValueError: On any violation.
+    """
+    http = manifest.http
+    if http is None:
+        return
+    url = http.url
+    scheme_end = url.find("://")
+    if scheme_end < 0 or "{" in url[:scheme_end]:
+        raise ValueError(_URL_HOST_REFUSAL)
+    rest = url[scheme_end + 3:]
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    if "{" in authority or "}" in authority:
+        raise ValueError(_URL_HOST_REFUSAL)
+    for name in http.headers:
+        if not _HEADER_NAME_RE.fullmatch(str(name)):
+            raise ValueError(f"[http.headers] name {name!r} is not a valid HTTP header name")
+    host = authority.rsplit("@", 1)[-1]
+    if host.startswith("["):
+        host = host[1:host.find("]")] if "]" in host else host
+    else:
+        host = host.rsplit(":", 1)[0]
+    from toolclad.hostpolicy import enforce_ip_policy, parse_canonical_ip
+
+    ip = parse_canonical_ip(host)
+    if ip is not None:
+        block_internal = any(a.block_internal for a in manifest.args.values())
+        try:
+            enforce_ip_policy("http.url", ip, block_internal)
+        except ValidationError as exc:
+            raise ValueError(str(exc)) from None
+
+
+def _interpolate_url(template: str, args: Dict[str, str], secrets_map: Dict[str, str]) -> str:
+    """Build the request URL: manifest secrets first, then each argument
+    value percent-encoded with nothing left safe, so ``/ ? # % & =`` and
+    ``..`` in a value can never change the path or query structure."""
+    encoded = {k: urllib.parse.quote(v, safe="") for k, v in args.items()}
+    return _interpolate(inject_template_vars(template, secrets_map), encoded)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: an allowed host could otherwise send the
+    request on to an internal address with no check. Returning None makes
+    urllib surface the 3xx as an ``HTTPError``."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
+def _open_url(req: urllib.request.Request, timeout: float):
+    """Open ``req`` with an opener that does not follow redirects."""
+    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
+def _read_capped(resp: Any, max_bytes: int) -> Tuple[str, bool]:
+    data = resp.read(max_bytes + 1) or b""
+    truncated = len(data) > max_bytes
+    if truncated:
+        data = data[:max_bytes]
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    return decoder.decode(data, final=not truncated), truncated
+
+
 def _execute_http(
     manifest: Manifest,
     args: Dict[str, str],
     *,
+    gate: Optional[Gate] = None,
     dry_run: bool = False,
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1002,6 +1306,9 @@ def _execute_http(
     # The same validation as the oneshot path (strict mode): only validated
     # values are ever interpolated into the URL, headers or body.
     args, absent = _validate_call_args(manifest, args, False)
+    check_http_url(manifest)
+    if not dry_run:
+        _consult_gate(gate or default_gate, manifest, args)
     for arg_name in absent:
         args[arg_name] = ""
 
@@ -1012,8 +1319,13 @@ def _execute_http(
     # argument can never carry a secret reference into the request.
     # The secrets file is read once per call, not once per placeholder.
     secrets_map = load_secrets_file()
-    url = _interpolate_http(http.url, args, secrets_map)
+    url = _interpolate_url(http.url, args, secrets_map)
     headers = {k: _interpolate_http(v, args, secrets_map) for k, v in http.headers.items()}
+    for name, value in headers.items():
+        if not _HEADER_NAME_RE.fullmatch(str(name)):
+            raise ValueError(f"[http.headers] name {name!r} is not a valid HTTP header name")
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"header '{name}' contains a CR or LF after interpolation")
     body: Optional[bytes] = None
     if http.body_template is not None:
         # JSON-escape values to prevent injection into JSON body
@@ -1027,7 +1339,9 @@ def _execute_http(
         "status": "success",
         "scan_id": scan_id,
         "tool": manifest.tool.name,
-        "command": f"{http.method} {url}",
+        # The declared form: placeholders and secret references intact, so
+        # no expanded secret reaches the agent or the evidence.
+        "command": f"{http.method} {http.url}",
         "duration_ms": 0,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "output_file": "",
@@ -1037,20 +1351,26 @@ def _execute_http(
     }
 
     if dry_run:
+        # The human-facing dry run shows the resolved request.
+        envelope["command"] = f"{http.method} {url}"
         envelope["status"] = "dry_run"
         return envelope
 
+    max_bytes = _max_bytes(manifest)
+    location: Optional[str] = None
     start = time.monotonic()
     try:
         req = urllib.request.Request(
             url, data=body, headers=headers, method=http.method
         )
-        resp = urllib.request.urlopen(req, timeout=effective_timeout)
+        resp = _open_url(req, effective_timeout)
         status_code = resp.status
-        resp_body = resp.read().decode("utf-8", errors="replace")
+        resp_body, truncated = _read_capped(resp, max_bytes)
     except urllib.error.HTTPError as exc:
         status_code = exc.code
-        resp_body = exc.read().decode("utf-8", errors="replace")
+        resp_body, truncated = _read_capped(exc, max_bytes)
+        if 300 <= status_code < 400:
+            location = exc.headers.get("Location", "") if exc.headers else ""
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         envelope["duration_ms"] = elapsed_ms
@@ -1061,6 +1381,13 @@ def _execute_http(
     elapsed_ms = int((time.monotonic() - start) * 1000)
     envelope["duration_ms"] = elapsed_ms
     envelope["http_status"] = status_code
+    if truncated:
+        envelope["output_truncated"] = True
+
+    if location is not None:
+        envelope["status"] = "redirect_blocked"
+        envelope["results"] = {"location": location, "raw_output": resp_body}
+        return envelope
 
     is_success = True
     if http.error_status and status_code in http.error_status:
@@ -1086,6 +1413,7 @@ def _execute_mcp_proxy(
     manifest: Manifest,
     args: Dict[str, str],
     *,
+    gate: Optional[Gate] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Build a delegation envelope for an MCP proxy manifest."""
@@ -1097,6 +1425,8 @@ def _execute_mcp_proxy(
     _check_declared_args(manifest, args)
     validated, absent = _validate_call_args(manifest, args, False)
     args = {k: v for k, v in validated.items() if k not in absent}
+    if not dry_run:
+        _consult_gate(gate or default_gate, manifest, args)
 
     scan_id = _generate_scan_id()
 
@@ -1132,30 +1462,63 @@ def _execute_mcp_proxy(
     return envelope
 
 
+def _declared_command(manifest: Manifest) -> str:
+    """The command as declared: the exec array joined by single spaces, or
+    the legacy template string as written. Never the resolved argv, so
+    executor-injected paths and expanded values stay out of the envelope."""
+    cmd = manifest.command
+    if cmd.exec_was_declared or not cmd.template:
+        return " ".join(cmd.exec)
+    return cmd.template
+
+
+def _select_gate(gate: Optional[Gate], approve: bool) -> Gate:
+    if gate is not None and approve:
+        raise ValueError("pass either gate or approve=True, not both")
+    if approve:
+        return approve_gate
+    return gate or default_gate
+
+
 def execute(
     manifest: Manifest,
     args: Dict[str, str],
     *,
+    gate: Optional[Gate] = None,
+    approve: bool = False,
     dry_run: bool = False,
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Validate arguments, build and run the command, and return an evidence envelope.
+    """Validate arguments, consult the policy gate, run, and return an
+    evidence envelope.
 
     Args:
         manifest: The parsed manifest.
         args: Mapping of argument name to raw string value.
-        dry_run: If True, build the command but do not execute it.
+        gate: A policy gate called with the manifest and the validated
+            argument values after validation and before anything runs.
+            ``None`` means :func:`default_gate`.
+        approve: Use the allow-all :func:`approve_gate`. Passing both
+            ``gate`` and ``approve=True`` is a ``ValueError``.
+        dry_run: If True, build the command but do not execute it. A dry
+            run is not gated: it is how an operator decides whether to
+            approve.
         timeout: Override for the manifest's timeout_seconds.
 
     Returns:
         An evidence envelope dict with status, scan_id, tool, command,
         duration_ms, timestamp, output_file, output_hash, and results.
+
+    Raises:
+        PolicyDenied: When the gate denies the call; nothing ran.
     """
+    selected = _select_gate(gate, approve)
+
     # Dispatch to HTTP or MCP execution if applicable.
     if manifest.http is not None:
-        return _execute_http(manifest, args, dry_run=dry_run, timeout=timeout)
+        return _execute_http(manifest, args, gate=selected, dry_run=dry_run, timeout=timeout)
     if manifest.mcp is not None:
-        return _execute_mcp_proxy(manifest, args, dry_run=dry_run)
+        return _execute_mcp_proxy(manifest, args, gate=selected, dry_run=dry_run)
 
     if manifest.session is not None:
         raise RuntimeError(
@@ -1170,22 +1533,28 @@ def execute(
 
     # Handle custom executor escape hatch.
     if manifest.command.executor:
-        return _execute_custom(manifest, args, dry_run=dry_run, timeout=timeout)
+        return _execute_custom(
+            manifest, args, gate=selected, dry_run=dry_run, timeout=timeout
+        )
 
     scan_id = _generate_scan_id()
     tool_name = manifest.tool.name
     effective_timeout = timeout or manifest.tool.timeout_seconds
 
+    def on_validated(values: Dict[str, str]) -> None:
+        if not dry_run:
+            _consult_gate(selected, manifest, values)
+
     # Build argv from the compiled exec form; values are never re-split. The
-    # same scan id backs {_scan_id}/{_output_file} and the envelope.
-    args_list = build_command_argv(manifest, args, scan_id=scan_id)
-    command = shlex.join(args_list)
+    # same scan id backs {_scan_id}/{_output_file} and the envelope. The
+    # gate runs between validation and substitution.
+    args_list = _build_argv(manifest, args, scan_id=scan_id, on_validated=on_validated)
 
     envelope: Dict[str, Any] = {
         "status": "success",
         "scan_id": scan_id,
         "tool": tool_name,
-        "command": command,
+        "command": _declared_command(manifest),
         "duration_ms": 0,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "output_file": "",
@@ -1194,6 +1563,8 @@ def execute(
     }
 
     if dry_run:
+        # The human-facing dry run shows the resolved argv.
+        envelope["command"] = shlex.join(args_list)
         envelope["status"] = "dry_run"
         return envelope
 
@@ -1207,18 +1578,22 @@ def execute(
         work_dir = _prepare_dirs(evidence_dir, out_dir, scan_id)
         if os.path.lexists(output_file):
             raise RuntimeError(f"refusing to run: evidence file '{output_file}' already exists")
-        returncode, stdout, stderr, timed_out = _run_process(
+        proc = _run_process(
             args_list,
             env=child_env(),
             cwd=work_dir,
             timeout=effective_timeout,
             limits=manifest.tool.limits,
+            max_bytes=_max_bytes(manifest),
         )
+        stdout = proc.stdout
         envelope["duration_ms"] = int((time.monotonic() - start) * 1000)
-        envelope["exit_code"] = returncode
-        envelope["stderr"] = stderr
+        envelope["exit_code"] = proc.returncode
+        envelope["stderr"] = proc.stderr
+        if proc.truncated:
+            envelope["output_truncated"] = True
 
-        if timed_out:
+        if proc.timed_out:
             envelope["status"] = "timeout"
             envelope["results"] = {
                 "error": f"Command timed out after {effective_timeout}s",
@@ -1227,8 +1602,8 @@ def execute(
             return envelope
 
         # Evidence: when the tool wrote {_output_file} itself, keep its file;
-        # otherwise record captured stdout. Either way nothing is followed
-        # through a symlink or overwritten.
+        # otherwise record captured (capped) stdout. Either way nothing is
+        # followed through a symlink or overwritten.
         if os.path.islink(output_file):
             raise RuntimeError(f"refusing evidence file '{output_file}': it is a symlink")
         if not os.path.lexists(output_file):
@@ -1239,20 +1614,15 @@ def execute(
                 output_file, manifest.tool.evidence.hash
             )
 
-        if returncode != 0:
+        if proc.returncode != 0:
             envelope["status"] = "error"
             envelope["results"] = {
-                "returncode": returncode,
-                "stderr": stderr,
+                "returncode": proc.returncode,
+                "stderr": proc.stderr,
                 "raw_output": stdout,
             }
         else:
-            try:
-                parsed = _parse_output(manifest, stdout)
-                envelope["results"] = parsed if isinstance(parsed, dict) else {"parsed_output": parsed}
-                _validate_output_schema(manifest, parsed)
-            except RuntimeError:
-                envelope["results"] = {"raw_output": stdout}
+            _apply_output(manifest, envelope, stdout)
     except Exception as exc:
         envelope["duration_ms"] = int((time.monotonic() - start) * 1000)
         envelope["status"] = "error"
@@ -1292,6 +1662,7 @@ def _execute_custom(
     manifest: Manifest,
     args: Dict[str, str],
     *,
+    gate: Optional[Gate] = None,
     dry_run: bool = False,
     timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1303,6 +1674,8 @@ def _execute_custom(
     secrets are never passed.
     """
     validated_args, _absent = _validate_call_args(manifest, args, False)
+    if not dry_run:
+        _consult_gate(gate or default_gate, manifest, validated_args)
 
     scan_id = _generate_scan_id()
     effective_timeout = timeout or manifest.tool.timeout_seconds
@@ -1335,18 +1708,22 @@ def _execute_custom(
     work_dir = ""
     try:
         work_dir = _prepare_dirs(evidence_dir, out_dir, scan_id)
-        returncode, stdout, stderr, timed_out = _run_process(
+        proc = _run_process(
             [manifest.command.executor],
             env=child_env(extra),
             cwd=work_dir,
             timeout=effective_timeout,
             limits=manifest.tool.limits,
+            max_bytes=_max_bytes(manifest),
         )
+        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         envelope["duration_ms"] = int((time.monotonic() - start) * 1000)
         envelope["exit_code"] = returncode
         envelope["stderr"] = stderr
+        if proc.truncated:
+            envelope["output_truncated"] = True
 
-        if timed_out:
+        if proc.timed_out:
             envelope["status"] = "timeout"
             envelope["results"] = {
                 "error": f"Custom executor timed out after {effective_timeout}s",
@@ -1356,11 +1733,7 @@ def _execute_custom(
             envelope["status"] = "error"
             envelope["results"] = {"returncode": returncode, "stderr": stderr, "raw_output": stdout}
         else:
-            try:
-                parsed = _parse_output(manifest, stdout)
-                envelope["results"] = parsed if isinstance(parsed, dict) else {"parsed_output": parsed}
-            except RuntimeError:
-                envelope["results"] = {"raw_output": stdout}
+            _apply_output(manifest, envelope, stdout)
     except Exception as exc:
         envelope["duration_ms"] = int((time.monotonic() - start) * 1000)
         envelope["status"] = "error"

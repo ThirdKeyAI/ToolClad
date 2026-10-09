@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import ipaddress
 import textwrap
-import urllib.request
 
 import pytest
 
@@ -687,15 +686,17 @@ class TestSecretOrdering:
         class _Resp:
             status = 200
 
-            def read(self):
+            def read(self, n=-1):
                 return b"{}"
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             # Records the built request; no socket is ever opened.
             captured["req"] = req
             return _Resp()
 
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        import toolclad.executor as executor_mod
+
+        monkeypatch.setattr(executor_mod, "_open_url", fake_open)
         m = _http_manifest(
             url="http://127.0.0.1:9/{target}",
             headers={"X-Echo": "{target}", "Authorization": "Bearer {_secret:api_key}"},

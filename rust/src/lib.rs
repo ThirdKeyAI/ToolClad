@@ -97,6 +97,13 @@
 //! println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
 //! ```
 //!
+//! `execute` consults [`default_gate`] after validation and before anything
+//! runs: a manifest with `human_approval = true` or `risk_tier` `high` /
+//! `critical` fails with `policy gate denied: ...`. Pass your own gate to
+//! [`executor::execute_with_gate`] (for example one that asks a human or a
+//! Cedar evaluator), or call [`executor::execute_approved`] once approval
+//! exists.
+//!
 //! ## Manifest Format
 //!
 //! See the [ToolClad Design Spec](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md)
@@ -104,10 +111,12 @@
 
 pub mod executor;
 pub mod hostpolicy;
+pub mod schema;
 pub mod scope;
 pub mod types;
 pub mod validator;
 
+pub use executor::{default_gate, GateDecision};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use types::{CustomTypeDef, Manifest, ToolCladError, MODES};
@@ -699,6 +708,79 @@ fn egress_lint(
     Ok(())
 }
 
+/// The output parsers the reference runtimes implement.
+pub const BUILTIN_PARSERS: &[&str] = &[
+    "builtin:json",
+    "builtin:jsonl",
+    "builtin:csv",
+    "builtin:xml",
+    "builtin:text",
+];
+
+/// Largest accepted `[output] max_bytes` (1 GiB).
+pub const MAX_OUTPUT_BYTES: u64 = 1_073_741_824;
+
+/// `[output]`: a custom parser is refused (it would otherwise be silently
+/// ignored), and `max_bytes` must be 1..=1 GiB. A non-integer `max_bytes`
+/// already fails to deserialize.
+fn check_output(manifest: &Manifest) -> Result<(), ToolCladError> {
+    let Some(ref output) = manifest.output else {
+        return Ok(());
+    };
+    if let Some(ref p) = output.parser {
+        if !BUILTIN_PARSERS.contains(&p.as_str()) {
+            return Err(ToolCladError::ManifestError(format!(
+                "custom output parsers are not supported by the reference runtimes (parser = \"{p}\")"
+            )));
+        }
+    }
+    if output.max_bytes == 0 || output.max_bytes > MAX_OUTPUT_BYTES {
+        return Err(ToolCladError::ManifestError(format!(
+            "output.max_bytes must be an integer from 1 to {MAX_OUTPUT_BYTES} (got {})",
+            output.max_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// `[http]`: the scheme and host of `http.url` must be literal (the host is
+/// the SSRF boundary and stays manifest-controlled), header names must be
+/// tokens, and the literal host passes the IP policy — link-local is always
+/// refused, and when any argument sets `block_internal` the remaining
+/// non-public ranges and internal names are refused too.
+fn check_http(manifest: &Manifest) -> Result<(), ToolCladError> {
+    let Some(ref http) = manifest.http else {
+        return Ok(());
+    };
+    let host = executor::http_url_literal_host(&http.url)?;
+    for name in http.headers.keys() {
+        executor::check_header_name(name)?;
+    }
+    let block_internal = all_arg_defs(manifest).iter().any(|(_, d)| d.block_internal);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    let as_manifest_err = |e: ToolCladError| match e {
+        ToolCladError::ValidationError(m) => ToolCladError::ManifestError(m),
+        other => other,
+    };
+    if let Some(ip) = hostpolicy::parse_canonical_ip(bare) {
+        hostpolicy::enforce_ip_policy("http.url", &ip, block_internal).map_err(as_manifest_err)?;
+    } else if block_internal {
+        if hostpolicy::is_internal_name(bare) {
+            return Err(ToolCladError::ManifestError(format!(
+                "http.url host '{bare}' is an internal name (blocked by block_internal policy)"
+            )));
+        }
+        if let Some(ip) = hostpolicy::embedded_ip_literal(bare) {
+            hostpolicy::enforce_ip_policy("http.url", &std::net::IpAddr::V4(ip), true)
+                .map_err(as_manifest_err)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate internal consistency of a parsed manifest with no custom types in
 /// scope: every argument type must be built in.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
@@ -748,6 +830,9 @@ pub fn validate_manifest_with_custom_types(
     if !is_callback {
         check_argv0(manifest)?;
     }
+
+    check_output(manifest)?;
+    check_http(manifest)?;
 
     // exec dispatch requires a backend and an [output] block.
     if !is_callback {
@@ -3134,6 +3219,7 @@ format = "text"
                 "binary-basename-mismatch",
                 "minimal-valid-exec",
                 "minimal-valid-template",
+                "custom-output-parser",
             ]
             .contains(&id)
             {
@@ -3143,6 +3229,109 @@ format = "text"
             let ok = parse_manifest(v["manifest"].as_str().unwrap()).is_ok();
             assert_eq!(ok, v["expect"] == "accept", "vector {id}");
         }
-        assert_eq!(seen, 5);
+        assert_eq!(seen, 6);
+    }
+
+    // ---- W9 / W10 load-time checks ---------------------------------------
+
+    fn output_manifest(output_extra: &str) -> String {
+        format!(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\n\
+             [command]\nexec = [\"echo\", \"hi\"]\n\n[output]\nformat = \"json\"\n{output_extra}\n"
+        )
+    }
+
+    #[test]
+    fn max_bytes_bounds_checked_at_load() {
+        for bad in [
+            "max_bytes = 0",
+            "max_bytes = 1.5",
+            "max_bytes = -1",
+            "max_bytes = \"10\"",
+            "max_bytes = 1073741825",
+        ] {
+            assert!(
+                parse_manifest(&output_manifest(bad)).is_err(),
+                "{bad} should be refused"
+            );
+        }
+        let err = parse_manifest(&output_manifest("max_bytes = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_bytes"), "{err}");
+        for good in ["max_bytes = 1", "max_bytes = 1073741824"] {
+            parse_manifest(&output_manifest(good)).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_parser_refused_builtins_accepted() {
+        let err = parse_manifest(&output_manifest("parser = \"scripts/x.py\""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "custom output parsers are not supported by the reference runtimes (parser = \"scripts/x.py\")"
+            ),
+            "{err}"
+        );
+        for p in BUILTIN_PARSERS {
+            parse_manifest(&output_manifest(&format!("parser = \"{p}\""))).unwrap();
+        }
+    }
+
+    fn http_load(url: &str, extra: &str) -> Result<Manifest, ToolCladError> {
+        parse_manifest(&format!(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"http\"\ndescription = \"x\"\n\n\
+             {extra}\n\n[http]\nmethod = \"GET\"\nurl = \"{url}\"\n\n[output]\nformat = \"text\"\n"
+        ))
+    }
+
+    #[test]
+    fn http_url_scheme_and_host_must_be_literal() {
+        let arg =
+            "[args.host]\nposition = 1\nrequired = true\ntype = \"string\"\ndescription = \"h\"";
+        for url in [
+            "https://{host}/x",
+            "{host}://example.com/",
+            "https://{host}.example.com/",
+        ] {
+            let err = http_load(url, arg).unwrap_err().to_string();
+            assert!(
+                err.contains("http.url may not interpolate into the scheme or host"),
+                "{url}: {err}"
+            );
+        }
+        http_load("https://api.example.com/{host}?q={host}", arg).unwrap();
+        // A literal loopback URL with no url-typed argument passes the lint.
+        http_load("http://127.0.0.1:8080/x", "").unwrap();
+    }
+
+    #[test]
+    fn http_literal_host_policy_at_load() {
+        // Link-local (metadata) is always refused.
+        let err = http_load("http://169.254.169.254/latest", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http.url"), "{err}");
+        // Loopback is refused once any argument opts into block_internal.
+        let arg =
+            "[args.u]\nposition = 1\nrequired = true\ntype = \"url\"\nblock_internal = true\n\
+                   description = \"u\"";
+        assert!(http_load("http://127.0.0.1/{u}", arg).is_err());
+        assert!(http_load("http://localhost/{u}", arg).is_err());
+        http_load("https://api.example.com/{u}", arg).unwrap();
+    }
+
+    #[test]
+    fn http_header_name_must_be_a_token() {
+        let err = parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"http\"\ndescription = \"x\"\n\n\
+             [http]\nmethod = \"GET\"\nurl = \"https://api.example.com/\"\n\
+             [http.headers]\n\"Bad Name\" = \"v\"\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a valid token"), "{err}");
     }
 }

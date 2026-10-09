@@ -31,6 +31,10 @@ enum Commands {
         /// Arguments as key=value pairs
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         args: Vec<String>,
+        /// Approve the call: skip the default policy gate, which denies
+        /// manifests with human_approval = true or risk_tier high/critical
+        #[arg(long)]
+        approve: bool,
     },
     /// Output MCP JSON schema for a manifest
     Schema {
@@ -66,7 +70,11 @@ fn main() {
             manifest,
             allow_unknown_keys,
         } => cmd_validate(&manifest, allow_unknown_keys),
-        Commands::Run { manifest, args } => cmd_run(&manifest, &args),
+        Commands::Run {
+            manifest,
+            args,
+            approve,
+        } => cmd_run(&manifest, &args, approve),
         Commands::Schema { manifest } => cmd_schema(&manifest),
         Commands::Test { manifest, args } => cmd_test(&manifest, &args),
     };
@@ -108,10 +116,18 @@ fn cmd_validate(path: &str, allow_unknown_keys: bool) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn cmd_run(path: &str, arg_pairs: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_run(
+    path: &str,
+    arg_pairs: &[String],
+    approve: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = toolclad::load_manifest(path)?;
     let args = parse_arg_pairs(arg_pairs)?;
-    let envelope = toolclad::executor::execute(&manifest, &args)?;
+    let envelope = if approve {
+        toolclad::executor::execute_approved(&manifest, &args)?
+    } else {
+        toolclad::executor::execute(&manifest, &args)?
+    };
     let json = serde_json::to_string_pretty(&envelope)?;
     println!("{json}");
     Ok(())
@@ -140,7 +156,50 @@ fn cmd_test(path: &str, arg_pairs: &[String]) -> Result<(), Box<dyn std::error::
         println!("  Cedar:     {cedar}");
     }
     println!("  Timeout:   {}s", result.timeout);
+    println!("  Risk tier: {}", manifest.tool.risk_tier);
+    let approval = match toolclad::default_gate(&manifest, &HashMap::new()) {
+        toolclad::GateDecision::Allow => "not required".to_string(),
+        toolclad::GateDecision::Deny(reason) => format!("required ({reason}; use run --approve)"),
+    };
+    println!("  Approval:  {approval}");
     println!();
     println!("  [dry run -- command not executed]");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_manifest(tool_extra: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("toolclad-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("gate-{}.clad.toml", tool_extra.len()));
+        std::fs::write(
+            &path,
+            format!(
+                "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\
+                 {tool_extra}\n\n[command]\nexec = [\"echo\", \"hi\"]\n\n[output]\nformat = \"text\"\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn run_without_approve_is_denied_by_the_gate() {
+        let path = write_manifest("human_approval = true");
+        let err = cmd_run(path.to_str().unwrap(), &[], false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "policy gate denied: manifest requires human approval (human_approval = true)"
+        );
+        // An echo-based manifest runs once approved.
+        cmd_run(path.to_str().unwrap(), &[], true).unwrap();
+        // The dry run is not gated.
+        cmd_test(path.to_str().unwrap(), &[]).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
 }

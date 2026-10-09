@@ -2,7 +2,7 @@
 
 import { Command } from "commander";
 import { loadManifest, loadManifestWithOptions } from "./manifest.js";
-import { buildCommand, execute, generateMcpSchema } from "./executor.js";
+import { defaultGate, execute, generateMcpSchema } from "./executor.js";
 
 const program = new Command();
 
@@ -34,11 +34,15 @@ program
   .command("run <manifest>")
   .description("Execute a tool using its manifest")
   .option("--arg <args...>", "Arguments as key=value pairs")
+  .option(
+    "--approve",
+    "Approve this call: use the allow-all policy gate instead of the default gate"
+  )
   .action(async (manifestPath, opts) => {
     try {
       const manifest = loadManifest(manifestPath);
       const args = parseArgs(opts.arg);
-      const result = await execute(manifest, args);
+      const result = await execute(manifest, args, { approve: opts.approve === true });
       console.log(JSON.stringify(result, null, 2));
     } catch (err) {
       console.error(`Error: ${err.message}`);
@@ -83,6 +87,11 @@ program
         );
       }
       console.log(`  Timeout:   ${manifest.tool.timeout_seconds || 60}s`);
+      const gate = defaultGate(manifest, result.resolvedArgs || {});
+      console.log(`  Risk tier: ${manifest.tool.risk_tier || "(none)"}`);
+      console.log(
+        `  Approval:  ${gate.allowed ? "not required" : `required (${gate.reason}); pass --approve to run`}`
+      );
       console.log();
       console.log("  [dry run -- command not executed]");
       console.log();

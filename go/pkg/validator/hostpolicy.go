@@ -362,3 +362,36 @@ func hasPunycodeLabel(host string) bool {
 	}
 	return false
 }
+
+// CheckLiteralHost applies the host policy to the manifest-controlled host
+// of an [http] url (hostport may carry a :port). A literal address, or one
+// embedded in a wildcard-DNS name, goes through the range table: link-local
+// / metadata always, the non-public ranges when blockInternal. The
+// metadata hostname is always refused; the rest of the internal-name
+// denylist applies under blockInternal, so a manifest that targets a local
+// API without the opt-in keeps working. The name is not resolved here: this
+// runs at load, and the host is the author's, not the caller's.
+func CheckLiteralHost(hostport string, blockInternal bool) error {
+	const name = "http.url"
+	host, _, err := splitURLHostPort(hostport)
+	if err != nil {
+		return newErr(name, err.Error())
+	}
+	if addr, ok := parseCanonicalIP(host); ok {
+		return enforceIPPolicy(name, addr, blockInternal)
+	}
+	if addr, ok := embeddedIPLiteral(host); ok {
+		if err := enforceIPPolicy(name, addr, blockInternal); err != nil {
+			return err
+		}
+	}
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "metadata.google.internal") {
+		return newErr(name, "target is the cloud metadata name — always blocked")
+	}
+	if blockInternal {
+		if err := enforceInternalName(name, host); err != nil {
+			return err
+		}
+	}
+	return nil
+}

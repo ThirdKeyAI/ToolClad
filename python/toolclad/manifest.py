@@ -999,6 +999,46 @@ def _validate_manifest(manifest: Manifest) -> None:
     _lint_egress(manifest)
     _check_scope_check_types(manifest)
     _check_arg_defaults(manifest)
+    _check_output(manifest)
+    if manifest.http is not None:
+        from toolclad.executor import check_http_url
+
+        check_http_url(manifest)
+
+
+BUILTIN_PARSERS = (
+    "builtin:json", "builtin:jsonl", "builtin:csv", "builtin:xml", "builtin:text",
+)
+
+MAX_OUTPUT_BYTES_LIMIT = 1 << 30
+
+
+def _check_output(manifest: Manifest) -> None:
+    """``[output]``: ``max_bytes`` is an integer in 1..=1 GiB, and the parser
+    is one of the builtins (an explicit ``parser``, else the one implied by
+    ``format``). Custom parsers are refused rather than silently ignored."""
+    output = manifest.output
+    if output is None:
+        return
+    mb = output.max_bytes
+    if isinstance(mb, bool) or not isinstance(mb, int) or not 1 <= mb <= MAX_OUTPUT_BYTES_LIMIT:
+        raise ValueError(
+            f"[output] max_bytes must be an integer between 1 and {MAX_OUTPUT_BYTES_LIMIT}, "
+            f"got {mb!r}"
+        )
+    parser = output.parser or f"builtin:{output.format}"
+    if parser not in BUILTIN_PARSERS:
+        if output.parser:
+            raise ValueError(
+                "custom output parsers are not supported by the reference runtimes "
+                f'(parser = "{output.parser}")'
+            )
+        raise ValueError(
+            f"[output] format '{output.format}' has no builtin parser "
+            f"(expected one of: json, jsonl, csv, xml, text)"
+        )
+    if not isinstance(output.schema, dict):
+        raise ValueError("[output.schema] must be a table")
 
 
 def _check_scope_check_types(manifest: Manifest) -> None:
