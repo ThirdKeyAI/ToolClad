@@ -43,7 +43,7 @@ println!("{}", serde_json::to_string_pretty(&schema)?);
 
 #### `validator::validate_arg(name, def, value) -> Result<()>`
 
-Validate a single argument value against its type definition. Returns `Ok(())` if valid, or an error describing the validation failure.
+Validate a single argument value against its type definition. Returns `Ok(())` if valid, or an error describing the validation failure. This entry point validates in **template mode**: whitespace is always rejected, regardless of `allow_whitespace`.
 
 ```rust
 use toolclad::types::ArgDef;
@@ -60,6 +60,10 @@ assert!(toolclad::validator::validate_arg("scan_type", &def, "ping").is_ok());
 assert!(toolclad::validator::validate_arg("scan_type", &def, "exploit").is_err());
 ```
 
+#### `validator::validate_arg_mode(name, def, value, mode) -> Result<()>`
+
+Same as `validate_arg`, with an explicit validation mode. The mode is either *template* (strict; whitespace always rejected) or *exec* (honors `allow_whitespace = true`). The executor passes exec mode only when the manifest declared `command.exec` directly; a `template` compiled to `exec` at load is still template mode. All other hygiene rules (NUL, control characters, quotes/backslash, leading dash) and the host/IP policy apply in both modes.
+
 #### `validator::validate_arg_with_custom_types(name, def, value, custom_types) -> Result<()>`
 
 Validate a single argument value against its type definition, resolving custom types from a loaded `toolclad.toml`. If the type is not a built-in type, it is looked up in `custom_types` and validated against the base type with any additional constraints.
@@ -71,7 +75,7 @@ toolclad::validator::validate_arg_with_custom_types("service", &def, "ssh", &cus
 
 #### `load_custom_types(path) -> Result<HashMap<String, CustomTypeDef>>`
 
-Load custom type definitions from a `toolclad.toml` file. Returns a map of type name to definition (base type + constraints).
+Load custom type definitions from a `toolclad.toml` file. Returns a map of type name to definition (base type + constraints). The CLI discovers `toolclad.toml` by walking up from the manifest's directory; library callers that want the same behavior should do the same walk before calling `validate_arg_with_custom_types`.
 
 ```rust
 let custom_types = toolclad::load_custom_types("toolclad.toml")?;
@@ -96,7 +100,7 @@ let cmd = toolclad::executor::build_command(&manifest, &args)?;
 
 #### `executor::execute(manifest, args) -> Result<EvidenceEnvelope>`
 
-Validate arguments, construct the command, execute with timeout, parse output, and return the evidence envelope.
+Validate arguments, run the **default policy gate**, construct the command, execute with timeout, parse output, and return the evidence envelope. The default gate denies when `tool.human_approval` is `true` or `tool.risk_tier` is `high` or `critical`; the error message starts with `policy gate denied: `.
 
 ```rust
 use std::collections::HashMap;
@@ -144,6 +148,31 @@ Notes:
 - **`Arc` the manifest.** Cloning a full `Manifest` into each blocking task is wasteful; wrap it in `Arc` at load time and `Arc::clone` per invocation.
 - **Three nested `Result`s.** The outer one is the `tokio::time::timeout` verdict (`Err` = timed out). The middle is the `JoinHandle` (`Err` = task panicked). The inner is the ToolClad result. Handle all three.
 
+#### `executor::execute_with_gate(manifest, args, gate) -> Result<EvidenceEnvelope>`
+
+Like `execute`, but with a caller-supplied gate:
+
+```
+GateDecision = Allow | Deny(reason)
+Gate         = fn(&Manifest, &validated_args) -> GateDecision
+```
+
+The gate runs after argument validation and before anything is spawned. Use it to wire an approval workflow or an external policy engine (Cedar evaluation is not performed by the library). `default_gate` is the gate `execute` uses.
+
+```rust
+let result = toolclad::executor::execute_with_gate(&manifest, &args, |m, _validated| {
+    if m.tool.human_approval && !operator_has_approved(&m.tool.name) {
+        toolclad::executor::GateDecision::Deny("awaiting operator approval".into())
+    } else {
+        toolclad::executor::GateDecision::Allow
+    }
+})?;
+```
+
+#### `executor::execute_approved(manifest, args) -> Result<EvidenceEnvelope>`
+
+Like `execute`, with an allow-all gate. This is what `toolclad run --approve` calls. Use it only after the approval has been obtained elsewhere.
+
 #### `executor::dry_run(manifest, args) -> Result<DryRunResult>`
 
 Validate arguments and construct the command without executing. Returns the command that would be run plus validation details.
@@ -186,8 +215,13 @@ Tool metadata from the `[tool]` section.
 | `binary` | `Option<String>` | Executable path (oneshot/session) |
 | `mode` | `Option<String>` | `"oneshot"` (default), `"session"`, or `"browser"` |
 | `description` | `String` | Human-readable description |
-| `timeout_seconds` | `u64` | Execution timeout |
-| `risk_tier` | `String` | `"low"`, `"medium"`, `"high"`, or `"critical"` |
+| `timeout_seconds` | `u64` | Execution timeout; must be greater than zero |
+| `risk_tier` | `String` | `"low"`, `"medium"`, `"high"`, or `"critical"`; `high`/`critical` are denied by the default gate |
+| `human_approval` | `bool` | Denied by the default gate when `true` |
+| `network_egress` | `bool` | Forces `block_internal = true` on every network-target arg at load |
+| `allow_interpreter` | `bool` | Permits an interpreter as `argv[0]` |
+| `dispatch` | `String` | `"exec"` (default) or `"callback"` |
+| `limits` | `Option<Limits>` | `[tool.limits]` rlimits (applied in Rust and Python only) |
 
 #### `ArgDef`
 
@@ -204,6 +238,12 @@ Parameter definition from `[args.*]`.
 | `min` | `Option<i64>` | Minimum value (for `integer` type) |
 | `max` | `Option<i64>` | Maximum value (for `integer` type) |
 | `clamp` | `bool` | Clamp out-of-range values instead of rejecting |
+| `min_float` / `max_float` | `Option<f64>` | Bounds for the `number` type |
+| `schemes` | `Option<Vec<String>>` | Allowed URL schemes (default `http`, `https`) |
+| `scope_check` | `bool` | Check against `scope/scope.toml` (fail-closed) |
+| `block_internal` | `bool` | Apply the private-range policy and DNS resolution |
+| `allow_whitespace` | `bool` | Permit whitespace (exec mode only) |
+| `allow_leading_dash` | `bool` | Permit a leading `-`/`+` |
 | `description` | `String` | Human-readable description |
 
 #### `EvidenceEnvelope`
@@ -212,7 +252,7 @@ Execution result with metadata.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | `String` | `"success"` or `"error"` |
+| `status` | `String` | `"success"`, `"error"`, `"timeout"`, `"schema_error"`, `"client_error"`, `"server_error"`, `"redirect_blocked"`, or `"delegation_preview"` |
 | `scan_id` | `String` | Unique invocation identifier |
 | `tool` | `String` | Tool name |
 | `command` | `String` | Constructed command string |
@@ -221,7 +261,7 @@ Execution result with metadata.
 | `exit_code` | `i32` | Process exit code |
 | `stderr` | `String` | Standard error output |
 | `output_hash` | `String` | SHA-256 hash of raw output |
-| `results` | `Value` | Parsed and validated output |
+| `results` | `Value` | Parsed and validated output; on `schema_error`, `{"schema_error": ..., "raw_output": ...}` |
 
 ---
 
@@ -261,6 +301,12 @@ validate_arg(arg_def, "ping")      # OK
 validate_arg(arg_def, "exploit")   # raises ValueError
 ```
 
+`validate_arg` validates in template mode (whitespace always rejected).
+
+#### `validate_arg_mode(arg_def, value, mode) -> None`
+
+Same as `validate_arg` with an explicit mode: template (strict) or exec (honors `allow_whitespace = True`). The executor uses exec mode only for manifests that declare `command.exec` directly.
+
 #### `build_command(manifest, args) -> list[str]`
 
 Construct the command argument array without executing.
@@ -273,9 +319,13 @@ cmd = build_command(manifest, {"target": "10.0.1.0/24", "scan_type": "service"})
 print(cmd)  # ["nmap", "-sT", "-sV", ...]
 ```
 
-#### `execute(manifest, args) -> dict`
+#### `execute(manifest, args, *, gate=None, approve=False) -> dict`
 
-Validate, construct, execute, parse, and return the evidence envelope.
+Validate, run the policy gate, construct, execute, parse, and return the evidence envelope.
+
+- With no keyword arguments the **default gate** is used: it denies when `human_approval` is true or `risk_tier` is `high`/`critical`, raising an error whose message starts with `policy gate denied: `.
+- `gate=` supplies a callable `(manifest, validated_args) -> GateDecision` (`Allow` or `Deny(reason)`) that replaces the default gate. Cedar evaluation is not performed by the library; wire it in here.
+- `approve=True` uses an allow-all gate (what `toolclad run --approve` does).
 
 ```python
 from toolclad import load_manifest, execute
@@ -283,6 +333,9 @@ from toolclad import load_manifest, execute
 manifest = load_manifest("tools/whois_lookup.clad.toml")
 result = execute(manifest, {"target": "example.com"})
 print(f"Status: {result['status']}, Duration: {result['duration_ms']}ms")
+
+# Explicitly approved high-risk tool
+result = execute(nikto_manifest, {"target": "example.com"}, approve=True)
 ```
 
 ### Dataclass Types
@@ -334,6 +387,22 @@ validateArg(argDef, "ping");     // OK
 validateArg(argDef, "exploit");  // throws Error
 ```
 
+`validateArg` validates in template mode (whitespace always rejected). Because synchronous DNS is not available in Node, `validateArg` **rejects a hostname** on an argument with `block_internal: true` (`hostname cannot be verified without DNS resolution; pass an IP literal or use validateArgAsync`); IP literals are checked synchronously.
+
+#### `validateArgMode(argDef, value, mode) -> void`
+
+Same as `validateArg` with an explicit mode: template (strict) or exec (honors `allow_whitespace: true`).
+
+#### `validateArgAsync(argDef, value) -> Promise<void>`
+
+Asynchronous variant that resolves hostnames with `dns.promises.lookup({ all: true })` and applies the host/IP policy to every answer when `block_internal` is set. Use it wherever a hostname must be accepted under `block_internal`.
+
+```javascript
+import { validateArgAsync } from "toolclad";
+
+await validateArgAsync({ type_name: "scope_target", block_internal: true }, "example.com");
+```
+
 #### `buildCommand(manifest, args) -> string[]`
 
 Construct the command argument array without executing.
@@ -346,9 +415,13 @@ const cmd = buildCommand(manifest, { target: "10.0.1.0/24", scan_type: "service"
 // ["nmap", "-sT", "-sV", ...]
 ```
 
-#### `execute(manifest, args) -> object`
+#### `execute(manifest, args, { gate, approve }) -> Promise<object>`
 
-Validate, construct, execute, parse, and return the evidence envelope.
+Validate, run the policy gate, construct, execute, parse, and return the evidence envelope. **`execute` is asynchronous** -- it spawns the child with `spawn` and a timer so the `SIGTERM`-then-`SIGKILL` sequence can run -- and must be awaited.
+
+- With no options the **default gate** is used: it denies when `human_approval` is true or `risk_tier` is `high`/`critical`, rejecting with an error whose message starts with `policy gate denied: `.
+- `gate` is a function `(manifest, validatedArgs) => GateDecision` (`Allow` or `Deny(reason)`) replacing the default gate. Cedar evaluation is not performed by the library.
+- `approve: true` uses an allow-all gate.
 
 ```javascript
 import { loadManifest, execute } from "toolclad";
@@ -356,7 +429,14 @@ import { loadManifest, execute } from "toolclad";
 const manifest = loadManifest("tools/whois_lookup.clad.toml");
 const result = await execute(manifest, { target: "example.com" });
 console.log(`Status: ${result.status}, Duration: ${result.duration_ms}ms`);
+
+// Explicitly approved high-risk tool
+const scan = await execute(nikto, { target: "example.com" }, { approve: true });
 ```
+
+#### `executeSync` (deprecated)
+
+`executeSync` is kept as a deprecated alias that **throws** a clear error telling the caller to `await execute(...)`. It no longer runs anything; update call sites rather than catching the error.
 
 #### `generateMcpSchema(manifest) -> object`
 
@@ -372,7 +452,7 @@ console.log(JSON.stringify(schema, null, 2));
 
 #### `executeHttp(manifest, args) -> object`
 
-Execute an HTTP backend tool. Constructs the request from `[http]`, sends it, and returns the evidence envelope.
+Execute an HTTP backend tool. Constructs the request from `[http]` (secrets expanded before arguments, URL values percent-encoded, body values JSON-escaped), sends it without following redirects, and returns the evidence envelope. Uses the built-in `fetch` with `redirect: "manual"`; nothing is passed through a child process, so headers and the URL never appear on any argv. `executeHttpSync` remains as a deprecated alias that returns the same Promise.
 
 ```javascript
 import { loadManifest, executeHttp } from "toolclad";
@@ -383,7 +463,7 @@ const result = await executeHttp(manifest, { channel: "C01234", message: "hello"
 
 #### `executeMcp(manifest, args) -> object`
 
-Execute an MCP proxy tool. Validates arguments, maps fields, forwards to the upstream MCP server, and returns the evidence envelope.
+Preview an MCP proxy call. Validates arguments, maps fields through `field_map`, and returns a `delegation_preview` envelope. **No upstream MCP server is contacted**; forwarding the call is the job of a hosting runtime.
 
 ```javascript
 import { loadManifest, executeMcp } from "toolclad";
@@ -425,7 +505,7 @@ func main() {
 
 #### `validator.ValidateArg(def ArgDef, value string) -> error`
 
-Validate a value against an argument definition.
+Validate a value against an argument definition, in template mode (whitespace always rejected).
 
 ```go
 import "github.com/ThirdKeyAI/ToolClad/go/pkg/validator"
@@ -435,6 +515,10 @@ if err != nil {
     fmt.Printf("Validation failed: %s\n", err)
 }
 ```
+
+#### `validator.ValidateArgMode(def ArgDef, value string, mode) -> error`
+
+Same as `ValidateArg` with an explicit mode: template (strict) or exec (honors `AllowWhitespace`). Under `block_internal`, hostnames are resolved with `net.DefaultResolver.LookupIPAddr` and a 2 s context; resolution failure is a rejection.
 
 ### `executor` package
 
@@ -455,7 +539,7 @@ cmd, err := executor.BuildCommand(m, args)
 
 #### `executor.Execute(manifest, args) -> (*EvidenceEnvelope, error)`
 
-Validate, construct, execute, parse, and return the evidence envelope.
+Validate, run the default policy gate, construct, execute, parse, and return the evidence envelope. The signature is unchanged; the default gate denies when `human_approval` is true or `risk_tier` is `high`/`critical`, returning an error whose message starts with `policy gate denied: `.
 
 ```go
 import "github.com/ThirdKeyAI/ToolClad/go/pkg/executor"
@@ -467,3 +551,9 @@ if err != nil {
 }
 fmt.Printf("Status: %s, Duration: %dms\n", result.Status, result.DurationMs)
 ```
+
+#### `executor.ExecuteWithGate(manifest, args, gate) -> (*EvidenceEnvelope, error)`
+
+Like `Execute`, with a caller-supplied gate `func(*Manifest, map[string]string) GateDecision` (`Allow` or `Deny(reason)`). The gate runs after validation and before the spawn. Cedar evaluation is not performed by the library; wire it in here. `toolclad run --approve` uses an allow-all gate.
+
+Go cannot set child rlimits portably, so `[tool.limits]` is parsed but not applied by this runtime; the timeout kill sequence is implemented with `cmd.Cancel` (`SIGTERM` to the process group) and `cmd.WaitDelay` (the `SIGKILL` grace period).

@@ -12,22 +12,28 @@ name = "nmap_scan"              # Required. Unique tool identifier.
 version = "1.0.0"              # Required. Semver, tracks CLI tool version.
 binary = "nmap"                # Binary name or path. Required for oneshot shell.
 description = "Network port scanning and service detection"  # Required.
-mode = "oneshot"               # "oneshot" (default) | "session" | "browser"
-timeout_seconds = 600          # Execution timeout. Default: 60.
-risk_tier = "low"              # "low" | "medium" | "high". Informs Cedar policies.
-human_approval = false         # Require human approval before execution. Default: false.
+mode = "oneshot"               # "oneshot" | "session" | "browser". Advisory; derived when absent.
+timeout_seconds = 600          # Execution timeout. Default: 60. Must be > 0.
+risk_tier = "low"              # "low" | "medium" | "high" | "critical". high/critical are gated.
+human_approval = false         # Gated by the default policy gate when true. Default: false.
+network_egress = true          # Tool reaches the network: network-target args must set block_internal.
+allow_interpreter = false      # Permit sh/bash/python3/node/... as argv[0]. Default: false.
+dispatch = "exec"              # "exec" (default) | "callback" (validator-only embedding)
 ```
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `name` | string | yes | -- | Unique tool identifier, used for MCP registration |
 | `version` | string | yes | -- | Semver version of the underlying CLI tool |
-| `binary` | string | yes (oneshot shell) | -- | Binary name or path to the executable |
+| `binary` | string | yes (oneshot shell) | -- | Binary name or path. When set with an `exec`/`template` command, its basename must equal the basename of `argv[0]` or the manifest is refused |
 | `description` | string | yes | -- | Human-readable description (included in MCP schema) |
-| `mode` | string | no | `"oneshot"` | Execution mode: `"oneshot"`, `"session"`, or `"browser"` |
-| `timeout_seconds` | integer | no | `60` | Maximum execution time before process kill |
-| `risk_tier` | string | no | `"low"` | Risk level for Cedar policy decisions |
-| `human_approval` | boolean | no | `false` | Require human approval before any execution |
+| `mode` | string | no | derived | `"oneshot"`, `"session"`, or `"browser"`. Advisory only; derived from which backend section is present when absent |
+| `timeout_seconds` | integer | no | `60` | Maximum execution time before the `SIGTERM`/`SIGKILL` process-group kill. `0` is refused at load (`timeout_seconds must be greater than zero`) |
+| `risk_tier` | string | no | `"low"` | `"low"`, `"medium"`, `"high"`, or `"critical"`. `high` and `critical` are denied by the default policy gate (`risk_tier '<t>' requires explicit approval`) unless `--approve` or an approving gate is supplied |
+| `human_approval` | boolean | no | `false` | When `true`, the default policy gate denies execution (`manifest requires human approval (human_approval = true)`); `--approve` or an approving gate is required |
+| `network_egress` | boolean | no | `false` | Declares that the tool reaches the network. When `true`, every argument of type `scope_target`, `url`, `ip_address`, `cidr`, or a custom type based on one of those must set `block_internal = true`, or the manifest is refused at load. The same lint applies automatically when `tool.binary`, `exec[0]`, or the template's first token is a known egress binary (`curl`, `wget`, `nmap`, `nc`, `ncat`, `netcat`, `masscan`, `telnet`, `ssh`, `ping`, `fping`, `httpie`, `http`, `wfuzz`, `ffuf`, `hydra`, `nikto`) and to every `[http]` and `[browser]` manifest |
+| `allow_interpreter` | boolean | no | `false` | Permits `argv[0]`'s basename to be `sh`, `bash`, `zsh`, `dash`, `ksh`, `csh`, `tcsh`, `fish`, `ash`, `busybox`, `env`, `eval`, `xargs`, `python`, `python2`, `python3`, `perl`, `ruby`, `node`, `deno`, `bun`, `lua`, `php`, or `awk`. Refused at load otherwise |
+| `dispatch` | string | no | `"exec"` | `"exec"` runs a backend; `"callback"` is a validator-only embedding with no backend or `[output]` required |
 
 ## `[tool.cedar]` -- Cedar Policy Metadata
 
@@ -48,7 +54,20 @@ capture = true                                 # Capture raw output to file. Def
 hash = "sha256"                                # Hash algorithm for output_hash. Default: "sha256".
 ```
 
-When `capture = true`, the executor writes the raw tool output to `output_dir` and includes the SHA-256 hash in the evidence envelope for tamper detection.
+When `capture = true`, the executor writes the raw tool output to `output_dir` and includes the SHA-256 hash in the evidence envelope for tamper detection. `screenshots` is accepted for browser manifests.
+
+## `[tool.limits]` -- Child Resource Limits
+
+```toml
+[tool.limits]
+nproc = 4096                   # RLIMIT_NPROC. Default: unset (not applied).
+nofile = 1024                  # RLIMIT_NOFILE. Default: 1024.
+fsize_bytes = 1073741824       # RLIMIT_FSIZE. Default: 1 GiB.
+address_space_bytes = 2147483648   # RLIMIT_AS. Only applied when declared.
+cpu_seconds = 600              # RLIMIT_CPU. Only applied when declared.
+```
+
+The **Rust and Python** runtimes apply these as rlimits on the child via a pre-exec hook (together with `RLIMIT_CORE = 0` and a 0077 umask). **Go and JavaScript cannot set child rlimits portably and skip this section**; the keys are still parsed and validated there, but deployments on those runtimes must enforce limits externally (cgroups, container limits, or `ulimit` in the hosting process).
 
 ## `[tool.schemapin]` -- SchemaPin Verification
 
@@ -92,7 +111,9 @@ Each parameter is a TOML table under `[args]`:
 [args.target]
 position = 1              # Positional index in the command template
 required = true            # Is this parameter mandatory?
-type = "scope_target"      # One of 14 built-in types or a custom type
+type = "scope_target"      # One of 15 built-in types or a custom type
+block_internal = true      # Refuse loopback/private/metadata targets; resolve hostnames fail-closed
+scope_check = true         # Allowlist against scope/scope.toml (fail-closed when no file is found)
 description = "Target CIDR, IP, or hostname"
 
 [args.scan_type]
@@ -118,11 +139,21 @@ sanitize = ["injection"]   # Explicit injection sanitization
 
 [args.target_url]
 type = "url"
-schemes = ["http", "https"]   # Allowed URL schemes
+schemes = ["http", "https"]   # Allowed URL schemes (default); dangerous schemes are always refused
+block_internal = true          # Required when the tool fetches the URL
 scope_check = true             # Extract host for scope validation
 
+[args.headers]
+type = "string"
+allow_whitespace = true        # Permit spaces; honored only when [command] declares exec = [...]
+default = ""
+
+[args.offset]
+type = "integer"
+allow_leading_dash = true      # Permit a negative value (otherwise a leading - or + is refused)
+
 [args.wordlist]
-type = "path"              # No traversal (../), no absolute paths
+type = "path"              # No `..` component, no absolute paths
 required = false
 ```
 
@@ -134,15 +165,22 @@ required = false
 | `required` | boolean | Mandatory parameter. Default: `false` |
 | `type` | string | Built-in type name or custom type. See [Type System](type-system.md) |
 | `description` | string | Human-readable description (included in MCP schema) |
-| `default` | any | Default value when parameter is not provided |
+| `default` | any scalar | Default value when parameter is not provided |
 | `allowed` | array | Valid values for `enum` type |
-| `pattern` | string | Regex constraint for `string` and `regex_match` types |
+| `pattern` | string | Regex constraint for `string` and `regex_match` types. Anchored: compiled as `^(?:pattern)$` |
 | `sanitize` | array | Sanitization rules: `["injection"]` |
-| `min` | number | Minimum for `integer` type |
-| `max` | number | Maximum for `integer` type |
-| `clamp` | boolean | Clamp to range instead of rejecting. Default: `false` |
-| `schemes` | array | Allowed URL schemes for `url` type |
-| `scope_check` | boolean | Enable scope validation for `url` type |
+| `min` | integer | Minimum for `integer` type |
+| `max` | integer | Maximum for `integer` type |
+| `min_float` | number | Minimum for `number` type |
+| `max_float` | number | Maximum for `number` type |
+| `clamp` | boolean | Clamp to range instead of rejecting (`integer`, `number`). Default: `false` |
+| `schemes` | array | Allowed URL schemes for `url` type. Default: `["http", "https"]`. `javascript`, `data`, `file`, `blob`, `about`, `gopher`, `dict`, `ftp`, `ldap`, `jar`, `netdoc`, `mailto`, `ws`, `wss` are refused even if listed |
+| `scope_check` | boolean | Check the value (host for `url`) against `scope/scope.toml`; applies to `scope_target`, `url`, `ip_address`, `cidr`. Fail-closed. Default: `false` |
+| `block_internal` | boolean | Block loopback, private, CGNAT, documentation, and reserved ranges and resolve hostnames fail-closed; applies to `scope_target`, `url`, `ip_address`, `cidr`. Link-local and internal names are blocked regardless. Mandatory on egress tools. Default: `false` |
+| `allow_whitespace` | boolean | Permit whitespace in a string-derived value. Honored only when `[command]` declares `exec` directly; never for `url`. Default: `false` |
+| `allow_leading_dash` | boolean | Permit a value (or numeric result) that starts with `-` or `+`. Default: `false` |
+
+Any other key under `[args.<name>]` is refused at load.
 
 ### Mappings in Args
 
@@ -152,15 +190,26 @@ When an `enum` arg has a corresponding entry in `[command.mappings]`, the enum v
 
 ```toml
 [command]
-template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} {extra_flags} {target}"
+exec = ["nmap", "{_scan_type_flags}", "--max-rate", "{max_rate}", "-oX", "{_output_file}", "{target}"]
+end_of_options = "--"          # Optional. Only "--" is accepted.
 ```
 
-Use `template` for most tools. Use `executor` when invocation logic exceeds what templates can express.
+`exec` is the canonical form: one argv element per entry, placeholders as whole unquoted tokens, `{{`/`}}` for literal braces, values never re-split. Use `executor` when invocation logic exceeds what `exec` can express.
 
 ```toml
 [command]
-executor = "scripts/tool-wrappers/msf-wrapper.sh"  # Escape hatch (replaces template)
+executor = "scripts/tool-wrappers/msf-wrapper.sh"  # Escape hatch (replaces exec)
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exec` | array | Canonical argv array |
+| `template` | string | **Deprecated.** Tokenized into `exec` at load with a warning; a placeholder inside quotes or unbalanced quotes rejects the manifest. Will be removed in the next minor release |
+| `executor` | string | Escape-hatch script; receives `TOOLCLAD_ARG_*` and friends in an otherwise cleared environment |
+| `end_of_options` | string | Only `"--"`. Inserts a literal `--` before the first user-argument token |
+| `defaults` | table | Open map of default values for placeholders |
+| `mappings` | table | Open map of `[command.mappings.<arg>]` tables |
+| `conditionals` | table | `[command.conditionals.<name>]` entries with `when` and `template` |
 
 See [Command Construction](command-construction.md) for details on mappings, conditionals, defaults, and the escape hatch.
 
@@ -180,7 +229,7 @@ service = "-sT -sV --version-intensity 5"
 syn = "-sS --top-ports 1000"
 ```
 
-Maps enum values to CLI flag strings. The mapped result is available as `{_scan_type_flags}` (or `{_scan_flags}` by convention) in the template.
+Maps enum values to CLI flag strings. The mapped result is available as `{_scan_type_flags}` -- the variable is always `_<arg_name>_flags`; no other alias is recognized. The mapped string is tokenized (it is manifest-controlled) and spliced into the argv where the placeholder appears.
 
 ### `[command.conditionals]`
 
@@ -191,7 +240,7 @@ username_file = { when = "username_file != ''", template = "-L {username_file}" 
 single_user = { when = "username != '' and username_file == ''", template = "-l {username}" }
 ```
 
-Include template fragments only when conditions are met. See [Command Construction](command-construction.md) for the full `when` expression syntax.
+Include template fragments only when conditions are met. Each conditional is exposed as `{_<name>}` (`{_service_port}` above) and its `template` is tokenized at load with the same rules as `[command].template`. See [Command Construction](command-construction.md) for the full `when` expression syntax.
 
 ## `[http]` -- HTTP Request Backend
 
@@ -214,7 +263,7 @@ error_status = [400, 401, 403, 404, 429]
 | `success_status` | array | HTTP status codes that indicate success |
 | `error_status` | array | HTTP status codes that indicate error |
 
-See [HTTP and MCP Backends](http-mcp-backends.md) for details.
+`{_secret:name}` references are expanded on these templates before any argument is interpolated; URL values are percent-encoded, body values are JSON-escaped, redirects are not followed, and the envelope's `command` holds the unexpanded `url`. `[http]` manifests are treated as `network_egress = true`, so every network-target argument must set `block_internal = true`. See [HTTP and MCP Backends](http-mcp-backends.md) for details.
 
 ## `[mcp]` -- MCP Proxy Backend
 
@@ -236,14 +285,25 @@ labels = "label_names"
 
 Unmapped fields pass through with the same name. See [HTTP and MCP Backends](http-mcp-backends.md) for details.
 
+> **Parsed, not executed.** The reference runtimes validate `[mcp]` manifests and return a `delegation_preview` envelope (field-mapped arguments, no upstream call). Forwarding to the MCP server is the job of a hosting runtime.
+
 ## `[output]` -- Output Handling
 
 ```toml
 [output]
 format = "xml"                             # "text" | "json" | "xml" | "csv" | "jsonl"
-parser = "builtin:xml"                     # Built-in or custom parser script path
+parser = "builtin:xml"                     # builtin:* only; anything else is refused at load
 envelope = true                            # Wrap in evidence envelope. Default: true.
+max_bytes = 8388608                        # Cap on stdout and stderr (each). Default: 8 MiB.
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `format` | string | Output format hint |
+| `parser` | string | One of the `builtin:*` names below. A script path is refused at load (`custom output parsers are not supported by the reference runtimes`) |
+| `envelope` | boolean | Wrap results in an evidence envelope. Default: `true` |
+| `schema` | table | Mandatory output schema (see below) |
+| `max_bytes` | integer | Cap on captured stdout and stderr, each. Overflow stops capture and sets `output_truncated: true`. Default: `8388608` |
 
 ### Built-in Parsers
 
@@ -255,14 +315,9 @@ envelope = true                            # Wrap in evidence envelope. Default:
 | `builtin:jsonl` | Array of objects | Nuclei, streaming tools |
 | `builtin:text` | `{ "raw_output": "..." }` | Unstructured text (default) |
 
-### Custom Parsers
+### Custom Parsers (Not Supported)
 
-```toml
-[output]
-parser = "scripts/parse-outputs/parse-nmap-xml.py"
-```
-
-Custom parsers receive the raw output file path as `argv[1]` and emit JSON to stdout. The parser's output is validated against the declared `[output.schema]` before it reaches the agent.
+A `parser` value that is not one of the `builtin:*` names above -- for example `parser = "scripts/parse-outputs/parse-nmap-xml.py"` -- is **refused at load** by the reference runtimes. There is no mechanism for an external script to run in the output pipeline. `builtin:xml` additionally refuses input containing `<!DOCTYPE` or `<!ENTITY`.
 
 ## `[output.schema]` -- Output Schema (Mandatory)
 
@@ -303,9 +358,11 @@ description = "Raw command output text"
 The schema serves two purposes:
 
 1. **MCP `outputSchema` generation** -- the LLM sees what data shape it will receive before proposing a tool call
-2. **Parser output validation** -- the executor validates parsed results against the schema, rejecting malformed output before it reaches the agent
+2. **Parser output validation** -- the executor validates parsed results against the schema with a bundled JSON-Schema subset validator (`type`, `properties`, `required`, `items`, `additionalProperties` as a boolean, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`; unknown keywords are ignored). Validation is fail-closed: a violation sets the envelope status to `schema_error`, replaces `results` with `{"schema_error": "<path>: <message>"}`, and preserves the raw output under `results.raw_output`
 
 ## `[session]` -- CLI Session Mode
+
+> **Parsed, not executed.** The reference runtimes load and validate `[session]` manifests (and serve `validate`/`schema` for them) but refuse `execute` with `session mode is parsed but not yet executable in the reference implementation`. Execution is provided by a hosting runtime.
 
 ```toml
 [session]
@@ -337,6 +394,8 @@ See [Session Mode](session-mode.md) for the full reference.
 
 ## `[browser]` -- Browser Mode
 
+> **Parsed, not executed.** The reference runtimes load and validate `[browser]` manifests but refuse `execute` with `browser mode is parsed but not yet executable in the reference implementation`. They do enforce the egress lint at load: `[browser]` manifests count as `network_egress = true`, so every network-target command argument must set `block_internal = true`.
+
 ```toml
 [browser]
 engine = "cdp-direct"
@@ -358,7 +417,7 @@ allow_external = false
 [browser.commands.navigate]
 description = "Navigate a tab to a URL"
 risk_tier = "medium"
-args.url = { type = "url", schemes = ["https"], scope_check = true }
+args.url = { type = "url", schemes = ["https"], block_internal = true, scope_check = true }
 
 [browser.commands.click]
 description = "Click an element by CSS selector"
@@ -372,14 +431,67 @@ human_approval = true
 args.selector = { type = "string" }
 ```
 
-## `[tool.scope]` -- Scope Targets
+## Scope Enforcement
 
-Any parameter with type `scope_target`, `url` (with `scope_check = true`), `cidr`, or `ip_address` is automatically validated against the project scope definition (`scope/scope.toml`). The scope check runs after Cedar authorization but before command execution.
+There is no `[tool.scope]` section; a manifest containing one is refused as an unknown key. Scope enforcement is declared per argument: any parameter of type `scope_target`, `url`, `ip_address`, or `cidr` that sets `scope_check = true` is validated against the project scope file during argument validation, before the command is built. Without `scope_check = true` no allowlisting happens -- `scope_target` by itself is only a shape check.
+
+```toml
+# scope/scope.toml
+[scope]
+allowed_cidrs   = ["10.0.1.0/24"]
+allowed_domains = ["example.com", "*.example.com"]
+blocked_cidrs   = []
+blocked_domains = []
+```
+
+The file is found via `TOOLCLAD_SCOPE_FILE`, or by searching for `scope/scope.toml` upward from the manifest's directory. Unknown keys in the scope file are refused. If `scope_check = true` and no file is reachable, the value is **rejected** (fail-closed). Blocked rules win over allowed rules; `*.example.com` matches strict subdomains at any depth but not the apex or `evil-example.com`; an IP must be contained in an allowed CIDR and a CIDR value must be fully contained. See [Security Model: Scope Enforcement](security-model.md#scope-enforcement).
+
+## Unknown Keys
+
+Every parser refuses keys it does not know, at load, with `unknown key '<section>.<key>' in manifest`. `toolclad validate --allow-unknown-keys` downgrades this to a printed warning; library loading is always strict. The complete allowlist:
+
+```
+[tool]            name version binary description timeout_seconds risk_tier
+                  human_approval dispatch mode network_egress allow_interpreter
+                  cedar evidence limits
+[tool.cedar]      resource action
+[tool.evidence]   output_dir capture hash screenshots
+[tool.limits]     nproc nofile fsize_bytes address_space_bytes cpu_seconds
+[args.<n>]        position required type description default allowed pattern
+                  sanitize min max min_float max_float clamp schemes
+                  scope_check block_internal allow_leading_dash allow_whitespace
+[command]         template exec executor defaults mappings conditionals
+                  end_of_options
+[command.conditionals.<n>]  when template
+[output]          format parser envelope schema max_bytes
+[http]            method url headers body_template success_status error_status
+[mcp]             server tool field_map
+[session]         startup_command ready_pattern startup_timeout_seconds
+                  idle_timeout_seconds session_timeout_seconds max_interactions
+                  interaction commands child_detection
+[session.interaction]  input_sanitize output_max_bytes output_wait_ms
+[session.commands.<n>] pattern description risk_tier human_approval
+                  extract_target args
+[session.child_detection]  pattern type manifest
+[browser]         engine headless connect extract_mode startup_timeout_seconds
+                  session_timeout_seconds idle_timeout_seconds max_interactions
+                  scope commands state defaults
+[browser.defaults]     extract_mode
+[browser.scope]        allowed_domains blocked_domains allow_external
+[browser.commands.<n>] description risk_tier human_approval args
+[browser.state]        fields
+```
+
+`[args.*].default` accepts any scalar. `[command.defaults]` and `[command.mappings]` are open maps whose keys are user-chosen names. `[output.schema]` is JSON Schema and is not key-checked.
 
 ## Complete Annotated Example
 
 ```toml
 # tools/nmap_scan.clad.toml -- Full manifest with all sections
+#
+# There is deliberately no free-form flag parameter. An argument whose value is
+# interpolated as nmap options is an option-injection channel; every supported
+# invocation is an entry in [command.mappings.scan_type] instead.
 
 [tool]
 name = "nmap_scan"
@@ -388,6 +500,7 @@ binary = "nmap"
 description = "Network port scanning and service detection"
 timeout_seconds = 600
 risk_tier = "low"
+network_egress = true
 
 [tool.cedar]
 resource = "PenTest::ScanTarget"
@@ -404,6 +517,10 @@ hash = "sha256"
 position = 1
 required = true
 type = "scope_target"
+# nmap connects to this target: default-deny internal/SSRF ranges. Under
+# block_internal a hostname must resolve to a public address, and a CIDR must
+# not overlap a blocked range.
+block_internal = true
 description = "Target CIDR, IP, or hostname"
 
 [args.scan_type]
@@ -413,18 +530,22 @@ type = "enum"
 allowed = ["ping", "service", "version", "syn", "os_detect", "aggressive", "vuln_script"]
 description = "Type of scan to perform"
 
-[args.extra_flags]
-position = 3
-required = false
-type = "string"
-sanitize = ["injection"]
-default = ""
-description = "Additional nmap flags"
-
 # --- Command Construction ---
+#
+# Array form: every element is one argv entry, dispatched straight to execve.
+# {_scan_type_flags} is the only multi-token placeholder; its value comes from
+# the mapping table below, which is manifest-controlled, not agent-supplied.
 
 [command]
-template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} --no-stylesheet -v {extra_flags} {target}"
+exec = [
+    "nmap",
+    "{_scan_type_flags}",
+    "--max-rate", "{max_rate}",
+    "-oX", "{_output_file}",
+    "--no-stylesheet",
+    "-v",
+    "{target}",
+]
 
 [command.defaults]
 max_rate = 1000
@@ -444,6 +565,7 @@ vuln_script = "-sV --script=vuln --script-timeout 60s"
 format = "xml"
 parser = "builtin:xml"
 envelope = true
+max_bytes = 8388608
 
 [output.schema]
 type = "object"

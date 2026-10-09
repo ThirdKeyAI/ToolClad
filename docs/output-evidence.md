@@ -34,25 +34,32 @@ envelope = true
 
 When no parser is specified, `builtin:text` is the default.
 
-### Custom Parsers
+### Custom Parsers (Not Supported)
 
-For tools whose output requires domain-specific parsing, declare an external script:
+The reference runtimes accept only the five `builtin:*` names. A `parser` value naming an external script, such as:
+
+```toml
+# REFUSED AT LOAD by the reference runtimes
+[output]
+parser = "scripts/parse-outputs/parse-nmap-xml.py"
+```
+
+is rejected when the manifest is loaded with `custom output parsers are not supported by the reference runtimes`. Earlier releases silently ignored such a value and fell back to the built-in parser; that is no longer the case. There is no code path through which an external script runs in the output pipeline. Tools whose output needs domain-specific post-processing should emit JSON, JSONL, CSV, or XML and let the built-in parser normalize it, with `[output.schema]` describing the result.
+
+### Output Size Cap
+
+`[output] max_bytes` (default `8388608`, 8 MiB) caps captured stdout and stderr **separately**. When either stream exceeds the cap, capture stops, the envelope carries `"output_truncated": true`, and the status is unaffected. The hash and evidence file reflect the captured bytes.
 
 ```toml
 [output]
-format = "xml"
-parser = "scripts/parse-outputs/parse-nmap-xml.py"
+format = "text"
 envelope = true
+max_bytes = 8388608
 ```
 
-Custom parsers:
+### XML Hardening
 
-- Receive the raw output file path as `argv[1]`
-- Must emit valid JSON to stdout
-- Run with the same timeout and process group isolation as the tool itself
-- Their output is validated against `[output.schema]` before reaching the agent
-
-The parser's output replaces what would otherwise be the built-in parser's result in the `results` field of the evidence envelope.
+Before `builtin:xml` parses anything, input containing `<!DOCTYPE` or `<!ENTITY` (case-insensitive) is refused. This closes entity-expansion attacks against the XML parser in every runtime.
 
 ---
 
@@ -63,7 +70,44 @@ Every manifest must declare the expected shape of its parsed results in `[output
 ### Purpose
 
 1. **MCP `outputSchema` generation.** The LLM sees what data shape it will receive *before* proposing a tool call. This enables more effective reasoning about whether and how to use a tool.
-2. **Parser output validation.** The executor validates parsed results against the schema. Malformed parser output is rejected before it reaches the agent, preventing corrupted state in the reasoning loop.
+2. **Parser output validation.** The executor validates parsed results against the schema, fail-closed. Malformed parser output is never handed to the agent as if it were valid.
+
+### Validation Semantics
+
+Each runtime bundles a minimal JSON-Schema subset validator (no external dependency). Supported keywords:
+
+| Keyword | Notes |
+|---------|-------|
+| `type` | `object`, `array`, `string`, `number`, `integer`, `boolean`, `null` |
+| `properties` | nested property schemas |
+| `required` | list of required property names |
+| `items` | schema applied to every array element |
+| `additionalProperties` | boolean only |
+| `enum` | allowed values |
+| `minimum` / `maximum` | numeric bounds |
+| `minLength` / `maxLength` | string length bounds |
+| `pattern` | regex on strings |
+
+Unknown keywords (including `description`) are ignored by the validator and passed through to the MCP `outputSchema`.
+
+Validation is **fail-closed**. When the parsed output violates the schema:
+
+- the envelope `status` becomes `"schema_error"`,
+- `results` is replaced with `{"schema_error": "<path>: <message>"}`, and
+- the raw output is preserved under `results.raw_output` so nothing is lost for forensics.
+
+```json
+{
+  "status": "schema_error",
+  "scan_id": "1711929600-12347",
+  "tool": "nmap_scan",
+  "exit_code": 0,
+  "results": {
+    "schema_error": "hosts[0].ports[1].port: expected integer, got string",
+    "raw_output": "<?xml version=\"1.0\"?><nmaprun>...</nmaprun>"
+  }
+}
+```
 
 ### Declaration
 
@@ -143,10 +187,11 @@ When `envelope = true` (the default), the executor wraps parsed output in a stan
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `"success"`, `"error"`, `"timeout"`, or `"delegated"` (MCP proxy) |
-| `scan_id` | string | Unique invocation identifier (`unix_timestamp-short_uuid`) |
+| `status` | string | `"success"`, `"error"`, `"timeout"`, `"schema_error"`, `"client_error"` / `"server_error"` / `"redirect_blocked"` (HTTP), or `"delegation_preview"` (MCP proxy) |
+| `scan_id` | string | Unique invocation identifier with 128 bits of entropy |
 | `tool` | string | Tool name from the manifest (`[tool].name`) |
-| `command` | string | The constructed command that was executed |
+| `command` | string | The argv that was executed, joined for display. For HTTP tools this is the **unexpanded** `"<METHOD> <url as written in the manifest>"`, so secrets never appear |
+| `output_truncated` | boolean | `true` when stdout or stderr hit `[output] max_bytes` and capture stopped |
 | `duration_ms` | integer | Wall-clock execution time in milliseconds |
 | `timestamp` | string | ISO 8601 execution timestamp (UTC) |
 | `exit_code` | integer | Process exit code (`0` = success, `-1` = timeout/error) |
@@ -166,14 +211,7 @@ HTTP tool envelopes include additional fields:
 
 ### MCP Proxy Envelopes
 
-MCP proxy tools produce delegation envelopes:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `status` | string | Always `"delegated"` |
-| `mcp_server` | string | Upstream MCP server name |
-| `mcp_tool` | string | Upstream MCP tool name |
-| `mcp_args` | object | Arguments mapped through `field_map` |
+The reference runtimes do not contact an MCP server. An `[mcp]` manifest produces a preview envelope with `status: "delegation_preview"` that carries the upstream server name, the upstream tool name, and the arguments after `field_map` translation; `duration_ms` is `0` and there is no output hash. A hosting runtime that performs the upstream call replaces this with a real envelope.
 
 ---
 
@@ -253,4 +291,4 @@ The agent receives structured error information:
 - `stderr` tells the agent *why* it failed, in the tool's own words
 - The agent can reason about the error and adjust its next action
 
-Timeout envelopes set `status = "timeout"` and `exit_code = -1`.
+Timeout envelopes set `status = "timeout"` and `exit_code = -1`; any stdout and stderr captured before the `SIGTERM`/`SIGKILL` sequence are preserved, with `output_truncated` set if the `max_bytes` cap was reached first. Schema violations produce `status = "schema_error"` with the raw output preserved (see [Validation Semantics](#validation-semantics)). A policy-gate denial does not produce an envelope at all: `execute` fails with an error starting `policy gate denied: ` before anything is spawned.

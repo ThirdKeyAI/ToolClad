@@ -5,6 +5,9 @@ description: Interactive CLI sessions with per-interaction governance
 
 # Session Mode
 
+> **Status: parsed and validated, not executable by the reference runtimes.**
+> The Rust, Go, JavaScript and Python runtimes in this repository load `[session]` manifests, check every key against the manifest key allowlist, and serve `toolclad validate` and `toolclad schema` for them. They do **not** run sessions: calling `execute` (or `toolclad run`) on a session manifest is refused with `session mode is parsed but not yet executable in the reference implementation`. Everything below describes the contract a hosting runtime such as Symbiont implements on top of the parsed manifest; none of the PTY, prompt-detection, or per-interaction gating behavior is enforced by the reference CLIs or libraries.
+
 Session mode governs interactive CLI tools -- programs that stay alive across multiple interactions and maintain internal state. Tools like `psql`, `msfconsole`, `redis-cli`, `kubectl exec`, and `gdb` accept commands over time, where each command changes the tool's internal state and carries a different risk level.
 
 ## What Session Mode Solves
@@ -26,8 +29,9 @@ A psql session manifest with read and write commands at different risk tiers:
 # tools/psql_session.clad.toml
 [tool]
 name = "psql_session"
+version = "1.0.0"
 binary = "psql"
-mode = "session"
+mode = "session"               # Advisory; derived from the [session] section when absent
 description = "Governed PostgreSQL interactive session"
 risk_tier = "medium"
 

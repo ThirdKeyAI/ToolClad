@@ -4,11 +4,15 @@
 
 Declarative tool interface contracts for agentic runtimes.
 
-ToolClad is a manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool: typed parameters, validation rules, invocation mechanism, output parsing, and policy metadata. Three execution modes share a common governance layer:
+ToolClad is a manifest format (`.clad.toml`) that defines the complete behavioral contract for a tool: typed parameters, validation rules, invocation mechanism, output parsing, and policy metadata. Two executing backends share a common governance layer:
 
-- **Oneshot** (default): Single CLI command execution
-- **Session**: Interactive CLI tools via PTY (msfconsole, psql, redis-cli) with per-interaction Cedar gating
-- **Browser**: Governed headless browser via CDP/Playwright with URL scope enforcement and page state policies
+- **Shell command** (`[command]`, default): a single CLI invocation dispatched via `execve`
+- **HTTP API** (`[http]`): a single HTTP request constructed from the manifest
+
+Three further manifest kinds are **parsed and validated but not executable by the reference runtimes** in this repository:
+
+- **MCP proxy** (`[mcp]`): arguments are validated and field-mapped, and `execute` returns a `delegation_preview` envelope; no upstream MCP call is made
+- **PTY session** (`[session]`) and **CDP browser** (`[browser]`): `validate` and `schema` work, but `execute` is refused with `session mode is parsed but not yet executable in the reference implementation` (and the equivalent message for browser mode). Executing these contracts is the job of a hosting runtime such as Symbiont.
 
 ## The Problem
 
@@ -33,7 +37,7 @@ type = "scope_target"
 description = "Domain name or IP address to query"
 
 [command]
-template = "whois {target}"
+exec = ["whois", "{target}"]
 
 [output]
 format = "text"
@@ -46,18 +50,18 @@ type = "object"
 type = "string"
 ```
 
-The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command. The `[command]` section is optional for HTTP-only or MCP-only manifests.
+The agent fills typed parameters. The executor validates, constructs the argv, executes with timeout, and returns structured JSON. The agent never generates a shell command; the evidence envelope reports the argv that was run (for HTTP tools, the unexpanded URL template, so secrets never reach the agent). The `[command]` section is optional for HTTP-only or MCP-only manifests.
 
-### Array-Based Command Construction (v0.5.3)
+### Array-Based Command Construction
 
-For commands where argument values may contain spaces or quotes, use the `exec` array format — it maps directly to `execve` with no shell interpretation or string splitting:
+`exec` is the canonical invocation form. Each element is exactly one argv entry, dispatched straight to `execve`; substituted values are never re-split and there is no shell:
 
 ```toml
 [command]
-exec = ["curl", "-H", "Authorization: {token}", "{target}"]
+exec = ["curl", "-s", "-S", "-X", "{method}", "{_header_flags}", "{url}"]
 ```
 
-The legacy `template` string format remains supported. See [Command Construction](https://docs.toolclad.org/command-construction/) for details.
+A placeholder must be a whole, unquoted token. `{{` and `}}` are escapes for literal braces (so `"\\n%{{http_code}}"` reaches curl as `\n%{http_code}`). The legacy `template` string form is **deprecated**: it is still accepted, but it is tokenized into the same `exec` array at load time, prints a deprecation warning, and will be removed in the next minor release. Argument values may contain whitespace only when the argument sets `allow_whitespace = true`, and that opt-in is honored only for manifests that declare `exec` directly. See [Command Construction](https://docs.toolclad.org/command-construction/) for details.
 
 ## Security Model
 
@@ -70,15 +74,40 @@ The dangerous action cannot be expressed because the interface doesn't permit it
 
 ### Security Features
 
-- **Shell injection prevention**: All string types reject metacharacters (`;|&$\`(){}[]<>!\n\r`) by default
-- **Array-based execution**: Commands dispatched via direct `execve` (no `sh -c` shell interpretation)
-- **Process group isolation**: Tools spawned in new PGID; timeout kills entire process group (no zombies)
-- **Absolute path blocking**: `path` type rejects `/etc/shadow`, `C:\...` style paths
-- **Newline injection blocking**: `\n` and `\r` rejected in all string-based types
-- **HTTP body JSON-escaping**: Values interpolated into HTTP body templates are JSON-escaped to prevent injection
-- **Platform-aware evidence directories**: Evidence output uses platform-appropriate temp directories
-- **HTTP error semantics**: 4xx responses map to `client_error`, 5xx to `server_error` in evidence envelopes
+- **Shell injection prevention**: All string-derived types reject shell metacharacters (`;|&$\`(){}[]<>!`), NUL, control characters, quotes and backslashes, whitespace (unless `allow_whitespace = true` in `exec` mode) and a leading `-`/`+` (unless `allow_leading_dash = true`). NUL is rejected for every type, `enum` included.
+- **Array-based execution**: Commands dispatched via direct `execve` (no `sh -c` shell interpretation); substituted values are never re-split
+- **Process group isolation**: Tools spawned in a new PGID; on timeout the executor sends `SIGTERM` to the group, waits `TOOLCLAD_KILL_GRACE_MS` (default 2000 ms), then sends `SIGKILL` to the group. `timeout_seconds = 0` is refused at load.
+- **Hardened spawn path**: child environment rebuilt from a fixed allowlist (secrets are never passed), `argv[0]` resolved against a fixed `PATH`, shell and script interpreters refused unless `allow_interpreter = true`, stdin from `/dev/null`, a 0700 per-invocation scratch directory as cwd
+- **Policy gate**: `human_approval = true` and `risk_tier` `high`/`critical` are denied by default; `--approve` (or an explicit gate in library use) is required to run them. Cedar evaluation stays external.
+- **Absolute path blocking**: `path` type rejects `/etc/shadow`, `C:\...` style paths and any `..` path component
+- **Host and IP policy**: link-local and cloud-metadata ranges are always blocked; `block_internal = true` additionally blocks loopback, private, CGNAT, documentation and reserved ranges, internal name suffixes, embedded-IP hostnames, and resolves hostnames (fail-closed). Manifests that dispatch a known egress binary, set `network_egress = true`, or use `[http]`/`[browser]` must set `block_internal = true` on every network-target argument.
+- **Fail-closed scope enforcement**: `scope_check = true` with no reachable `scope/scope.toml` is a refusal, not a pass
+- **Unknown manifest keys refused at load**: every section is checked against a fixed key allowlist (`validate --allow-unknown-keys` is the only escape hatch)
+- **HTTP hardening**: secrets are expanded before argument interpolation, URL values are percent-encoded, body values are JSON-escaped, redirects are not followed (`redirect_blocked`), and the envelope's `command` holds the unexpanded template
+- **Platform-aware evidence directories**: evidence root at `TOOLCLAD_EVIDENCE_DIR` or `<tmpdir>/toolclad-evidence`, created mode 0700; output files opened `O_NOFOLLOW | O_EXCL | O_CREAT` mode 0600
+- **Fail-closed output**: stdout and stderr capped by `[output] max_bytes` (default 8 MiB, sets `output_truncated`), XML containing `<!DOCTYPE`/`<!ENTITY` refused, schema violations yield status `schema_error`, custom parser scripts refused at load
+- **HTTP error semantics**: 4xx responses map to `client_error`, 5xx to `server_error`, 3xx to `redirect_blocked` in evidence envelopes
 - **No eval**: Conditional evaluators use closed-vocabulary parsers, never dynamic code execution
+
+### Scope Enforcement
+
+Any argument of type `scope_target`, `url`, `ip_address`, or `cidr` that sets `scope_check = true` is checked against the project scope file before the command is built. `scope_target` alone is only a shape check; allowlisting requires `scope_check = true`.
+
+```toml
+# scope/scope.toml
+[scope]
+allowed_domains = ["example.com", "*.example.com"]
+allowed_cidrs   = ["10.0.1.0/24"]
+blocked_domains = []
+blocked_cidrs   = []
+```
+
+- **Discovery**: `TOOLCLAD_SCOPE_FILE` if set, otherwise `scope/scope.toml` searched upward from the manifest's directory (or the cwd when loading from a string). Unknown keys in the scope file are refused.
+- **Fail-closed**: `scope_check = true` with no scope file reachable is refused (`scope_check is enabled but no scope/scope.toml was found (set TOOLCLAD_SCOPE_FILE)`).
+- **Blocked before allowed**: blocked rules are evaluated first and always win.
+- **Domain rules**: an exact rule matches the host case-insensitively; `*.example.com` matches strict subdomains at any depth (`app.example.com`, `deep.sub.example.com`) but not the apex `example.com` and not `evil-example.com`. For `url` arguments the host is extracted first.
+- **CIDR rules**: an IP matches when it is contained in an allowed range; a CIDR argument matches only when it is **fully contained** in an allowed range.
+- No match: `target '<value>' is not in scope`.
 
 ## Packages
 
@@ -101,15 +130,15 @@ npm install toolclad           # JavaScript / npm
 
 Each implementation provides:
 
-- **Manifest parsing** -- load and validate `.clad.toml` files (oneshot, session, browser modes)
-- **14 built-in type validators** -- all with injection sanitization, plus custom types via `toolclad.toml`
-- **Command construction** -- template interpolation with mappings, conditionals, defaults
-- **Execution** -- direct argv dispatch, real timeout enforcement with process group kill, SHA-256 evidence hashing
-- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
-- **Output schema validation** -- validates parsed results against `[output.schema]`
+- **Manifest parsing** -- load and validate `.clad.toml` files; unknown keys are refused at load. Session and browser manifests parse and validate but are not executable.
+- **15 built-in type validators** -- all with injection sanitization, plus custom types via `toolclad.toml` (discovered by walking up from the manifest's directory)
+- **Command construction** -- `exec` argv arrays with mappings, conditionals, defaults; deprecated `template` strings are compiled to `exec` at load
+- **Execution** -- shell and HTTP backends: direct argv dispatch, hardened child environment, SIGTERM-then-SIGKILL process group kill on timeout, policy gate, SHA-256 evidence hashing
+- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text (custom parser scripts are refused at load)
+- **Output schema validation** -- fail-closed validation of parsed results against `[output.schema]` (status `schema_error` on violation)
 - **MCP schema generation** -- rich inputSchema + outputSchema with format/pattern constraints for LLM tool use
 - **Evidence envelopes** -- structured JSON with scan_id, timestamps, exit_code, stderr, output_hash
-- **CLI** -- `validate`, `run`, `schema`, `test` (dry run) subcommands
+- **CLI** -- `validate` (`--allow-unknown-keys`), `run` (`--approve`), `schema`, `test` (dry run) subcommands
 
 ## Quick Start
 
@@ -133,26 +162,38 @@ cd go && go run ./cmd/toolclad test ../examples/whois_lookup.clad.toml --arg tar
 
 | Type | Validates | Examples |
 |------|-----------|---------|
-| `string` | Non-empty, injection-safe, optional regex `pattern` | General text |
-| `integer` | Numeric, optional `min`/`max` with `clamp` | Thread counts |
+| `string` | Injection-safe, optional anchored regex `pattern` | General text |
+| `integer` | `^[+-]?\d+$`, optional `min`/`max` with `clamp` | Thread counts |
 | `number` | Float, optional `min_float`/`max_float` with `clamp`; rejects NaN/inf | Confidence scores, ratios |
-| `port` | 1-65535 | Network ports |
-| `boolean` | Exactly `"true"` or `"false"` | Feature flags |
+| `port` | `^\d+$` in 1-65535 | Network ports |
+| `boolean` | `true` or `false` (case-insensitive, normalized to lowercase) | Feature flags |
 | `enum` | Value in declared `allowed` list | Scan types |
-| `scope_target` | Injection-safe, ASCII-only, IDN/punycode rejected, no wildcards/traversal, valid IP/CIDR/hostname | Targets |
-| `url` | Valid URL, optional `schemes` restriction, `scope_check` | Web targets |
-| `path` | No traversal (`../`), no absolute paths | File paths |
-| `ip_address` | Valid IPv4 or IPv6 | Addresses |
-| `cidr` | Valid CIDR notation (IPv4 + IPv6) | Network ranges |
+| `scope_target` | Injection-safe, ASCII-only, IDN/punycode rejected, no wildcards/traversal, canonical IP/CIDR (IPv4 + IPv6)/hostname; `block_internal`, `scope_check` | Targets |
+| `url` | `scheme://host[:port]/...` with `http`/`https` by default (`schemes` to override; dangerous schemes always refused), no userinfo, host/IP policy; `block_internal`, `scope_check` | Web targets |
+| `path` | No `..` component, no absolute paths | File paths |
+| `ip_address` | Canonical IPv4 or IPv6 literal; `block_internal`, `scope_check` | Addresses |
+| `cidr` | Valid CIDR notation (IPv4 + IPv6); `block_internal` (overlap check), `scope_check` | Network ranges |
 
 ### Extended Types
 
 | Type | Validates | Use Case |
 |------|-----------|----------|
-| `msf_options` | Semicolon-delimited `set KEY VALUE` pairs | Metasploit options |
+| `msf_options` | Semicolon-delimited `set KEY VALUE` pairs (whitespace allowed as the separator) | Metasploit options |
 | `credential_file` | Relative path + must exist | Username/password lists |
-| `duration` | Integer with suffix (`30`, `5m`, `2h`) | Timeout overrides |
-| `regex_match` | Matches declared `pattern` (required) | Module paths |
+| `duration` | `^\d+$` or `h`/`m`/`s`/`ms` components (`30`, `5m`, `2h`, `1h30m`) | Timeout overrides |
+| `regex_match` | Matches declared anchored `pattern` (required) | Module paths |
+
+### Value Hygiene
+
+Every string-derived type (`string`, `path`, `credential_file`, `regex_match`, `url`, `scope_target`, `duration`, `msf_options`) is checked, in order, before any type-specific parsing:
+
+1. NUL bytes are rejected (for every type, including `enum`)
+2. Control characters (U+0000-U+001F, U+007F) are rejected
+3. `'`, `"` and `\` are rejected
+4. Any Unicode whitespace is rejected unless the argument sets `allow_whitespace = true` **and** the manifest declares `command.exec` directly (`msf_options` is exempt because the space is its `KEY VALUE` separator)
+5. A leading `-` or `+` is rejected unless the argument sets `allow_leading_dash = true`
+
+Numeric types apply the leading-dash rule to the output value after clamping, so `-5` with `clamp = true` and `min = 1` yields `1`, while `-1` with no bounds is rejected unless `allow_leading_dash = true`. Every `pattern` is anchored (`^(?:pat)$`) so it must match the whole value.
 
 ### Custom Types
 
@@ -170,13 +211,17 @@ allowed = ["info", "low", "medium", "high", "critical"]
 
 Reference in manifests: `type = "service_protocol"`
 
+The CLIs discover `toolclad.toml` by walking up from the manifest's directory and pass the custom types into validation and load-time type checking. Custom types cannot carry `block_internal` or `scope_check`, so an argument that names a network target must use the built-in `scope_target`, `url`, `ip_address`, or `cidr` type; a custom type whose base is one of those still counts as a network target for the egress lint.
+
 ### Dispatch Modes
 
 `tool.dispatch` selects the execution model:
 
 - `"exec"` (default) — manifest must declare a backend (`[command]`, `[http]`,
-  `[mcp]`, `[session]`, or `[browser]`) and an `[output]` block. ToolClad runs
-  the backend itself.
+  `[mcp]`, `[session]`, or `[browser]`) and an `[output]` block. The reference
+  runtimes execute `[command]` and `[http]`; `[mcp]` yields a
+  `delegation_preview` envelope and `[session]`/`[browser]` are refused at
+  execution (see above).
 - `"callback"` — validator-only embedding. Backend and `[output]` are
   optional; in-process code dispatches the validated arguments however it
   likes. Useful when ToolClad is just the typed-argument fence and execution
@@ -194,6 +239,18 @@ max_float = 1.0
 required = true
 ```
 
+### Tool-Level Hardening Keys
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `[tool] network_egress` | `false` | Declares that the tool reaches the network. When `true` (or when the binary is a known egress tool such as `curl`, `nmap`, `ssh`, or the manifest uses `[http]`/`[browser]`), every `scope_target`/`url`/`ip_address`/`cidr` argument must set `block_internal = true` or the manifest is refused at load. |
+| `[tool] allow_interpreter` | `false` | Permits `argv[0]` to be a shell or script interpreter (`sh`, `bash`, `python3`, `node`, `perl`, `env`, `xargs`, ...). Refused at load otherwise. |
+| `[tool] mode` | derived | `oneshot`, `session`, or `browser`. Advisory only; derived from the backend section when absent. |
+| `[tool] human_approval` | `false` | The default policy gate denies execution; requires `--approve` or an approving gate. |
+| `[tool.limits]` | unset | `nproc`, `nofile`, `fsize_bytes`, `address_space_bytes`, `cpu_seconds`. Applied as child rlimits by the Rust and Python runtimes; Go and JS cannot set child rlimits portably and skip them. |
+| `[command] end_of_options` | unset | Only `"--"` is accepted; inserts a literal `--` before the first user-argument token. |
+| `[output] max_bytes` | `8388608` | Cap on captured stdout and stderr; overflow sets `output_truncated`. |
+
 ## Output Handling
 
 ### Built-in Parsers
@@ -206,14 +263,15 @@ required = true
 | `builtin:jsonl` | Nuclei, streaming tools |
 | `builtin:text` | Simple unstructured output (default) |
 
-### Custom Parsers
+### Custom Parsers (Not Supported)
 
-```toml
-[output]
-parser = "scripts/parse-outputs/parse-nmap-xml.py"
-```
+The reference runtimes accept only the `builtin:*` parser names above. A `parser` value naming a script (for example `parser = "scripts/parse.py"`) is refused at load with `custom output parsers are not supported by the reference runtimes`.
 
-Custom parsers receive the raw output file path as `argv[1]` and emit JSON to stdout.
+### Output Limits and Schema Validation
+
+- `[output] max_bytes` (default `8388608`, 8 MiB) caps stdout and stderr separately; on overflow capture stops and the envelope gets `"output_truncated": true` without changing the status.
+- XML input containing `<!DOCTYPE` or `<!ENTITY` (case-insensitive) is refused before parsing.
+- Parsed output is validated against `[output.schema]` with a bundled JSON-Schema subset validator. Validation is fail-closed: a violation sets `status` to `schema_error`, replaces `results` with `{"schema_error": "<path>: <message>"}`, and preserves the raw output under `results.raw_output`.
 
 ### Evidence Envelope
 
@@ -234,7 +292,7 @@ Every execution returns a structured envelope:
 }
 ```
 
-On error, `exit_code` and `stderr` are included so LLM agents can self-correct.
+On error, `exit_code` and `stderr` are included so LLM agents can self-correct. Possible `status` values are `success`, `error`, `timeout` (partial output preserved), `schema_error`, `client_error`, `server_error`, `redirect_blocked` (HTTP), and `delegation_preview` (MCP proxy). For HTTP tools `command` holds `"<METHOD> <url as written in the manifest>"`, never the expanded URL.
 
 ## Symbiont Integration
 
@@ -243,7 +301,7 @@ ToolClad is the `tools/` directory convention for [Symbiont](https://symbiont.de
 - Runtime auto-discovers `.clad.toml` files at startup
 - Registers each tool as an MCP tool in the ORGA reasoning loop
 - Cedar policy evaluation using manifest-declared `[tool.cedar]` resource/action
-- Scope enforcement against `scope/scope.toml`
+- Scope enforcement against `scope/scope.toml` (the same fail-closed rules described under [Scope Enforcement](#scope-enforcement))
 - Cedar policy auto-generation from manifest `risk_tier`
 - Hot-reload in development mode
 - `symbi tools list/validate/test/schema/init` CLI

@@ -1,6 +1,8 @@
 # HTTP & MCP Backends
 
-ToolClad oneshot mode supports three backends: shell commands (`[command]`), HTTP requests (`[http]`), and MCP proxy calls (`[mcp]`). All three share the same governance layer: argument validation, Cedar policy evaluation, output schema validation, and evidence envelopes. The backend determines how the request is dispatched.
+ToolClad oneshot mode declares three backends: shell commands (`[command]`), HTTP requests (`[http]`), and MCP proxy calls (`[mcp]`). All three share the same governance layer: argument validation, policy gating, output schema validation, and evidence envelopes. The backend determines how the request is dispatched.
+
+> **Which backends the reference runtimes execute.** `[command]` and `[http]` are executed. `[mcp]` manifests are **parsed and validated but not executable**: the reference runtimes validate the arguments, apply `field_map`, and return a `delegation_preview` envelope without contacting any MCP server. Forwarding the call upstream is the job of a hosting runtime such as Symbiont.
 
 ## HTTP Backend
 
@@ -73,14 +75,16 @@ description = "Message timestamp (Slack message ID)"
 
 The executor follows this sequence:
 
-1. Interpolate `{arg_name}` placeholders in `url`, `headers`, and `body_template` with validated parameter values
-2. Resolve `{_secret:name}` references from secrets management
+1. Expand `{_secret:name}` references **on the manifest template first** -- in `url`, every `headers` value, and `body_template`. Because this happens before any argument is interpolated, an argument value can never introduce a secret reference (the `url` validator also rejects `{` and `}` outright).
+2. Interpolate `{arg_name}` placeholders with validated parameter values. Values placed in the URL are percent-encoded (path segments with the path set, query values with the query set); values placed in `body_template` are JSON-escaped.
 3. Set method, headers, and body
-4. Execute with `timeout_seconds`
+4. Execute with `timeout_seconds`. Redirects are **not** followed: a 3xx response is surfaced as `status: "redirect_blocked"`.
 5. Check response status against `success_status` / `error_status`
-6. Parse response body with the declared parser
-7. Validate against `[output.schema]`
-8. Wrap in evidence envelope
+6. Parse the response body with the declared parser, subject to `[output] max_bytes`
+7. Validate against `[output.schema]` (fail-closed: a violation yields `status: "schema_error"` with the raw body preserved)
+8. Wrap in an evidence envelope. The envelope's `command` holds the **unexpanded** template (`"<METHOD> <http.url as written in the manifest>"`), never the expanded URL, so secrets never reach the agent or the evidence store.
+
+`[http]` manifests are treated as `network_egress = true`: every `url`, `scope_target`, `ip_address`, or `cidr` argument must set `block_internal = true` or the manifest is refused at load.
 
 ### Secrets Injection
 
@@ -92,10 +96,12 @@ url = "https://api.example.com/v1/{endpoint}?key={_secret:api_key}"
 headers = { "Authorization" = "Bearer {_secret:bearer_token}" }
 ```
 
-Resolution order:
+Resolution order in the reference runtimes:
 
-1. `TOOLCLAD_SECRET_<NAME>` environment variable (standalone use)
-2. Vault/OpenBao path (Symbiont integration)
+1. The file named by `TOOLCLAD_SECRETS_FILE` (preferred): a TOML file with `name = "value"` entries at top level. Its permissions are checked and it is rejected if group- or other-readable. When present, the file wins.
+2. The `TOOLCLAD_SECRET_<NAME>` environment variable of the runtime's own process.
+
+A missing secret is a hard error. Secrets are never placed in a child process environment (`TOOLCLAD_SECRET_*` is stripped from every spawn), never appear in the envelope's `command`, and -- because expansion happens before argument interpolation -- can never be referenced from an argument value. A hosting runtime such as Symbiont may substitute its own secret store (Vault/OpenBao); that integration is outside the reference runtimes.
 
 The agent proposes `slack_post_message(channel="C01234", message="hello")`. The executor injects the bearer token from the secret store. The agent never sees the token.
 
@@ -109,6 +115,8 @@ error_status = [400, 401, 403, 404, 429]
 - Status in `success_status`: parse response, return results.
 - Status in `error_status`: return error envelope with status code and response body for agent self-correction.
 - Status not in either list: return error envelope with "unexpected status code" message.
+- Any 3xx: redirects are not followed; the envelope status is `redirect_blocked`.
+- 4xx responses are classified `client_error` and 5xx `server_error` in the envelope.
 
 ### HTTP GET Example
 
@@ -124,11 +132,13 @@ risk_tier = "low"
 [args.ip]
 type = "ip_address"
 required = true
+# [http] manifests are network egress: block_internal is mandatory at load.
+block_internal = true
 description = "IP address to look up"
 
 [http]
 method = "GET"
-url = "https://ipapi.co/{ip}/json/"
+url = "https://ipapi.co/{ip}/json/"     # {ip} is percent-encoded as a path segment
 success_status = [200]
 error_status = [429]
 
@@ -158,7 +168,9 @@ description = "ISP or organization"
 
 ## MCP Proxy Backend
 
-The MCP proxy backend wraps an existing MCP server tool in a ToolClad manifest. The manifest applies stricter validation and Cedar policy gating on top of the upstream tool's permissive schema.
+> **Not executable by the reference runtimes.** An `[mcp]` manifest loads, validates, and produces an MCP schema, but `execute` returns a `delegation_preview` envelope containing the upstream server name, tool name, and the field-mapped arguments. No MCP server is contacted. Steps 4-6 of the execution flow below are performed by a hosting runtime, not by the reference CLIs or libraries.
+
+The MCP proxy backend wraps an existing MCP server tool in a ToolClad manifest. The manifest applies stricter validation and policy gating on top of the upstream tool's permissive schema.
 
 ### Why Proxy MCP Tools?
 
@@ -271,11 +283,11 @@ Unmapped fields pass through with the same name. This decouples the ToolClad con
 ### MCP Proxy Execution Flow
 
 1. ToolClad validates all arguments against the manifest's type system (stricter than upstream)
-2. Cedar evaluates policy (e.g., "this agent can only create issues in `ThirdKeyAI/*` repos")
-3. Executor maps validated arguments to the upstream tool's expected names via `field_map`
-4. Executor forwards the call to the MCP server referenced by `server`
-5. Response is parsed and validated against `[output.schema]`
-6. Wrapped in evidence envelope with audit trail
+2. The policy gate runs (`human_approval` / `risk_tier` deny-by-default); Cedar evaluation, e.g. "this agent can only create issues in `ThirdKeyAI/*` repos", is external to the reference runtimes
+3. Executor maps validated arguments to the upstream tool's expected names via `field_map` and -- in the reference runtimes -- returns a `delegation_preview` envelope here
+4. *(hosting runtime)* Forwards the call to the MCP server referenced by `server`
+5. *(hosting runtime)* Response is parsed and validated against `[output.schema]`
+6. *(hosting runtime)* Wrapped in evidence envelope with audit trail
 
 ### Proxy for Database MCP
 
@@ -333,16 +345,18 @@ The upstream `postgres-mcp` tool accepts any query string. The ToolClad manifest
 
 ## Shared Guarantees
 
-Both HTTP and MCP proxy backends share all ToolClad guarantees with the shell backend:
+What the reference runtimes enforce for each backend:
 
 | Guarantee | Shell | HTTP | MCP Proxy |
 |-----------|-------|------|-----------|
 | Argument validation | Yes | Yes | Yes |
-| Cedar policy evaluation | Yes | Yes | Yes |
-| Output schema validation | Yes | Yes | Yes |
-| Evidence envelope | Yes | Yes | Yes |
-| Timeout enforcement | Yes | Yes | Yes |
-| Audit trail | Yes | Yes | Yes |
-| Scope enforcement | Yes | Yes | Yes |
+| Policy gate (`human_approval`, `risk_tier`) | Yes | Yes | Yes |
+| Cedar policy evaluation | External | External | External |
+| Scope enforcement (`scope_check`) | Yes | Yes | Yes |
+| Egress lint (`block_internal` required) | When `network_egress` / egress binary | Always | No |
+| Output schema validation (fail-closed) | Yes | Yes | Not applicable (no upstream response) |
+| Output cap (`max_bytes`) | Yes | Yes | Not applicable |
+| Timeout enforcement | Yes | Yes | Not applicable |
+| Evidence envelope | Yes | Yes | `delegation_preview` only |
 
-The backend is an implementation detail. The governance layer is the same.
+The backend is an implementation detail of dispatch; argument validation and the policy gate are the same for all three.
