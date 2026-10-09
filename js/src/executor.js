@@ -20,6 +20,111 @@ const TEMPLATE_DEPRECATION_WARNING =
   "warning: [command] template is deprecated and will be removed in the next minor release; use exec = [...]";
 
 /**
+ * Binaries that connect to a network destination derived from their
+ * arguments — the ones for which an unconstrained target is an SSRF surface.
+ * Kept identical to the Rust runtime's list so the lint reads the same in
+ * every runtime; it is deliberately not extended here.
+ */
+export const EGRESS_BINARIES = Object.freeze([
+  "curl",
+  "wget",
+  "nmap",
+  "nc",
+  "ncat",
+  "netcat",
+  "masscan",
+  "telnet",
+  "ssh",
+  "ping",
+  "fping",
+  "httpie",
+  "http",
+  "wfuzz",
+  "ffuf",
+  "hydra",
+  "nikto",
+]);
+
+/** Argument types whose value names a network target. */
+const NETWORK_TARGET_TYPES = new Set(["scope_target", "url", "ip_address", "cidr"]);
+
+/** The last path component of a command, lowercased (`/usr/bin/Curl` → `curl`). */
+function commandBasename(command) {
+  const parts = String(command).split(/[/\\]/);
+  return parts[parts.length - 1].toLowerCase();
+}
+
+/**
+ * True if the manifest describes a tool that reaches the network: the author
+ * declared `tool.network_egress = true`, the backend is `[http]` or
+ * `[browser]`, or the dispatched binary — `tool.binary`, `exec[0]`, or the
+ * template's first token — is one of EGRESS_BINARIES.
+ *
+ * An `executor`-only manifest cannot be inspected for a binary: the script
+ * may run anything. It is an egress manifest only when the author says so
+ * (`network_egress = true`) or uses `[http]` / `[browser]`. That escape
+ * hatch is the author's responsibility.
+ *
+ * @param {object} manifest - Parsed or in-memory manifest
+ * @returns {boolean}
+ */
+export function isEgressManifest(manifest) {
+  const tool = manifest.tool || {};
+  if (tool.network_egress === true) return true;
+  if (manifest.http || manifest.browser) return true;
+
+  const command = manifest.command || {};
+  const names = [];
+  if (typeof tool.binary === "string" && tool.binary !== "") {
+    names.push(commandBasename(tool.binary));
+  }
+  if (Array.isArray(command.exec) && command.exec.length > 0) {
+    names.push(commandBasename(command.exec[0]));
+  }
+  if (typeof command.template === "string") {
+    const first = command.template.trim().split(/\s+/)[0];
+    if (first) names.push(commandBasename(first));
+  }
+  return names.some((name) => EGRESS_BINARIES.includes(name));
+}
+
+/**
+ * Egress lint (TC-15), applied at load and before any in-memory build. For
+ * an egress manifest every argument whose type names a network target must
+ * set `block_internal = true`, so internal / SSRF addresses are denied by
+ * default rather than by the author remembering. When the custom type map
+ * is available, an argument whose custom type has a network-target base is
+ * refused outright: a custom type definition cannot carry `block_internal`.
+ *
+ * @param {object} manifest - Parsed or in-memory manifest
+ * @param {object} [customTypes] - Map of custom type name to definition
+ * @throws {Error} naming the first offending argument
+ */
+export function lintNetworkEgress(manifest, customTypes) {
+  if (!isEgressManifest(manifest)) return;
+  for (const [name, def] of Object.entries(manifest.args || {})) {
+    if (!def || typeof def !== "object") continue;
+    const type = def.type;
+    if (NETWORK_TARGET_TYPES.has(type)) {
+      if (def.block_internal !== true) {
+        throw new Error(
+          `argument '${name}' is a network target for an egress binary but block_internal is not set; set block_internal = true to default-deny internal/SSRF targets`
+        );
+      }
+      continue;
+    }
+    if (customTypes && Object.hasOwn(customTypes, type)) {
+      const base = customTypes[type].base;
+      if (NETWORK_TARGET_TYPES.has(base)) {
+        throw new Error(
+          `argument '${name}' uses custom type '${type}' as a network target; custom types cannot carry block_internal — use the built-in ${base} type`
+        );
+      }
+    }
+  }
+}
+
+/**
  * Replace {_secret:name} placeholders with TOOLCLAD_SECRET_<NAME> env vars.
  * @param {string} template - Template string with optional {_secret:name} vars
  * @returns {string} Template with secrets injected from environment
@@ -119,6 +224,8 @@ function defineHidden(obj, key, value) {
  * - Every conditional template is tokenized into a hidden token array.
  * - `end_of_options` must be exactly "--" when present.
  * - Every placeholder must name a declared variable.
+ * - An egress manifest must set `block_internal` on every network target
+ *   argument (lintNetworkEgress).
  *
  * Sets the hidden flag `command._execWasDeclared` (true only when the manifest
  * declared `exec` directly), which selects exec-mode validation.
@@ -213,6 +320,7 @@ export function compileCommand(manifest) {
   }
 
   checkPlaceholders(manifest);
+  lintNetworkEgress(manifest);
   defineHidden(command, "_compiled", true);
   return manifest;
 }
@@ -948,6 +1056,9 @@ function executeHttpSync(manifest, args, options = {}) {
     throw new Error("Manifest missing [http] section or http.url");
   }
 
+  // An [http] manifest is an egress manifest by definition; an in-memory one
+  // never passes through loadManifest or compileCommand, so lint it here.
+  lintNetworkEgress(manifest);
   const resolvedArgs = resolveArgs(manifest, args);
   const context = { ...resolvedArgs };
 
@@ -1050,6 +1161,8 @@ export async function executeHttp(manifest, args, options = {}) {
     throw new Error("Manifest missing [http] section or http.url");
   }
 
+  // See executeHttpSync: in-memory [http] manifests are linted here.
+  lintNetworkEgress(manifest);
   const resolvedArgs = resolveArgs(manifest, args);
   const context = { ...resolvedArgs };
 

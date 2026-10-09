@@ -181,13 +181,18 @@ pub struct ArgDef {
     #[serde(default)]
     pub scope_check: bool,
     /// `scope_target`, `url`, `ip_address` and `cidr`: when true, reject a
-    /// literal target (or the base address of a CIDR) in a non-public range —
-    /// loopback, private, shared/CGNAT, unspecified, broadcast, documentation,
-    /// benchmarking, reserved, and the IPv6 equivalents (incl. v4-mapped); the
-    /// table lives in `crate::hostpolicy`. Link-local (incl. cloud-metadata
-    /// 169.254.0.0/16) is refused regardless of this flag. SSRF
-    /// defense-in-depth, opt-in per arg so tools that legitimately target
-    /// internal hosts are unaffected.
+    /// target in a non-public range — loopback, private, shared/CGNAT,
+    /// unspecified, broadcast, documentation, benchmarking, reserved, and the
+    /// IPv6 equivalents (incl. v4-mapped); the table lives in
+    /// `crate::hostpolicy`. A literal is tested directly, a CIDR by overlap
+    /// with every blocked range, and a hostname is resolved and every A/AAAA
+    /// answer tested (a name that cannot be resolved is refused). Regardless
+    /// of this flag, link-local (incl. cloud-metadata 169.254.0.0/16) and the
+    /// internal-name denylist (`localhost`, `*.local`, `*.internal`, ...) are
+    /// refused, and an IP literal embedded in a hostname (`127.0.0.1.nip.io`)
+    /// is treated as that address. SSRF defense-in-depth, opt-in per arg so
+    /// tools that legitimately target internal hosts are unaffected; an
+    /// egress manifest must set it on every network-target argument.
     #[serde(default)]
     pub block_internal: bool,
     /// Permit a value that starts with `-` or `+`. Off by default so a user

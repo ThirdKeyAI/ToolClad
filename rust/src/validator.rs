@@ -1,9 +1,10 @@
 use crate::hostpolicy::{
-    enforce_ip_policy, has_punycode_label, looks_like_ip_literal, parse_canonical_ip,
+    enforce_cidr_policy, enforce_hostname_policy, enforce_ip_policy, has_punycode_label,
+    looks_like_ip_literal, parse_canonical_ip, parse_cidr,
 };
 use crate::types::{ArgDef, ToolCladError};
 use regex::Regex;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::LazyLock;
 
 /// Supported argument types for validation.
@@ -30,10 +31,9 @@ const SHELL_METACHARACTERS: &[char] = &[
     '\n', '\r', ';', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
 ];
 
-/// Compiled regex for IP address formats. Canonical IPv4/IPv6 are validated by
-/// strict `std::net` parsers; this regex only frames CIDR notation.
-static CIDR_V4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$").unwrap());
+/// Hostname grammar: LDH labels, no leading or trailing hyphen, no empty
+/// label, no trailing dot. IP literals and CIDRs are parsed by the strict
+/// `crate::hostpolicy` parsers before a value is matched against this.
 static HOSTNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$",
@@ -418,7 +418,7 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
             "argument '{name}' scope_target must not contain path traversal sequences"
         )));
     }
-    if val.contains('/') && !CIDR_V4_RE.is_match(val) && val.parse::<std::net::IpAddr>().is_err() {
+    if val.contains('/') && parse_cidr(val).is_none() {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' scope_target must not contain '/' (use CIDR notation for ranges)"
         )));
@@ -461,12 +461,11 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
         return Ok(val.to_string());
     }
 
-    // CIDR ranges. Range-check the base address under policy.
-    if let Some(caps) = CIDR_V4_RE.captures(val) {
-        if let Ok(base) = caps[1].parse::<Ipv4Addr>() {
-            enforce_ip_policy(name, &IpAddr::V4(base), def.block_internal)?;
-            return Ok(val.to_string());
-        }
+    // CIDR ranges (IPv4 or IPv6, strictly framed): the whole range is tested
+    // for overlap with the blocked prefixes, not just its base address.
+    if let Some(net) = parse_cidr(val) {
+        enforce_cidr_policy(name, &net, def.block_internal)?;
+        return Ok(val.to_string());
     }
 
     // A non-canonical IP-literal encoding must not slip through as a "hostname":
@@ -480,13 +479,17 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
 
     // Hostname: structural regex plus a non-numeric rightmost label — no valid
     // TLD is all digits (RFC 3696 §2), which also rejects dotted-decimal IPs.
-    if HOSTNAME_RE.is_match(val) && tld_not_all_numeric(val) {
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
+    if !(HOSTNAME_RE.is_match(val) && tld_not_all_numeric(val)) {
+        return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid scope target (IP, CIDR, or hostname)"
-        )))
+        )));
     }
+
+    // A well-formed name: internal-name denylist (always), embedded IP
+    // literal (treated as that address), and under `block_internal` DNS
+    // resolution with the range policy applied to every answer.
+    enforce_hostname_policy(name, val, def.block_internal)?;
+    Ok(val.to_string())
 }
 
 /// True if the rightmost DNS label is not entirely numeric (a real TLD is never
@@ -665,9 +668,10 @@ fn validate_url(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladE
                     "argument '{name}' URL host is not a valid hostname or IP literal"
                 )));
             }
-            // Hostname strengthening (internal-suffix denylist, embedded IP
-            // literals, DNS resolution under `block_internal`) plugs in here
-            // in a later wave, via `crate::hostpolicy`.
+            // The same name rules as `scope_target`: internal-name denylist
+            // (always), embedded IP literal (treated as that address), and
+            // under `block_internal` DNS resolution of every answer.
+            enforce_hostname_policy(name, host, def.block_internal)?;
         }
     }
 
@@ -709,30 +713,18 @@ fn validate_ip_address(name: &str, def: &ArgDef, val: &str) -> Result<String, To
     }
 }
 
+/// A strictly framed IPv4 or IPv6 CIDR (canonical base, plain decimal prefix
+/// within the family's bound). The whole range is tested for overlap with
+/// every blocked prefix: link-local always, the rest under `block_internal`.
 fn validate_cidr(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
-    if let Some(caps) = CIDR_V4_RE.captures(val) {
-        let ip_part = &caps[1];
-        let prefix: u8 = caps[2].parse().map_err(|_| {
-            ToolCladError::ValidationError(format!("argument '{name}' has invalid CIDR prefix"))
-        })?;
-        let base = ip_part.parse::<Ipv4Addr>().map_err(|_| {
-            ToolCladError::ValidationError(format!(
-                "argument '{name}' has invalid IPv4 address in CIDR"
-            ))
-        })?;
-        if prefix > 32 {
-            return Err(ToolCladError::ValidationError(format!(
-                "argument '{name}' CIDR prefix must be 0-32"
-            )));
+    match parse_cidr(val) {
+        Some(net) => {
+            enforce_cidr_policy(name, &net, def.block_internal)?;
+            Ok(val.to_string())
         }
-        // The policy applies to the base address. Testing the whole range
-        // for overlap with each blocked prefix is a later wave.
-        enforce_ip_policy(name, &IpAddr::V4(base), def.block_internal)?;
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' is not valid CIDR notation (e.g. 10.0.0.0/24)"
-        )))
+        None => Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not valid CIDR notation (e.g. 10.0.0.0/24 or 2001:db8::/32)"
+        ))),
     }
 }
 
@@ -1183,10 +1175,12 @@ mod tests {
         ] {
             assert!(validate_arg("t", &def, v).is_err(), "{v} should be blocked");
         }
-        // Public addresses and hostnames still pass under the policy.
+        // Public literals still pass under the policy. A public *name* now
+        // needs DNS resolution, so the positive cases stay literal and the
+        // name path is covered by the `.invalid` fail-closed test.
         assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
-        assert!(validate_arg("t", &def, "example.com").is_ok());
-        // CIDR with an internal base is blocked too.
+        assert!(validate_arg("t", &def, "2606:4700::1111").is_ok());
+        // A CIDR overlapping an internal range is blocked too.
         assert!(validate_arg("t", &def, "10.0.0.0/24").is_err());
     }
 
@@ -1317,8 +1311,20 @@ mod tests {
     fn test_cidr() {
         let def = make_arg("cidr");
         assert!(validate_arg("c", &def, "10.0.0.0/24").is_ok());
+        assert!(validate_arg("c", &def, "2606:4700::/32").is_ok());
         assert!(validate_arg("c", &def, "10.0.0.0/33").is_err());
         assert!(validate_arg("c", &def, "10.0.0.0").is_err());
+        for v in [
+            "2606:4700::/129",
+            "10.0.0.0/024",
+            "10.0.0.0/+24",
+            "2606:4700::",
+            "[2606:4700::]/32",
+            "0x0a000000/8",
+        ] {
+            let err = validate_arg("c", &def, v).unwrap_err().to_string();
+            assert!(err.contains("not valid CIDR notation"), "{v}: {err}");
+        }
     }
 
     #[test]
@@ -2006,7 +2012,7 @@ mod tests {
             );
         }
         assert!(validate_arg("u", &blocking, "https://93.184.216.34/x").is_ok());
-        assert!(validate_arg("u", &blocking, "https://example.com/").is_ok());
+        assert!(validate_arg("u", &blocking, "https://8.8.8.8:8443/").is_ok());
         // Off by default: internal literals pass, except the always-blocked
         // tier.
         let open = make_arg("url");
@@ -2128,5 +2134,217 @@ mod tests {
         assert!(validate_arg("c", &block_cidr, "10.0.0.0/24").is_err());
         assert!(validate_arg("c", &block_cidr, "198.18.0.0/15").is_err());
         assert!(validate_arg("c", &block_cidr, "8.8.8.0/24").is_ok());
+    }
+
+    // ---- W4 hostname rules: denylist, embedded literal, overlap, DNS ----
+
+    #[test]
+    fn test_internal_names_always_blocked() {
+        const MSG: &str = "resolves to an internal name — always blocked";
+        let names = [
+            "localhost",
+            "api.localhost",
+            "printer.local",
+            "metadata.google.internal",
+            "db.internal",
+            "x.home.arpa",
+            "nas.lan",
+            "wiki.intranet",
+            "fs.corp",
+            "vpn.private",
+            "LOCALHOST",
+            "Metadata.Google.Internal",
+        ];
+        for block_internal in [false, true] {
+            let target = ArgDef {
+                type_name: "scope_target".to_string(),
+                block_internal,
+                ..Default::default()
+            };
+            let url = url_arg(block_internal, &[]);
+            for h in names {
+                let err = validate_arg("t", &target, h).unwrap_err().to_string();
+                assert_eq!(
+                    err,
+                    format!("validation error: argument 't' target {MSG}"),
+                    "{h}"
+                );
+                let err = validate_arg("u", &url, &format!("http://{h}/x"))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!("validation error: argument 'u' target {MSG}"),
+                    "{h}"
+                );
+                let err = validate_arg("u", &url, &format!("https://{h}:8443/"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(MSG), "{h}: {err}");
+            }
+        }
+        // A public name that merely contains a listed word is not on the list.
+        let open = make_arg("scope_target");
+        for h in [
+            "localhost.com",
+            "internal.example.com",
+            "local.example.com",
+            "corp.example.com",
+        ] {
+            assert!(validate_arg("t", &open, h).is_ok(), "{h}");
+        }
+    }
+
+    #[test]
+    fn test_embedded_ip_literal_in_hostname() {
+        let open = make_arg("scope_target");
+        let blocking = blocking_arg();
+        // Link-local spelled into a wildcard-DNS name: refused without the policy.
+        let err = validate_arg("t", &open, "169.254.169.254.nip.io")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        let err = validate_arg(
+            "u",
+            &url_arg(false, &[]),
+            "http://169.254.169.254.nip.io/latest/meta-data/",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        // Loopback / private spelled dotted or dashed: refused with the policy
+        // and open without it, exactly like the literal they spell.
+        for h in [
+            "127.0.0.1.nip.io",
+            "10-0-0-1.nip.io",
+            "192-168-1-1.sslip.io",
+            "0.0.0.0.nip.io",
+            "100-64-0-1.nip.io",
+        ] {
+            let err = validate_arg("t", &blocking, h).unwrap_err().to_string();
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{h}: {err}"
+            );
+            let err = validate_arg("u", &url_arg(true, &[]), &format!("http://{h}:8080/"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{h}: {err}"
+            );
+            assert!(validate_arg("t", &open, h).is_ok(), "{h}");
+        }
+        // A public embedded address is not refused for its shape; it is taken
+        // as the address the name spells, so no lookup is needed.
+        for h in [
+            "93-184-216-34.example.com",
+            "93.184.216.34.nip.io",
+            "8-8-8-8.sslip.io",
+        ] {
+            assert!(validate_arg("t", &blocking, h).is_ok(), "{h}");
+            assert!(
+                validate_arg("u", &url_arg(true, &[]), &format!("https://{h}/")).is_ok(),
+                "{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scope_target_and_cidr_overlap_policy() {
+        let blocking = blocking_arg();
+        let block_cidr = ArgDef {
+            type_name: "cidr".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        for def in [&blocking, &block_cidr] {
+            // The supernet from the review: public base, contains 10.0.0.0/8.
+            let err = validate_arg("t", def, "8.0.0.0/5").unwrap_err().to_string();
+            assert!(
+                err.contains("overlaps 10.0.0.0/8") && err.contains("block_internal"),
+                "{err}"
+            );
+            let err = validate_arg("t", def, "10.0.0.0/24")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("overlaps 10.0.0.0/8"), "{err}");
+            assert!(validate_arg("t", def, "93.184.216.0/24").is_ok());
+            // IPv6 CIDRs are values of both types.
+            let err = validate_arg("t", def, "2001:db8::/32")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("overlaps 2001:db8::/32"), "{err}");
+            assert!(validate_arg("t", def, "2606:4700::/32").is_ok());
+            assert!(validate_arg("t", def, "2000::/3").is_err()); // holds 2001:db8::/32
+                                                                  // The whole address space is always blocked (it holds link-local).
+            assert!(validate_arg("t", def, "0.0.0.0/0").is_err());
+            assert!(validate_arg("t", def, "::/0").is_err());
+        }
+        // Without the policy only the always-blocked tier is tested — still
+        // by overlap.
+        for def in [make_arg("scope_target"), make_arg("cidr")] {
+            assert!(validate_arg("t", &def, "8.0.0.0/5").is_ok());
+            assert!(validate_arg("t", &def, "2001:db8::/32").is_ok());
+            let err = validate_arg("t", &def, "169.0.0.0/8")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("overlaps 169.254.0.0/16") && err.contains("always blocked"),
+                "{err}"
+            );
+            let err = validate_arg("t", &def, "0.0.0.0/0")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("always blocked"), "{err}");
+            let err = validate_arg("t", &def, "fe00::/7").unwrap_err().to_string();
+            assert!(err.contains("overlaps fe80::/10"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_ipv6_cidr_is_framed_strictly() {
+        // Base must be canonical IPv6 and the prefix plain decimal 0-128; a
+        // malformed range is "not a CIDR", so it fails the slash rule.
+        let open = make_arg("scope_target");
+        assert!(validate_arg("t", &open, "2606:4700::/32").is_ok());
+        for v in [
+            "2606:4700::/129",
+            "2606:4700::/032",
+            "2606:4700::/+32",
+            "2606:4700::/",
+            "2606:4700:/32",
+            "2606:4700::/32/",
+            "10.0.0.0/33",
+            "10.0.0.0/024",
+        ] {
+            let err = validate_arg("t", &open, v).unwrap_err().to_string();
+            assert!(err.contains("'/'"), "{v}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_block_internal_resolution_fails_closed() {
+        // RFC 2606 reserves `.invalid`; the name never resolves. This is the
+        // one lookup the suite performs and it exercises the refusal path.
+        const HOST: &str = "no-such-host.invalid";
+        let err = validate_arg("t", &blocking_arg(), HOST)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("validation error: argument 't' could not resolve host '{HOST}' to verify it is public (block_internal)")
+        );
+        let err = validate_arg("u", &url_arg(true, &[]), &format!("https://{HOST}/path"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("validation error: argument 'u' could not resolve host '{HOST}' to verify it is public (block_internal)")
+        );
+        // Without the policy no resolution is attempted: the name is accepted
+        // on structure alone.
+        assert!(validate_arg("t", &make_arg("scope_target"), HOST).is_ok());
+        assert!(validate_arg("u", &make_arg("url"), &format!("https://{HOST}/path")).is_ok());
     }
 }

@@ -551,7 +551,12 @@ describe("validateArg - url: host policy", () => {
     assert.throws(() => validateArg(def, "http://0.0.0.0/"), BLOCKED_BY_POLICY);
     assert.throws(() => validateArg(def, "http://198.18.0.1/"), BLOCKED_BY_POLICY);
     assert.equal(validateArg(def, "https://93.184.216.34/x"), "https://93.184.216.34/x");
-    assert.equal(validateArg(def, "https://example.com/"), "https://example.com/");
+    // A hostname can only be shown public by resolving it; the sync path
+    // refuses rather than guess (wave D).
+    assert.throws(
+      () => validateArg(def, "https://example.com/"),
+      /hostname cannot be verified without DNS resolution; pass an IP literal or use validateArgAsync/
+    );
   });
 
   it("block_internal is opt-in: loopback passes without it", () => {
@@ -896,7 +901,7 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
   it("a url-typed argument carrying a secret reference is rejected before any expansion", async () => {
     const m = {
       tool: { name: "h", description: "http" },
-      args: { target: { type: "url", required: true } },
+      args: { target: { type: "url", required: true, block_internal: true } },
       http: { method: "GET", url: "{target}" },
     };
     await assert.rejects(executeHttp(m, { target: SMUGGLED }, { dryRun: true }), /Injection detected/);

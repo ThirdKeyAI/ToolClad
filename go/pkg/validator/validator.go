@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -456,12 +457,26 @@ func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 		return value, nil
 	}
 
-	// CIDR ranges: the policy is applied to the base address.
+	// CIDR ranges: the policy is tested for overlap with every blocked
+	// range, so a supernet cannot carry a blocked range past the check.
 	if prefix, ok := parseCanonicalCIDR(value); ok {
-		if err := enforceIPPolicy(def.Name, prefix.Addr(), def.BlockInternal); err != nil {
+		if err := enforceCIDRPolicy(def.Name, prefix, def.BlockInternal); err != nil {
 			return "", err
 		}
 		return value, nil
+	}
+
+	// Name-side policy, in order: the internal-name denylist (always), an
+	// IP literal embedded in the leading labels (range policy on that
+	// address), the non-canonical literal rule, the structural hostname
+	// check, and finally resolution under block_internal.
+	if err := enforceInternalName(def.Name, value); err != nil {
+		return "", err
+	}
+	if addr, ok := embeddedIPLiteral(value); ok {
+		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+			return "", err
+		}
 	}
 
 	// A non-canonical IP-literal encoding must not slip through as a
@@ -473,6 +488,11 @@ func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 
 	if !isValidHostname(value) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid scope target: %q (must be a valid IP, CIDR, or hostname)", value))
+	}
+	if def.BlockInternal {
+		if err := enforceResolvedPolicy(def.Name, value); err != nil {
+			return "", err
+		}
 	}
 	return value, nil
 }
@@ -546,7 +566,10 @@ func validateURL(def *manifest.ArgDef, value string) (string, error) {
 		}
 	}
 
-	// Host policy: punycode, canonical-literal rule, range table.
+	// Host policy: punycode, then a literal goes through the range table
+	// directly; a name goes through the internal-name denylist, the
+	// embedded-literal rule, the non-canonical literal rule, the structural
+	// check and, under block_internal, resolution of every answer.
 	if hasPunycodeLabel(host) {
 		return "", newErr(def.Name, "URL host must not contain punycode (xn--) labels")
 	}
@@ -554,10 +577,26 @@ func validateURL(def *manifest.ArgDef, value string) (string, error) {
 		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
 			return "", err
 		}
-	} else if looksLikeIPLiteral(host) {
-		return "", newErr(def.Name, fmt.Sprintf("URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname: %q", host))
-	} else if !isValidHostname(host) {
-		return "", newErr(def.Name, fmt.Sprintf("URL host is not a valid hostname or IP literal: %q", host))
+	} else {
+		if err := enforceInternalName(def.Name, host); err != nil {
+			return "", err
+		}
+		if addr, ok := embeddedIPLiteral(host); ok {
+			if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+				return "", err
+			}
+		}
+		if looksLikeIPLiteral(host) {
+			return "", newErr(def.Name, fmt.Sprintf("URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname: %q", host))
+		}
+		if !isValidHostname(host) {
+			return "", newErr(def.Name, fmt.Sprintf("URL host is not a valid hostname or IP literal: %q", host))
+		}
+		if def.BlockInternal {
+			if err := enforceResolvedPolicy(def.Name, host); err != nil {
+				return "", err
+			}
+		}
 	}
 
 	// SCOPE HOOK: when def.ScopeCheck is set, the scope checker will be
@@ -649,7 +688,7 @@ func validateCIDR(def *manifest.ArgDef, value string) (string, error) {
 	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("invalid CIDR: %q", value))
 	}
-	if err := enforceIPPolicy(def.Name, prefix.Addr(), def.BlockInternal); err != nil {
+	if err := enforceCIDRPolicy(def.Name, prefix, def.BlockInternal); err != nil {
 		return "", err
 	}
 	return value, nil
@@ -771,4 +810,34 @@ func ValidateArgWithCustomTypesMode(def *manifest.ArgDef, value string, customTy
 		synthetic.MaxFloat = ct.MaxFloat
 	}
 	return ValidateArgMode(&synthetic, value, execMode)
+}
+
+// ValidateManifestWithCustomTypes checks a loaded manifest against the
+// custom type table the CLI will read from toolclad.toml: every argument
+// type must be a built-in or a custom type with a built-in base, and the
+// egress lint is run with the custom types visible, so a custom type whose
+// base is a network target is refused in an egress manifest (a custom type
+// cannot carry block_internal). LoadManifest already runs the lint for the
+// built-in types; this is the entry point to call once custom types are
+// available.
+func ValidateManifestWithCustomTypes(m *manifest.Manifest, customTypes map[string]*manifest.CustomTypeDef) error {
+	names := make([]string, 0, len(m.Args))
+	for name := range m.Args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		def := m.Args[name]
+		if _, ok := typeHandlers[def.Type]; ok {
+			continue
+		}
+		ct, ok := customTypes[def.Type]
+		if !ok {
+			return fmt.Errorf("argument '%s' has unknown type '%s'", name, def.Type)
+		}
+		if _, ok := typeHandlers[ct.Base]; !ok {
+			return fmt.Errorf("argument '%s': custom type '%s' has invalid base type '%s'", name, def.Type, ct.Base)
+		}
+	}
+	return m.LintEgress(customTypes)
 }

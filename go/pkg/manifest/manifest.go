@@ -68,8 +68,9 @@ type ToolMeta struct {
 	// Mode is advisory: "oneshot", "session", or "browser". When absent it
 	// is derived at load from which backend section is present.
 	Mode string `toml:"mode"`
-	// NetworkEgress declares that the tool reaches the network. Registered
-	// as a known key; the egress lint is not implemented here.
+	// NetworkEgress declares that the tool reaches a network destination
+	// taken from its arguments. It makes the manifest an egress manifest
+	// for LintEgress regardless of which binary the command names.
 	NetworkEgress bool `toml:"network_egress"`
 	// AllowInterpreter permits argv[0] to be a shell or language
 	// interpreter. Registered as a known key; the denylist is not
@@ -491,7 +492,14 @@ func (m *Manifest) EnsureCompiled() error {
 	if m.compiled {
 		return nil
 	}
-	return m.compileCommand(false)
+	if err := m.compileCommand(false); err != nil {
+		return err
+	}
+	if err := m.LintEgress(nil); err != nil {
+		return err
+	}
+	m.compiled = true
+	return nil
 }
 
 // compileCommand turns the [command] section into its canonical exec form:
@@ -583,9 +591,146 @@ func (m *Manifest) compileCommand(warn bool) error {
 			return err
 		}
 	}
-
-	m.compiled = true
 	return nil
+}
+
+// egressBinaries are the basenames of tools that connect to a network
+// destination derived from their arguments — the ones for which an
+// unconstrained network-typed argument is an SSRF surface. The list is
+// shared verbatim across the ToolClad runtimes; extend it in all of them or
+// in none.
+var egressBinaries = map[string]bool{
+	"curl":    true,
+	"wget":    true,
+	"nmap":    true,
+	"nc":      true,
+	"ncat":    true,
+	"netcat":  true,
+	"masscan": true,
+	"telnet":  true,
+	"ssh":     true,
+	"ping":    true,
+	"fping":   true,
+	"httpie":  true,
+	"http":    true,
+	"wfuzz":   true,
+	"ffuf":    true,
+	"hydra":   true,
+	"nikto":   true,
+}
+
+// networkTargetTypes are the argument types that name a network
+// destination and therefore carry block_internal.
+var networkTargetTypes = map[string]bool{
+	"scope_target": true,
+	"url":          true,
+	"ip_address":   true,
+	"cidr":         true,
+}
+
+// commandBasename returns the lower-cased final path element of a command
+// token, so /usr/bin/curl, ./curl and CURL all compare as curl.
+func commandBasename(s string) string {
+	if i := strings.LastIndexAny(s, `/\`); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.ToLower(s)
+}
+
+// IsNetworkEgress reports whether the manifest is an egress manifest: it
+// declares network_egress = true, dispatches through [http] or [browser],
+// or names a known egress binary in tool.binary, exec[0] or the first token
+// of the legacy template.
+//
+// An executor-only manifest runs a script this check cannot see into, so it
+// is an egress manifest only through network_egress = true, [http] or
+// [browser]. That escape hatch is the author's responsibility: a wrapper
+// around curl must declare network_egress = true itself.
+func (m *Manifest) IsNetworkEgress() bool {
+	if m.Tool.NetworkEgress || m.Http != nil || m.Browser != nil {
+		return true
+	}
+	var names []string
+	if m.Tool.Binary != "" {
+		names = append(names, commandBasename(m.Tool.Binary))
+	}
+	if len(m.Command.Exec) > 0 {
+		names = append(names, commandBasename(m.Command.Exec[0]))
+	}
+	if first := strings.Fields(m.Command.Template); len(first) > 0 {
+		names = append(names, commandBasename(first[0]))
+	}
+	for _, n := range names {
+		if egressBinaries[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// LintEgress is the egress safety lint: a tool that connects to a network
+// target must default-deny internal / SSRF addresses. For an egress
+// manifest (IsNetworkEgress) every argument of a network target type must
+// set block_internal = true, and an argument of a custom type whose base is
+// a network target type is refused outright, because a custom type cannot
+// carry block_internal. customTypes may be nil when the caller has none
+// loaded; the built-in checks still run. Arguments are visited in name
+// order so the reported failure is stable.
+func (m *Manifest) LintEgress(customTypes map[string]*CustomTypeDef) error {
+	if !m.IsNetworkEgress() {
+		return nil
+	}
+	all := m.allArgDefs()
+	names := make([]string, 0, len(all))
+	for name := range all {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		def := all[name]
+		if networkTargetTypes[def.Type] {
+			if !def.BlockInternal {
+				return fmt.Errorf(
+					"argument '%s' is a network target for an egress binary but block_internal is not set; "+
+						"set block_internal = true to default-deny internal/SSRF targets", name)
+			}
+			continue
+		}
+		if ct, ok := customTypes[def.Type]; ok && networkTargetTypes[ct.Base] {
+			return fmt.Errorf(
+				"argument '%s' uses custom type '%s' as a network target; "+
+					"custom types cannot carry block_internal — use the built-in %s type",
+				name, def.Type, ct.Base)
+		}
+	}
+	return nil
+}
+
+// allArgDefs returns every argument definition the manifest declares, keyed by
+// name: top-level [args] by their own name, and the arguments of each
+// [session.commands.<c>] and [browser.commands.<c>] by their key path. A
+// [browser] manifest's real network targets live under its commands, so a
+// lint that only looked at top-level [args] would be hollow for it.
+func (m *Manifest) allArgDefs() map[string]*ArgDef {
+	out := make(map[string]*ArgDef, len(m.Args))
+	for name, def := range m.Args {
+		out[name] = def
+	}
+	if m.Session != nil {
+		for cname, cmd := range m.Session.Commands {
+			for aname, def := range cmd.Args {
+				out["session.commands."+cname+".args."+aname] = def
+			}
+		}
+	}
+	if m.Browser != nil {
+		for cname, cmd := range m.Browser.Commands {
+			for aname, def := range cmd.Args {
+				out["browser.commands."+cname+".args."+aname] = def
+			}
+		}
+	}
+	return out
 }
 
 // unknownKeys walks the raw document against the Manifest struct type and
@@ -787,6 +932,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	if err := m.compileCommand(true); err != nil {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
+	m.compiled = true
 
 	// Cross-section validation. Callback dispatch is for validator-only
 	// embeddings; no backend or [output] block is required.
@@ -812,6 +958,13 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 				path,
 			)
 		}
+	}
+
+	// Egress safety lint (built-in types; the CLI re-runs it with custom
+	// types through validator.ValidateManifestWithCustomTypes once it loads
+	// toolclad.toml).
+	if err := m.LintEgress(nil); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 
 	m.SourcePath = path

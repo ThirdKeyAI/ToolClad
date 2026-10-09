@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1037,6 +1038,7 @@ human_approval = false
 position = 1
 required = true
 type = "url"
+block_internal = true
 
 [browser.state]
 fields = ["url", "title"]
@@ -1198,5 +1200,167 @@ format = "text"
 		if strings.Count(err.Error(), w) != 1 {
 			t.Errorf("want %q exactly once in: %v", w, err)
 		}
+	}
+}
+
+// D5: the egress lint. A manifest that reaches the network — by naming an
+// egress binary, by declaring network_egress, or by dispatching through
+// [http] or [browser] — must set block_internal on every network-typed
+// argument.
+func TestEgressLint(t *testing.T) {
+	const want = "argument 'target' is a network target for an egress binary but block_internal is not set; " +
+		"set block_internal = true to default-deny internal/SSRF targets"
+	body := func(tool, args, backend string) string {
+		return "[tool]\nname = \"t\"\n" + tool + "\n\n[args.target]\nposition = 1\nrequired = true\n" + args +
+			"\n\n" + backend + "\n\n[output]\nformat = \"text\"\n"
+	}
+	cases := []struct {
+		name     string
+		manifest string
+		refused  bool
+	}{
+		{"curl template without flag", body(``, `type = "scope_target"`, "[command]\ntemplate = \"curl {target}\""), true},
+		{"nmap exec without flag", body(``, `type = "scope_target"`, "[command]\nexec = [\"nmap\", \"{target}\"]"), true},
+		{"nmap exec with flag", body(``, "type = \"scope_target\"\nblock_internal = true", "[command]\nexec = [\"nmap\", \"{target}\"]"), false},
+		{"tool.binary path basename", body(`binary = "/usr/bin/curl"`, `type = "url"`, "[command]\nexec = [\"fetch\", \"{target}\"]"), true},
+		{"exec[0] path basename", body(``, `type = "url"`, "[command]\nexec = [\"/opt/bin/WGET\", \"{target}\"]"), true},
+		{"quoted template first token", body(``, `type = "url"`, "[command]\ntemplate = \"'curl' {target}\""), true},
+		{"network_egress on unlisted binary", body(`network_egress = true`, `type = "ip_address"`, "[command]\nexec = [\"scanner\", \"{target}\"]"), true},
+		{"network_egress with flag", body(`network_egress = true`, "type = \"cidr\"\nblock_internal = true", "[command]\nexec = [\"scanner\", \"{target}\"]"), false},
+		{"http backend url arg", body(``, `type = "url"`, "[http]\nmethod = \"GET\"\nurl = \"{target}\""), true},
+		{"http backend with flag", body(``, "type = \"url\"\nblock_internal = true", "[http]\nmethod = \"GET\"\nurl = \"{target}\""), false},
+		{"browser backend", body(``, `type = "url"`, "[browser]\nengine = \"chromium\""), true},
+		{"non-egress whois", body(``, `type = "scope_target"`, "[command]\nexec = [\"whois\", \"{target}\"]"), false},
+		{"non-egress binary string arg", body(`binary = "curl"`, `type = "string"`, "[command]\nexec = [\"curl\", \"{target}\"]"), false},
+		{"executor only is not inspected", body(``, `type = "scope_target"`, "[command]\nexecutor = \"scripts/curl-wrapper.sh\""), false},
+		{"executor with network_egress", body(`network_egress = true`, `type = "scope_target"`, "[command]\nexecutor = \"scripts/curl-wrapper.sh\""), true},
+		{"mcp backend is not egress", body(``, `type = "scope_target"`, "[mcp]\nserver = \"mcp://example.com\"\ntool = \"scan\""), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LoadManifest(writeTmp(t, c.manifest))
+			if !c.refused {
+				if err != nil {
+					t.Fatalf("must load: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("want %q, got %v", want, err)
+			}
+		})
+	}
+}
+
+// The lint reports the first offending argument in name order and names
+// each of the four network types.
+func TestEgressLintCoversEveryNetworkType(t *testing.T) {
+	for _, typ := range []string{"scope_target", "url", "ip_address", "cidr"} {
+		m := &Manifest{
+			Tool: ToolMeta{Name: "t"},
+			Args: map[string]*ArgDef{
+				"zeta":  {Name: "zeta", Type: typ},
+				"alpha": {Name: "alpha", Type: typ},
+				"port":  {Name: "port", Type: "port"},
+			},
+			Command: CommandDef{Exec: []string{"nmap", "{alpha}", "{zeta}"}},
+		}
+		err := m.LintEgress(nil)
+		if err == nil || !strings.HasPrefix(err.Error(), "argument 'alpha' is a network target") {
+			t.Errorf("%s: want alpha reported first, got %v", typ, err)
+		}
+		m.Args["alpha"].BlockInternal = true
+		if err := m.LintEgress(nil); err == nil || !strings.HasPrefix(err.Error(), "argument 'zeta'") {
+			t.Errorf("%s: want zeta reported next, got %v", typ, err)
+		}
+		m.Args["zeta"].BlockInternal = true
+		if err := m.LintEgress(nil); err != nil {
+			t.Errorf("%s: all flagged must pass: %v", typ, err)
+		}
+	}
+}
+
+// Manifests built in memory get the lint through EnsureCompiled, and a
+// failed lint leaves the manifest uncompiled so a retry is not skipped.
+func TestEgressLintInEnsureCompiled(t *testing.T) {
+	m := &Manifest{
+		Tool:    ToolMeta{Name: "t"},
+		Args:    map[string]*ArgDef{"target": {Name: "target", Type: "scope_target"}},
+		Command: CommandDef{Template: "nmap -sV {target}"},
+	}
+	err := m.EnsureCompiled()
+	if err == nil || !strings.Contains(err.Error(), "block_internal is not set") {
+		t.Fatalf("want lint failure, got %v", err)
+	}
+	if err := m.EnsureCompiled(); err == nil {
+		t.Fatal("a second EnsureCompiled must not skip the failed lint")
+	}
+	m.Args["target"].BlockInternal = true
+	if err := m.EnsureCompiled(); err != nil {
+		t.Fatalf("flagged manifest must compile: %v", err)
+	}
+	if !m.compiled || len(m.Command.Exec) != 3 {
+		t.Errorf("manifest not compiled: compiled=%v exec=%v", m.compiled, m.Command.Exec)
+	}
+}
+
+func TestIsNetworkEgress(t *testing.T) {
+	cases := []struct {
+		name string
+		m    Manifest
+		want bool
+	}{
+		{"plain", Manifest{Command: CommandDef{Exec: []string{"whois"}}}, false},
+		{"flag", Manifest{Tool: ToolMeta{NetworkEgress: true}}, true},
+		{"http", Manifest{Http: &HttpDef{}}, true},
+		{"browser", Manifest{Browser: &BrowserDef{}}, true},
+		{"mcp", Manifest{Mcp: &McpProxyDef{}}, false},
+		{"session", Manifest{Session: &SessionDef{}}, false},
+		{"binary", Manifest{Tool: ToolMeta{Binary: "nikto"}}, true},
+		{"binary windows path", Manifest{Tool: ToolMeta{Binary: `C:\tools\Hydra`}}, true},
+		{"binary suffixed", Manifest{Tool: ToolMeta{Binary: "curl.exe"}}, false},
+		{"binary unix path", Manifest{Tool: ToolMeta{Binary: "/usr/local/bin/ffuf"}}, true},
+		{"exec", Manifest{Command: CommandDef{Exec: []string{"ncat", "-z"}}}, true},
+		{"template", Manifest{Command: CommandDef{Template: "  ping -c 1 {target}"}}, true},
+		{"template later token", Manifest{Command: CommandDef{Template: "timeout 5 curl {target}"}}, false},
+		{"executor", Manifest{Command: CommandDef{Executor: "scripts/curl.sh"}}, false},
+		{"curl-like name", Manifest{Command: CommandDef{Exec: []string{"curlish"}}}, false},
+	}
+	for _, c := range cases {
+		if got := c.m.IsNetworkEgress(); got != c.want {
+			t.Errorf("%s: IsNetworkEgress = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestEgressLintCoversNestedCommandArgs(t *testing.T) {
+	base := `
+[tool]
+name = "b"
+version = "1.0.0"
+binary = "chrome"
+description = "x"
+
+[browser]
+
+[browser.commands.navigate]
+description = "go"
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+%s
+description = "u"
+
+[output]
+format = "json"
+`
+	_, err := LoadManifest(writeTmp(t, fmt.Sprintf(base, "")))
+	if err == nil || !strings.Contains(err.Error(), "browser.commands.navigate.args.url") {
+		t.Fatalf("expected nested browser arg to be linted, got %v", err)
+	}
+	if _, err := LoadManifest(writeTmp(t, fmt.Sprintf(base, "block_internal = true"))); err != nil {
+		t.Fatalf("flagged nested arg should load: %v", err)
 	}
 }

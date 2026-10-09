@@ -7,6 +7,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from toolclad.hostpolicy import (
+    enforce_cidr_policy,
+    enforce_hostname_policy,
     enforce_ip_policy,
     has_punycode_label,
     looks_like_ip_literal,
@@ -14,7 +16,7 @@ from toolclad.hostpolicy import (
     parse_canonical_ip,
     tld_not_all_numeric,
 )
-from toolclad.manifest import ArgDef
+from toolclad.manifest import NETWORK_TARGET_TYPES, ArgDef
 
 # Shell metacharacters that indicate injection attempts.
 SHELL_METACHARACTERS = set(";|&$`(){}[]<>!\n\r")
@@ -206,9 +208,11 @@ def _validate_enum(arg_def: ArgDef, value: str) -> str:
 # ---------------------------------------------------------------------------
 # Network-typed values: scope_target, url, ip_address, cidr
 #
-# Every literal address goes through ``toolclad.hostpolicy`` — the range
-# table, the canonical-literal parsers and the punycode rule — so the policy
-# can be compared side by side with the other runtimes.
+# Every literal address, CIDR range and hostname goes through
+# ``toolclad.hostpolicy`` — the range table, the overlap test for ranges, the
+# canonical-literal parsers, the punycode rule, the internal-name denylist,
+# the embedded-literal rule and DNS resolution under ``block_internal`` — so
+# the policy can be compared side by side with the other runtimes.
 # ---------------------------------------------------------------------------
 
 def _is_valid_hostname(value: str) -> bool:
@@ -298,12 +302,11 @@ def _validate_scope_target(arg_def: ArgDef, value: str) -> str:
         enforce_ip_policy(arg_def.name, ip, arg_def.block_internal)
         return value
 
-    # CIDR ranges: the policy is applied to the base address as written.
-    # Testing the whole range for overlap with each blocked prefix is a
-    # later wave.
+    # CIDR ranges: the whole range is tested for overlap with each blocked
+    # prefix, so a supernet of a blocked range is refused too.
     cidr = parse_canonical_cidr(value)
     if cidr is not None:
-        enforce_ip_policy(arg_def.name, cidr[0], arg_def.block_internal)
+        enforce_cidr_policy(arg_def.name, cidr[0], cidr[1], arg_def.block_internal)
         return value
 
     # A non-canonical IP-literal encoding must not slip through as a
@@ -320,9 +323,11 @@ def _validate_scope_target(arg_def: ArgDef, value: str) -> str:
             f"Invalid scope target: {value!r} "
             "(must be a valid IP, CIDR, or hostname)"
         )
-    # Hostname strengthening (internal-suffix denylist, embedded IP
-    # literals, DNS resolution under block_internal) plugs in here in a
-    # later wave, via toolclad.hostpolicy.
+    # The structural check above has already refused the trailing-dot form,
+    # so the name policy compares exactly what a resolver would see: the
+    # internal-name denylist, an embedded IP literal, then DNS resolution
+    # under block_internal.
+    enforce_hostname_policy(arg_def.name, value, arg_def.block_internal)
     return value
 
 
@@ -460,9 +465,10 @@ def _validate_url(arg_def: ArgDef, value: str) -> str:
             raise ValidationError(
                 f"URL host is not a valid hostname or IP literal: {host!r}"
             )
-        # Hostname strengthening (internal-suffix denylist, embedded IP
-        # literals, DNS resolution under block_internal) plugs in here in a
-        # later wave, via toolclad.hostpolicy.
+        # Trailing dot already refused above; the name policy (internal-name
+        # denylist, embedded IP literal, DNS resolution under block_internal)
+        # sees the host exactly as the fetcher would.
+        enforce_hostname_policy(arg_def.name, host, arg_def.block_internal)
 
     # Step 8 — SCOPE HOOK: when arg_def.scope_check is set, the scope checker
     # (a later wave) is consulted here with `host`. Not implemented yet; the
@@ -497,9 +503,9 @@ def _validate_cidr(arg_def: ArgDef, value: str) -> str:
     parsed = parse_canonical_cidr(value)
     if parsed is None:
         raise ValidationError(f"Invalid CIDR: {value!r}")
-    # The policy applies to the base address as written. Testing the whole
-    # range for overlap with each blocked prefix is a later wave.
-    enforce_ip_policy(arg_def.name, parsed[0], arg_def.block_internal)
+    # The whole range is tested for overlap with each blocked prefix, not
+    # just the base address as written.
+    enforce_cidr_policy(arg_def.name, parsed[0], parsed[1], arg_def.block_internal)
     return value
 
 
@@ -637,6 +643,11 @@ def validate_arg_with_custom_types_mode(
     If the arg type matches a custom type, create a synthetic ArgDef
     from the custom type and delegate to the base type validator. The
     custom type's ``pattern`` is anchored exactly like a built-in one.
+
+    A custom type whose base is a network target type (``scope_target``,
+    ``url``, ``ip_address``, ``cidr``) is refused outright: the synthetic
+    definition cannot carry ``block_internal``, so the author's flag would
+    be silently dropped. Network targets use the built-in types.
     """
     from toolclad.manifest import CustomTypeDef  # avoid circular import  # noqa: F811
 
@@ -644,6 +655,12 @@ def validate_arg_with_custom_types_mode(
         custom = custom_types[arg_def.type]
         if custom.base not in _TYPE_HANDLERS:
             raise ValidationError(f"Custom type '{arg_def.type}' has invalid base type '{custom.base}'")
+        if custom.base in NETWORK_TARGET_TYPES:
+            raise ValidationError(
+                f"argument '{arg_def.name}' uses custom type '{arg_def.type}' as a "
+                f"network target; custom types cannot carry block_internal — use "
+                f"the built-in {custom.base} type"
+            )
 
         # Create synthetic ArgDef with custom type constraints merged
         synthetic = ArgDef(

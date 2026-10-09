@@ -312,7 +312,9 @@ class TestUrlHostPolicy:
     def test_public_literal_accepted_under_block_internal(self):
         assert validate_arg(_arg("url", block_internal=True), "https://93.184.216.34/x") == "https://93.184.216.34/x"
         assert validate_arg(_arg("url", block_internal=True), "https://8.8.8.8:853/")
-        assert validate_arg(_arg("url", block_internal=True), "https://example.com/")
+        # A name under block_internal is resolved (test_hardening_w4); with
+        # the policy off no lookup happens and the name is accepted as is.
+        assert validate_arg(_arg("url"), "https://example.com/")
 
     def test_punycode_host_rejected(self):
         _rejects(_arg("url"), "https://xn--example-9c.com/", "punycode")
@@ -392,8 +394,11 @@ class TestScopeTargetPolicy:
         assert validate_arg(_arg("scope_target"), value) == value
 
     def test_block_internal_admits_public(self):
-        for value in ("93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946", "example.com", "::ffff:93.184.216.34"):
+        for value in ("93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946", "::ffff:93.184.216.34"):
             assert validate_arg(_arg("scope_target", block_internal=True), value) == value
+        # A name under block_internal is resolved (test_hardening_w4); with
+        # the policy off no lookup happens and the name is accepted as is.
+        assert validate_arg(_arg("scope_target"), "example.com") == "example.com"
 
     @pytest.mark.parametrize("value", ["169.254.169.254", "169.254.0.1", "::ffff:169.254.169.254", "fe80::1", "febf::1"])
     def test_link_local_always_blocked(self, value):
@@ -427,7 +432,9 @@ class TestScopeTargetPolicy:
         _rejects(_arg("scope_target"), "fe80::1%eth0", "Invalid scope target")
 
     def test_canonical_literals_still_accepted(self):
-        for value in ("93.184.216.34", "::ffff:93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "0.0.0.0/0"):
+        # A /0 range now fails the overlap test (it contains link-local
+        # space, test_hardening_w4); a /1 that does not is still canonical.
+        for value in ("93.184.216.34", "::ffff:93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "0.0.0.0/1"):
             assert validate_arg(_arg("scope_target"), value) == value
 
 
@@ -460,7 +467,9 @@ class TestCidrPolicy:
                       "10.0.0/8", "010.0.0.0/8", "::1/129", "fe80::1%eth0/64", "not/a/cidr"):
             _rejects(_arg("cidr"), value, "Invalid CIDR")
         assert validate_arg(_arg("cidr"), "10.0.0.0/8") == "10.0.0.0/8"
-        assert validate_arg(_arg("cidr"), "0.0.0.0/0") == "0.0.0.0/0"
+        # 0.0.0.0/0 is canonical but overlaps link-local space, so it is
+        # refused by the policy (test_hardening_w4); 0.0.0.0/1 is not.
+        assert validate_arg(_arg("cidr"), "0.0.0.0/1") == "0.0.0.0/1"
         assert validate_arg(_arg("cidr"), "2001:db8::/32") == "2001:db8::/32"
 
     def test_policy_on_base_address(self):

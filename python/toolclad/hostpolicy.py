@@ -27,16 +27,28 @@ has already passed the canonical-form check, because on its own it accepts
 shapes this policy must not: a zone id (``fe80::1%eth0``), an integer, and
 host bits in a network when ``strict=False``.
 
-The remaining hostname rules (internal-suffix denylist, embedded IP
-literals, CIDR overlap, DNS resolution under ``block_internal``) plug into
-this module in a later wave.
+A CIDR value is tested for **overlap** with every blocked prefix
+(``enforce_cidr_policy``), not just its base address, so a supernet such as
+``8.0.0.0/5`` is refused for containing ``10.0.0.0/8``.
+
+The hostname rules (``enforce_hostname_policy``) close the ways a target can
+reach a blocked address without being written as a literal:
+
+* the internal-name denylist (``localhost``, ``*.local``, ``*.internal``,
+  ...) is applied unconditionally;
+* an IP literal embedded in a name (``127.0.0.1.nip.io``, ``10-0-0-1.nip.io``)
+  is treated as that address, so wildcard-DNS services are not a bypass;
+* under ``block_internal`` a name is resolved and **every** answer is put
+  through the range table; a name that cannot be resolved cannot be shown
+  to be public and is refused.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import re
-from typing import NamedTuple, Optional, Sequence, Tuple, Union
+import socket
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
@@ -158,6 +170,213 @@ def enforce_ip_policy(name: str, ip: IPAddress, block_internal: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CIDR ranges: overlap with every blocked prefix
+# ---------------------------------------------------------------------------
+
+def _mapped_v6(entry: BlockedRange) -> BlockedRange:
+    """The IPv4-mapped IPv6 image of an IPv4 blocked range: ``a.b.c.d/n``
+    becomes ``::ffff:a.b.c.d/(96+n)``. An IPv6 prefix that covers mapped
+    IPv4 space (``::ffff:10.0.0.0/104``, or anything shorter than /96 that
+    contains ``::ffff:0:0/96``) is tested against these images, so the
+    IPv4 table cannot be reached through its IPv6 spelling."""
+    mapped = ipaddress.IPv6Network(
+        (ipaddress.IPv6Address(f"::ffff:{entry.net.network_address}"), 96 + entry.net.prefixlen)
+    )
+    return BlockedRange(mapped, entry.reason)
+
+
+_ALWAYS_BLOCKED_V6_RANGES: Tuple[BlockedRange, ...] = ALWAYS_BLOCKED_V6 + tuple(
+    _mapped_v6(e) for e in ALWAYS_BLOCKED_V4
+)
+_BLOCK_INTERNAL_V6_RANGES: Tuple[BlockedRange, ...] = BLOCK_INTERNAL_V6 + tuple(
+    _mapped_v6(e) for e in BLOCK_INTERNAL_V4
+)
+
+
+def _first_overlap(table: Sequence[BlockedRange], net: IPNetwork) -> Optional[str]:
+    """The reason of the first table entry that overlaps ``net``. Two
+    prefixes overlap when either contains the other's network address,
+    which is exactly ``ipaddress``'s ``overlaps``."""
+    for entry in table:
+        if entry.net.overlaps(net):
+            return entry.reason
+    return None
+
+
+def always_blocked_cidr_reason(net: IPNetwork) -> Optional[str]:
+    """Reason if any address in ``net`` is blocked regardless of policy."""
+    if isinstance(net, ipaddress.IPv4Network):
+        return _first_overlap(ALWAYS_BLOCKED_V4, net)
+    return _first_overlap(_ALWAYS_BLOCKED_V6_RANGES, net)
+
+
+def non_public_cidr_reason(net: IPNetwork) -> Optional[str]:
+    """Reason if any address in ``net`` falls in a range the opt-in
+    ``block_internal`` policy blocks."""
+    if isinstance(net, ipaddress.IPv4Network):
+        return _first_overlap(BLOCK_INTERNAL_V4, net)
+    return _first_overlap(_BLOCK_INTERNAL_V6_RANGES, net)
+
+
+def enforce_cidr_policy(
+    name: str, base: IPAddress, prefix_len: int, block_internal: bool
+) -> None:
+    """Enforce the egress policy for a CIDR target on behalf of argument
+    ``name``. The whole range is tested for overlap with each blocked
+    prefix, not just the base address: ``8.0.0.0/5`` has a public base and
+    contains all of ``10.0.0.0/8``. Host bits in ``base`` are masked off
+    first (the value is still passed through as written). ``0.0.0.0/0``
+    and ``::/0`` therefore always fail, since they contain link-local
+    space. Raises ``ValidationError``."""
+    # Deferred: toolclad.validator imports this module at load.
+    from toolclad.validator import ValidationError
+
+    net = ipaddress.ip_network((base, prefix_len), strict=False)
+    reason = always_blocked_cidr_reason(net)
+    if reason is not None:
+        raise ValidationError(f"argument '{name}' target {reason}")
+    if block_internal:
+        reason = non_public_cidr_reason(net)
+        if reason is not None:
+            raise ValidationError(
+                f"argument '{name}' target {reason} (blocked by block_internal policy)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Hostnames: internal-name denylist, embedded IP literals, DNS resolution
+# ---------------------------------------------------------------------------
+
+# Names that can only ever mean "this machine or this network". Compared
+# case-insensitively, after one trailing dot is dropped. ``*.internal``
+# already covers the GCE metadata name; it is listed exactly as well so the
+# table reads the same as the other runtimes.
+INTERNAL_NAMES: Tuple[str, ...] = ("localhost", "metadata.google.internal")
+INTERNAL_NAME_SUFFIXES: Tuple[str, ...] = (
+    ".localhost", ".local", ".internal", ".home.arpa", ".lan", ".intranet",
+    ".corp", ".private",
+)
+INTERNAL_NAME_REASON = "resolves to an internal name — always blocked"
+
+# A dashed quad as used by wildcard-DNS services: four groups of 1-3 digits
+# separated by ``-``. The 0-255 bound is checked after the match.
+_DASHED_QUAD_RE = re.compile(r"[0-9]{1,3}(?:-[0-9]{1,3}){3}")
+
+
+def internal_name_reason(host: str) -> Optional[str]:
+    """Reason if ``host`` is on the internal-name denylist: exactly
+    ``localhost`` or ``metadata.google.internal``, or any name under
+    ``.localhost``, ``.local``, ``.internal``, ``.home.arpa``, ``.lan``,
+    ``.intranet``, ``.corp`` or ``.private``. Applied with or without
+    ``block_internal``: such a name never denotes a public host, whatever
+    it resolves to. Case-insensitive; one trailing dot is ignored (the
+    validators refuse the trailing-dot form before calling this, so the
+    strip only matters to a direct caller)."""
+    normalized = host.lower()
+    if normalized.endswith("."):
+        normalized = normalized[:-1]
+    if normalized in INTERNAL_NAMES or normalized.endswith(INTERNAL_NAME_SUFFIXES):
+        return INTERNAL_NAME_REASON
+    return None
+
+
+def embedded_ip_literal(host: str) -> Optional[ipaddress.IPv4Address]:
+    """The IPv4 address a wildcard-DNS name spells, if any: the first four
+    dot-separated labels as a canonical dotted quad (``127.0.0.1.nip.io``),
+    or the first label as a dashed quad (``10-0-0-1.nip.io``). Services such
+    as nip.io, sslip.io and xip.io resolve these names to exactly that
+    address, so the range policy must see the address, not the name. A name
+    whose shape does not match returns ``None``."""
+    labels = host.split(".")
+    if len(labels) >= 4:
+        dotted = _parse_canonical_ipv4(".".join(labels[:4]))
+        if dotted is not None:
+            return dotted
+    first = labels[0]
+    if _DASHED_QUAD_RE.fullmatch(first) is not None:
+        groups = [int(g) for g in first.split("-")]
+        if all(g <= 255 for g in groups):
+            return ipaddress.IPv4Address(".".join(str(g) for g in groups))
+    return None
+
+
+def resolve_host_addresses(host: str) -> List[IPAddress]:
+    """Every A/AAAA answer the system resolver returns for ``host``, in
+    answer order and de-duplicated, via ``socket.getaddrinfo(host, None)``.
+    An IPv6 zone id is dropped. Raises ``OSError`` (``socket.gaierror`` is
+    a subclass) when the name does not resolve; the caller fails closed.
+    Module-level so an embedding can substitute its own resolver."""
+    answers: List[IPAddress] = []
+    for _family, _socktype, _proto, _canonical, sockaddr in socket.getaddrinfo(host, None):
+        text = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(text)
+        except ValueError:
+            continue
+        if ip not in answers:
+            answers.append(ip)
+    return answers
+
+
+def enforce_resolved_host_policy(name: str, host: str) -> None:
+    """Resolve ``host`` and put **every** answer through the range table on
+    behalf of argument ``name`` (``block_internal`` is implied: this is only
+    called under it). A resolver error or an empty answer set is a refusal,
+    not a pass: a name that cannot be resolved cannot be shown to be public.
+    This is the control that closes DNS rebinding and attacker-controlled
+    domains that point at internal space. Raises ``ValidationError``."""
+    # Deferred: toolclad.validator imports this module at load.
+    from toolclad.validator import ValidationError
+
+    try:
+        answers = resolve_host_addresses(host)
+    except OSError:
+        answers = []
+    if not answers:
+        raise ValidationError(
+            f"argument '{name}' could not resolve host '{host}' to verify it is "
+            "public (block_internal)"
+        )
+    # Resolution seam. The addresses verified here are not necessarily the
+    # addresses the tool connects to: the binary resolves the name again
+    # when it runs, and a rebinding resolver can answer differently the
+    # second time. A runtime that wants to close that window should pin the
+    # verified address into the invocation (``curl --resolve host:443:ip``,
+    # or hand nmap the literal) instead of passing the name through. That
+    # pinning is a runtime concern and is not done here.
+    for ip in answers:
+        enforce_ip_policy(name, ip, True)
+
+
+def enforce_hostname_policy(name: str, host: str, block_internal: bool) -> None:
+    """The hostname half of the policy, for a structurally valid name that
+    is not an IP literal, on behalf of argument ``name``. In order:
+
+    1. the internal-name denylist, unconditionally;
+    2. an embedded IP literal is treated as that address under the range
+       policy — a blocked address is refused with the normal policy
+       message, an allowed one is accepted as is (the shape alone is never
+       a refusal, and no resolution is attempted for it);
+    3. under ``block_internal``, the name is resolved and every answer is
+       checked; resolution failure is a refusal.
+
+    Raises ``ValidationError``.
+    """
+    # Deferred: toolclad.validator imports this module at load.
+    from toolclad.validator import ValidationError
+
+    reason = internal_name_reason(host)
+    if reason is not None:
+        raise ValidationError(f"argument '{name}' target {reason}")
+    embedded = embedded_ip_literal(host)
+    if embedded is not None:
+        enforce_ip_policy(name, embedded, block_internal)
+        return
+    if block_internal:
+        enforce_resolved_host_policy(name, host)
+
+
+# ---------------------------------------------------------------------------
 # Canonical-form parsers that sit in front of the policy
 # ---------------------------------------------------------------------------
 
@@ -219,7 +438,8 @@ def parse_canonical_cidr(val: str) -> Optional[Tuple[IPAddress, int]]:
     ``parse_canonical_ip``) followed by ``/`` and a decimal prefix length in
     range for that address family. Returns ``(base_address, prefix_len)``
     with the base address exactly as written (host bits are permitted, as in
-    the other runtimes); the policy is applied to that base address."""
+    the other runtimes); ``enforce_cidr_policy`` masks them off and tests the
+    whole range for overlap with each blocked prefix."""
     base_text, sep, prefix_text = val.partition("/")
     if not sep:
         return None

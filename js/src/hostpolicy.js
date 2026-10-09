@@ -174,24 +174,50 @@ export function parseCidr(str) {
 }
 
 /**
+ * True if `a` and `b` (same family) agree on their first `prefix` bits.
+ * IPv4 compares the 32-bit integers (a prefix of 0 is special-cased because
+ * `>>> 32` is a no-op shift); IPv6 compares whole 16-bit groups and then the
+ * masked remainder of the boundary group.
+ */
+function sharePrefix(a, b, prefix) {
+  if (a.family === 4) {
+    if (prefix === 0) return true;
+    return ((a.addr ^ b.addr) >>> (32 - prefix)) === 0;
+  }
+  const full = prefix >> 4;
+  for (let i = 0; i < full; i++) {
+    if (a.groups[i] !== b.groups[i]) return false;
+  }
+  const rem = prefix & 15;
+  if (rem === 0) return true;
+  const mask = (0xffff << (16 - rem)) & 0xffff;
+  return (a.groups[full] & mask) === (b.groups[full] & mask);
+}
+
+/**
  * True if `ip` lies inside the range `{ip: base, prefix}`. Families must
  * match; an IPv4-mapped IPv6 address is unwrapped by the caller, not here.
  */
 export function ipInRange(ip, range) {
   if (ip.family !== range.ip.family) return false;
-  const prefix = range.prefix;
-  if (ip.family === 4) {
-    if (prefix === 0) return true;
-    return ((ip.addr ^ range.ip.addr) >>> (32 - prefix)) === 0;
-  }
-  const full = prefix >> 4;
-  for (let i = 0; i < full; i++) {
-    if (ip.groups[i] !== range.ip.groups[i]) return false;
-  }
-  const rem = prefix & 15;
-  if (rem === 0) return true;
-  const mask = (0xffff << (16 - rem)) & 0xffff;
-  return (ip.groups[full] & mask) === (range.ip.groups[full] & mask);
+  return sharePrefix(ip, range.ip, range.prefix);
+}
+
+/**
+ * True if two prefixes share at least one address. Masking both network
+ * addresses to the shorter of the two prefix lengths and comparing is the
+ * same test as "either range contains the other's network address": the
+ * wider range contains the narrower one entirely or not at all. This is
+ * what makes `8.0.0.0/5` fail against `10.0.0.0/8` even though its base
+ * address is public. Families must match; an IPv4-mapped IPv6 range is
+ * projected onto IPv4 by the caller (see toIpv4MappedPrefix).
+ * @param {{ip: object, prefix: number}} a
+ * @param {{ip: object, prefix: number}} b
+ * @returns {boolean}
+ */
+export function prefixesOverlap(a, b) {
+  if (a.ip.family !== b.ip.family) return false;
+  return sharePrefix(a.ip, b.ip, Math.min(a.prefix, b.prefix));
 }
 
 /**
@@ -206,6 +232,27 @@ export function toIpv4Mapped(ip) {
     return { family: 4, addr: ((g[6] << 16) | g[7]) >>> 0 };
   }
   return null;
+}
+
+/** The IPv4-mapped block `::ffff:0:0/96` as a parsed address. */
+const IPV4_MAPPED_BLOCK = Object.freeze({ family: 6, groups: [0, 0, 0, 0, 0, 0xffff, 0, 0] });
+
+/**
+ * The IPv4 range an IPv4-mapped IPv6 range covers, or the range itself when
+ * it is already IPv4. A prefix of /96 or longer on a mapped base is the same
+ * prefix minus 96 (`::ffff:127.0.0.0/104` is `127.0.0.0/8`); a shorter
+ * prefix that contains the whole mapped block covers every IPv4 address and
+ * is `0.0.0.0/0`. Null for any other IPv6 range.
+ * @param {{ip: object, prefix: number}} cidr
+ * @returns {{ip: {family: 4, addr: number}, prefix: number} | null}
+ */
+export function toIpv4MappedPrefix(cidr) {
+  if (cidr.ip.family === 4) return cidr;
+  if (cidr.prefix >= 96) {
+    const v4 = toIpv4Mapped(cidr.ip);
+    return v4 === null ? null : { ip: v4, prefix: cidr.prefix - 96 };
+  }
+  return ipInRange(IPV4_MAPPED_BLOCK, cidr) ? { ip: { family: 4, addr: 0 }, prefix: 0 } : null;
 }
 
 function compileTable(rows) {
@@ -223,7 +270,7 @@ function compileTable(rows) {
 const ALWAYS_BLOCKED = compileTable(ALWAYS_BLOCKED_RANGES);
 const BLOCK_INTERNAL = compileTable(BLOCK_INTERNAL_RANGES);
 
-function firstMatch(table, ip) {
+function firstIpMatch(table, ip) {
   // IPv4 rows are tested against the unwrapped address, IPv6 rows against the
   // address as given, so a v4-mapped literal is caught by the IPv4 rows.
   const v4 = toIpv4Mapped(ip);
@@ -234,13 +281,25 @@ function firstMatch(table, ip) {
   return null;
 }
 
+function firstCidrMatch(table, cidr) {
+  // Same projection as for literals: IPv4 rows see the mapped IPv4 range,
+  // IPv6 rows see the range as given. A range is matched by overlap, so a
+  // supernet of a blocked row (`8.0.0.0/5` over `10.0.0.0/8`) is caught.
+  const v4 = toIpv4MappedPrefix(cidr);
+  for (const row of table) {
+    const candidate = row.range.ip.family === 4 ? v4 : cidr.ip.family === 6 ? cidr : null;
+    if (candidate !== null && prefixesOverlap(candidate, row.range)) return row.reason;
+  }
+  return null;
+}
+
 /**
  * Reason `ip` must be blocked regardless of policy, or null.
  * @param {object} ip - Parsed address from parseCanonicalIp
  * @returns {string|null}
  */
 export function alwaysBlockedIpReason(ip) {
-  return firstMatch(ALWAYS_BLOCKED, ip);
+  return firstIpMatch(ALWAYS_BLOCKED, ip);
 }
 
 /**
@@ -249,7 +308,45 @@ export function alwaysBlockedIpReason(ip) {
  * @returns {string|null}
  */
 export function nonPublicIpReason(ip) {
-  return firstMatch(BLOCK_INTERNAL, ip);
+  return firstIpMatch(BLOCK_INTERNAL, ip);
+}
+
+/**
+ * Reason the range `cidr` overlaps an always-blocked range, or null.
+ * @param {{ip: object, prefix: number}} cidr - Parsed range from parseCidr
+ * @returns {string|null}
+ */
+export function alwaysBlockedCidrReason(cidr) {
+  return firstCidrMatch(ALWAYS_BLOCKED, cidr);
+}
+
+/**
+ * Reason the range `cidr` overlaps a range that `block_internal` refuses,
+ * or null.
+ * @param {{ip: object, prefix: number}} cidr - Parsed range from parseCidr
+ * @returns {string|null}
+ */
+export function nonPublicCidrReason(cidr) {
+  return firstCidrMatch(BLOCK_INTERNAL, cidr);
+}
+
+/**
+ * The two policy tiers: an always-blocked match is refused unconditionally;
+ * the non-public table is consulted only under `block_internal = true`.
+ * @param {boolean} blockInternal
+ * @param {string|null} always - Always-blocked reason, if any
+ * @param {() => string|null} nonPublic - Non-public reason, computed lazily
+ */
+function enforceTiers(blockInternal, always, nonPublic) {
+  if (always !== null) {
+    throw new Error(`target ${always}`);
+  }
+  if (blockInternal === true) {
+    const reason = nonPublic();
+    if (reason !== null) {
+      throw new Error(`target ${reason} (blocked by block_internal policy)`);
+    }
+  }
 }
 
 /**
@@ -261,16 +358,19 @@ export function nonPublicIpReason(ip) {
  * @throws {Error} with the policy reason
  */
 export function enforceIpPolicy(ip, blockInternal) {
-  const always = alwaysBlockedIpReason(ip);
-  if (always !== null) {
-    throw new Error(`target ${always}`);
-  }
-  if (blockInternal === true) {
-    const reason = nonPublicIpReason(ip);
-    if (reason !== null) {
-      throw new Error(`target ${reason} (blocked by block_internal policy)`);
-    }
-  }
+  enforceTiers(blockInternal, alwaysBlockedIpReason(ip), () => nonPublicIpReason(ip));
+}
+
+/**
+ * Enforce the egress policy for a target range. The range is tested for
+ * overlap with every blocked range, not just at its base address: a target
+ * that contains any blocked address is refused with that range's reason.
+ * @param {{ip: object, prefix: number}} cidr - Parsed range from parseCidr
+ * @param {boolean} blockInternal
+ * @throws {Error} with the policy reason
+ */
+export function enforceCidrPolicy(cidr, blockInternal) {
+  enforceTiers(blockInternal, alwaysBlockedCidrReason(cidr), () => nonPublicCidrReason(cidr));
 }
 
 /**
@@ -297,4 +397,83 @@ export function hasPunycodeLabel(host) {
   return host
     .split(".")
     .some((label) => label.length >= 4 && label.slice(0, 4).toLowerCase() === "xn--");
+}
+
+/**
+ * Names that are always internal, compared exactly (after lowercasing and
+ * dropping one trailing dot). `metadata.google.internal` is listed on its own
+ * even though `.internal` already covers it, so the policy reads the same as
+ * in the other runtimes.
+ */
+export const INTERNAL_NAMES = Object.freeze(["localhost", "metadata.google.internal"]);
+
+/**
+ * Suffixes that place a host in the local machine or a site-internal
+ * namespace: `.localhost` (RFC 6761), mDNS `.local` (RFC 6762), `.home.arpa`
+ * (RFC 8375), and the common private-namespace suffixes `.internal`, `.lan`,
+ * `.intranet`, `.corp`, `.private`. A name under any of them is refused for
+ * every target, with or without `block_internal`, before any resolution.
+ */
+export const INTERNAL_NAME_SUFFIXES = Object.freeze([
+  ".localhost",
+  ".local",
+  ".internal",
+  ".home.arpa",
+  ".lan",
+  ".intranet",
+  ".corp",
+  ".private",
+]);
+
+/**
+ * Reason `host` is an internal name that is always refused, or null. The
+ * comparison is case-insensitive and ignores one trailing dot (the FQDN root
+ * label) where the type still admits one at this point.
+ * @param {string} host
+ * @returns {string|null}
+ */
+export function internalNameReason(host) {
+  let h = host.toLowerCase();
+  if (h.endsWith(".")) h = h.slice(0, -1);
+  if (INTERNAL_NAMES.includes(h) || INTERNAL_NAME_SUFFIXES.some((suffix) => h.endsWith(suffix))) {
+    return "resolves to an internal name — always blocked";
+  }
+  return null;
+}
+
+/** Four 1-3 digit groups joined by `-`: the dashed quad wildcard DNS accepts. */
+const DASHED_QUAD_RE = /^([0-9]{1,3})-([0-9]{1,3})-([0-9]{1,3})-([0-9]{1,3})$/;
+
+/**
+ * The IPv4 address an "embedded literal" hostname spells, or null. Wildcard
+ * DNS services (nip.io, sslip.io, xip.io) answer `<a>.<b>.<c>.<d>.<zone>`
+ * and `<a>-<b>-<c>-<d>.<zone>` with the address written in the name, so a
+ * string check for a hostname shape is a one-step bypass of the literal
+ * policy. Two shapes are recognized:
+ *
+ * - the first four dot-separated labels form a canonical dotted quad
+ *   (`127.0.0.1.nip.io`, `169.254.169.254.xip.io`);
+ * - the first label is a dashed quad of four 1-3 digit groups each 0-255
+ *   (`10-0-0-1.nip.io`).
+ *
+ * The caller applies the range policy to the result. An address the policy
+ * allows does not make the hostname invalid (`93-184-216-34.example.com`
+ * continues as an ordinary hostname).
+ * @param {string} host
+ * @returns {{family: 4, addr: number} | null}
+ */
+export function embeddedIpv4Literal(host) {
+  const labels = host.split(".");
+  if (labels.length >= 4) {
+    const v4 = parseIpv4(labels.slice(0, 4).join("."));
+    if (v4 !== null) return { family: 4, addr: v4 };
+  }
+  const m = DASHED_QUAD_RE.exec(labels[0]);
+  if (m !== null) {
+    const octets = m.slice(1, 5).map(Number);
+    if (octets.every((octet) => octet <= 255)) {
+      return { family: 4, addr: octets.reduce((acc, octet) => acc * 256 + octet, 0) >>> 0 };
+    }
+  }
+  return null;
 }

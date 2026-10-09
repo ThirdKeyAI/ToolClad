@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import TOML from "@iarna/toml";
-import { compileCommand } from "./executor.js";
+import { compileCommand, lintNetworkEgress } from "./executor.js";
 
 /**
  * Complete manifest key allowlist, one entry per section, in the order of the
@@ -291,6 +291,31 @@ export function loadManifestWithOptions(path, options = {}) {
     compileCommand(manifest);
   }
 
+  // Egress lint on every load. compileCommand already applied it to a
+  // [command] manifest; an [http] / [browser] manifest may have no [command]
+  // at all and is an egress manifest by definition.
+  lintNetworkEgress(manifest);
+
+  return manifest;
+}
+
+/**
+ * Manifest checks that need the custom type map, run after loading: the
+ * egress lint with custom types resolved, so an egress manifest whose
+ * network target is declared through a custom type is refused (a custom
+ * type definition cannot carry `block_internal`). The check is unconditional
+ * once the custom types are available; `loadManifest` cannot run it because
+ * the CLI does not load `toolclad.toml` yet.
+ *
+ * @param {object} manifest - A loaded or in-memory manifest
+ * @param {object} customTypes - Map from loadCustomTypes
+ * @returns {object} The same manifest
+ */
+export function validateManifestWithCustomTypes(manifest, customTypes) {
+  if (manifest.command) {
+    compileCommand(manifest);
+  }
+  lintNetworkEgress(manifest, customTypes || {});
   return manifest;
 }
 

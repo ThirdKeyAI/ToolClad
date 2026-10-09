@@ -101,6 +101,7 @@ description = "go"
 {command}
 [browser.commands.navigate.args.url]
 type = "url"
+block_internal = true
 {arg}
 [output]
 format = "json"

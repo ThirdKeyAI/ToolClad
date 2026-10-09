@@ -22,12 +22,26 @@
 //! `0177.0.0.1`, `127.1`) must be refused outright rather than passed through
 //! as a "hostname" the table never sees.
 //!
-//! The remaining hostname rules (internal-suffix denylist, embedded IP
-//! literals, CIDR overlap, DNS resolution under `block_internal`) plug into
-//! this module in a later wave.
+//! The hostname and range rules build on the table:
+//!
+//! * [`is_internal_name`] — the internal-name denylist (`localhost`,
+//!   `*.local`, `*.internal`, ...), applied with or without `block_internal`.
+//! * [`embedded_ip_literal`] — a dotted or dashed quad at the front of a
+//!   hostname (`127.0.0.1.nip.io`, `10-0-0-1.nip.io`); wildcard-DNS services
+//!   resolve such names to the address they spell, so the host is treated as
+//!   that address.
+//! * [`enforce_cidr_policy`] — a CIDR value is tested for *overlap* with every
+//!   blocked range, not just its base address, so a supernet such as
+//!   `8.0.0.0/5` cannot smuggle `10.0.0.0/8` past the table.
+//! * [`enforce_resolved_host_policy`] — under `block_internal` a name is
+//!   resolved and every A/AAAA answer is tested; a name that cannot be
+//!   resolved cannot be shown to be public and is refused.
+//!
+//! [`enforce_hostname_policy`] runs those in order for a structurally valid
+//! hostname and is the single entry point the validators call.
 
 use crate::types::ToolCladError;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 /// One blocked IPv4 prefix and the reason reported when a target falls in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,24 +209,164 @@ pub const BLOCK_INTERNAL_V6: &[BlockedRange6] = &[
     ),
 ];
 
-/// True if `ip` lies inside the range (prefix match on the leading bits).
-pub fn v4_in_range(ip: Ipv4Addr, range: &BlockedRange4) -> bool {
-    let mask: u32 = if range.prefix == 0 {
+/// Network mask for an IPv4 prefix length (`/0` is all zeros).
+fn v4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
         0
     } else {
-        u32::MAX << (32 - u32::from(range.prefix.min(32)))
-    };
-    (u32::from(ip) & mask) == (u32::from(range.net) & mask)
+        u32::MAX << (32 - u32::from(prefix.min(32)))
+    }
+}
+
+/// Network mask for an IPv6 prefix length (`/0` is all zeros).
+fn v6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix.min(128)))
+    }
+}
+
+/// True if the prefixes `a/ap` and `b/bp` share any address. Two prefixes
+/// overlap exactly when one contains the other's network address, which is
+/// the same as agreeing on the leading bits up to the *shorter* of the two
+/// prefix lengths.
+pub fn v4_overlaps(a: Ipv4Addr, ap: u8, b: Ipv4Addr, bp: u8) -> bool {
+    let mask = v4_mask(ap.min(bp));
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
+/// IPv6 counterpart of [`v4_overlaps`].
+pub fn v6_overlaps(a: Ipv6Addr, ap: u8, b: Ipv6Addr, bp: u8) -> bool {
+    let mask = v6_mask(ap.min(bp));
+    (u128::from(a) & mask) == (u128::from(b) & mask)
+}
+
+/// True if `ip` lies inside the range (prefix match on the leading bits).
+pub fn v4_in_range(ip: Ipv4Addr, range: &BlockedRange4) -> bool {
+    v4_overlaps(ip, 32, range.net, range.prefix)
 }
 
 /// True if `ip` lies inside the range (prefix match on the leading bits).
 pub fn v6_in_range(ip: Ipv6Addr, range: &BlockedRange6) -> bool {
-    let mask: u128 = if range.prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - u32::from(range.prefix.min(128)))
+    v6_overlaps(ip, 128, range.net, range.prefix)
+}
+
+/// A parsed CIDR prefix (`addr/prefix`). `std` has no prefix type, so this
+/// is the minimal one the policy needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpNet {
+    pub addr: IpAddr,
+    pub prefix: u8,
+}
+
+impl std::fmt::Display for IpNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+/// Parse strict CIDR notation: a canonical IP literal (dotted-quad IPv4 or
+/// standard IPv6, as accepted by [`parse_canonical_ip`]), one `/`, and a
+/// prefix length written in plain decimal with no sign and no leading zero,
+/// at most 32 for IPv4 and 128 for IPv6. Anything else — a shorthand or hex
+/// base, `/+24`, `/024`, a bracketed IPv6 — is not a CIDR.
+pub fn parse_cidr(val: &str) -> Option<IpNet> {
+    let (base, prefix) = val.split_once('/')?;
+    let addr = parse_canonical_ip(base)?;
+    let plain_decimal = !prefix.is_empty()
+        && prefix.len() <= 3
+        && prefix.bytes().all(|b| b.is_ascii_digit())
+        && (prefix == "0" || !prefix.starts_with('0'));
+    if !plain_decimal {
+        return None;
+    }
+    let prefix: u8 = prefix.parse().ok()?;
+    let max = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
     };
-    (u128::from(ip) & mask) == (u128::from(range.net) & mask)
+    (prefix <= max).then_some(IpNet { addr, prefix })
+}
+
+/// Overlap of `net` with a blocked IPv4 range. An IPv6 `net` is tested
+/// against the range's IPv4-mapped image (`::ffff:a.b.c.d/(96+p)`), so
+/// `::ffff:10.0.0.0/104` is caught like `10.0.0.0/8`.
+fn net_overlaps_v4_range(net: &IpNet, range: &BlockedRange4) -> bool {
+    match net.addr {
+        IpAddr::V4(a) => v4_overlaps(a, net.prefix, range.net, range.prefix),
+        IpAddr::V6(a) => v6_overlaps(a, net.prefix, range.net.to_ipv6_mapped(), 96 + range.prefix),
+    }
+}
+
+/// Overlap of `net` with a blocked IPv6 range. No IPv6 range in the table
+/// lies inside the IPv4-mapped block, so an IPv4 `net` never overlaps one.
+fn net_overlaps_v6_range(net: &IpNet, range: &BlockedRange6) -> bool {
+    match net.addr {
+        IpAddr::V4(_) => false,
+        IpAddr::V6(a) => v6_overlaps(a, net.prefix, range.net, range.prefix),
+    }
+}
+
+fn v4_range_text(range: &BlockedRange4) -> String {
+    format!("{}/{}", range.net, range.prefix)
+}
+
+fn v6_range_text(range: &BlockedRange6) -> String {
+    format!("{}/{}", range.net, range.prefix)
+}
+
+/// The always-blocked range `net` overlaps, if any, as `(range, reason)`.
+pub fn always_blocked_net_reason(net: &IpNet) -> Option<(String, &'static str)> {
+    ALWAYS_BLOCKED_V4
+        .iter()
+        .find(|r| net_overlaps_v4_range(net, r))
+        .map(|r| (v4_range_text(r), r.reason))
+        .or_else(|| {
+            ALWAYS_BLOCKED_V6
+                .iter()
+                .find(|r| net_overlaps_v6_range(net, r))
+                .map(|r| (v6_range_text(r), r.reason))
+        })
+}
+
+/// The `block_internal` range `net` overlaps, if any, as `(range, reason)`.
+pub fn non_public_net_reason(net: &IpNet) -> Option<(String, &'static str)> {
+    BLOCK_INTERNAL_V4
+        .iter()
+        .find(|r| net_overlaps_v4_range(net, r))
+        .map(|r| (v4_range_text(r), r.reason))
+        .or_else(|| {
+            BLOCK_INTERNAL_V6
+                .iter()
+                .find(|r| net_overlaps_v6_range(net, r))
+                .map(|r| (v6_range_text(r), r.reason))
+        })
+}
+
+/// Enforce the egress policy for a CIDR target on behalf of argument `name`.
+/// The whole range is tested for overlap with each blocked prefix: a range
+/// that contains, is contained in, or is any blocked range is refused, so a
+/// supernet (`8.0.0.0/5` ⊃ `10.0.0.0/8`) or `::/0` cannot pass on the
+/// strength of a public base address.
+pub fn enforce_cidr_policy(
+    name: &str,
+    net: &IpNet,
+    block_internal: bool,
+) -> Result<(), ToolCladError> {
+    if let Some((range, reason)) = always_blocked_net_reason(net) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' target range overlaps {range}, which {reason}"
+        )));
+    }
+    if block_internal {
+        if let Some((range, reason)) = non_public_net_reason(net) {
+            return Err(ToolCladError::ValidationError(format!(
+                "argument '{name}' target range overlaps {range}, which {reason} (blocked by block_internal policy)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The IPv4 view of `ip`: the address itself, or the embedded address of an
@@ -319,6 +473,145 @@ pub fn looks_like_ip_literal(val: &str) -> bool {
 pub fn has_punycode_label(host: &str) -> bool {
     host.split('.')
         .any(|label| label.len() >= 4 && label.as_bytes()[..4].eq_ignore_ascii_case(b"xn--"))
+}
+
+/// Names refused outright, with or without `block_internal`: a host equal to
+/// one of these.
+pub const INTERNAL_NAME_EXACT: &[&str] = &["localhost", "metadata.google.internal"];
+
+/// Names refused outright, with or without `block_internal`: a host ending in
+/// one of these suffixes. `.local` is mDNS, `.internal` / `.home.arpa` /
+/// `.lan` / `.intranet` / `.corp` / `.private` are the conventional private
+/// zones, and `.localhost` is reserved for loopback (RFC 6761).
+pub const INTERNAL_NAME_SUFFIXES: &[&str] = &[
+    ".localhost",
+    ".local",
+    ".internal",
+    ".home.arpa",
+    ".lan",
+    ".intranet",
+    ".corp",
+    ".private",
+];
+
+/// True if `host` is on the internal-name denylist. The comparison is
+/// case-insensitive (DNS is) and ignores one trailing dot (an absolute name
+/// is the same name); the validators' hostname grammar refuses a trailing dot
+/// anyway, so this only matters for callers that use the helper directly.
+pub fn is_internal_name(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    let host = lower.strip_suffix('.').unwrap_or(&lower);
+    INTERNAL_NAME_EXACT.contains(&host) || INTERNAL_NAME_SUFFIXES.iter().any(|s| host.ends_with(s))
+}
+
+/// The IPv4 address a hostname spells at its front, if any:
+///
+/// * the **first four** dot-separated labels form a canonical dotted quad
+///   (`127.0.0.1.nip.io`, `169.254.169.254.xip.io`), or
+/// * the **first label** is a dashed quad of four 1–3 digit groups each in
+///   0–255 (`10-0-0-1.nip.io`).
+///
+/// Wildcard-DNS services resolve such names to exactly that address, which
+/// made them a one-step bypass of a string-only host check. A host with an
+/// embedded literal is treated as that address by the policy; the shape alone
+/// is not a refusal (`93-184-216-34.example.com` is a public address).
+pub fn embedded_ip_literal(host: &str) -> Option<Ipv4Addr> {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() >= 4 {
+        if let Ok(ip) = labels[..4].join(".").parse::<Ipv4Addr>() {
+            return Some(ip);
+        }
+    }
+    let first = labels.first()?;
+    let groups: Vec<&str> = first.split('-').collect();
+    if groups.len() != 4 {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (slot, group) in octets.iter_mut().zip(&groups) {
+        let is_digits =
+            !group.is_empty() && group.len() <= 3 && group.bytes().all(|b| b.is_ascii_digit());
+        if !is_digits {
+            return None;
+        }
+        *slot = group.parse().ok()?;
+    }
+    Some(Ipv4Addr::from(octets))
+}
+
+/// A hostname resolver: the system one, or a stand-in under test. Returns
+/// every address the name maps to, or an error when it maps to none.
+pub type HostResolver = fn(&str) -> std::io::Result<Vec<IpAddr>>;
+
+/// Resolve `host` with the system resolver via `(host, 0).to_socket_addrs()`,
+/// which returns every A and AAAA answer. `std` offers no per-call deadline;
+/// the lookup is bounded by the platform resolver's own timeout and retry
+/// settings (`resolv.conf` `options timeout:` / `attempts:` on Linux).
+pub fn system_resolve(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    Ok((host, 0u16).to_socket_addrs()?.map(|sa| sa.ip()).collect())
+}
+
+/// Under `block_internal`, resolve `host` and apply the full range policy to
+/// **every** answer: one internal address among the answers is a refusal.
+/// This is the control that closes DNS rebinding and attacker-controlled
+/// domains, so a name that cannot be resolved is refused rather than passed
+/// (it cannot be shown to be public).
+///
+/// Resolve-then-reconnect window: the target binary performs its own lookup
+/// after this check and may receive a different answer. A runtime closing
+/// that window should pin the address verified here into the invocation
+/// (for example `curl --resolve host:443:ip`); that pinning is out of scope
+/// for the validator and is the follow-up this seam exists for.
+pub fn enforce_resolved_host_policy(name: &str, host: &str) -> Result<(), ToolCladError> {
+    enforce_resolved_host_policy_with(name, host, system_resolve)
+}
+
+/// [`enforce_resolved_host_policy`] with an explicit resolver, so the
+/// every-answer rule can be tested without live DNS.
+pub fn enforce_resolved_host_policy_with(
+    name: &str,
+    host: &str,
+    resolve: HostResolver,
+) -> Result<(), ToolCladError> {
+    let answers = match resolve(host) {
+        Ok(answers) if !answers.is_empty() => answers,
+        _ => {
+            return Err(ToolCladError::ValidationError(format!(
+                "argument '{name}' could not resolve host '{host}' to verify it is public (block_internal)"
+            )));
+        }
+    };
+    for ip in &answers {
+        enforce_ip_policy(name, ip, true)?;
+    }
+    Ok(())
+}
+
+/// The hostname rules, in order, for a structurally valid hostname (not a
+/// literal — the validators handle literals and CIDRs first):
+///
+/// 1. internal-name denylist — always refused;
+/// 2. embedded IP literal — the host is treated as that address under the
+///    range policy, and if the policy allows it the host is accepted as is;
+/// 3. under `block_internal`, DNS resolution with the range policy applied
+///    to every answer, failing closed when the name does not resolve.
+pub fn enforce_hostname_policy(
+    name: &str,
+    host: &str,
+    block_internal: bool,
+) -> Result<(), ToolCladError> {
+    if is_internal_name(host) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' target resolves to an internal name — always blocked"
+        )));
+    }
+    if let Some(ip) = embedded_ip_literal(host) {
+        return enforce_ip_policy(name, &IpAddr::V4(ip), block_internal);
+    }
+    if block_internal {
+        return enforce_resolved_host_policy(name, host);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,5 +870,365 @@ mod tests {
         for v in ["example.com", "xn-.com", "axn--b.com", "xn.com", ""] {
             assert!(!has_punycode_label(v), "{v}");
         }
+    }
+
+    #[test]
+    fn internal_name_denylist() {
+        for v in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "api.localhost",
+            "a.b.c.localhost",
+            "printer.local",
+            "Printer.LOCAL",
+            "metadata.google.internal",
+            "METADATA.GOOGLE.INTERNAL.",
+            "db.internal",
+            "x.home.arpa",
+            "nas.lan",
+            "wiki.intranet",
+            "fs.corp",
+            "vpn.private",
+        ] {
+            assert!(is_internal_name(v), "{v}");
+        }
+        for v in [
+            "localhost.com",
+            "notlocalhost",
+            "internal.example.com",
+            "example.local.com",
+            "local",
+            "internal",
+            "home.arpa",
+            "corp",
+            "lan",
+            "example.com",
+            "metadata.google.internal.example.com",
+            "localhost..", // only one trailing dot is ignored
+            "",
+        ] {
+            assert!(!is_internal_name(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn embedded_ip_literal_shapes() {
+        let found = |s: &str| embedded_ip_literal(s).map(|ip| ip.to_string());
+        for (host, addr) in [
+            ("127.0.0.1.nip.io", "127.0.0.1"),
+            ("169.254.169.254.xip.io", "169.254.169.254"),
+            ("10-0-0-1.nip.io", "10.0.0.1"),
+            ("93-184-216-34.example.com", "93.184.216.34"),
+            ("010-0-0-1.nip.io", "10.0.0.1"), // dashed groups are 1-3 digits, 0-255
+            ("10-0-0-1", "10.0.0.1"),
+            ("1.2.3.4.5.6", "1.2.3.4"),
+            ("255-255-255-255.x", "255.255.255.255"),
+        ] {
+            assert_eq!(found(host).as_deref(), Some(addr), "{host}");
+        }
+        for v in [
+            "example.com",
+            "nip.io",
+            "127.0.0.nip.io",
+            "010.0.0.1.nip.io", // the dotted form must be canonical
+            "256-0-0-1.nip.io",
+            "1-2-3.nip.io",
+            "1-2-3-4-5.nip.io",
+            "a-b-c-d.nip.io",
+            "1234-0-0-1.nip.io",
+            "-1-2-3.nip.io",
+            "1-2-3-.nip.io",
+            "1.2.3.x.y",
+            "",
+        ] {
+            assert_eq!(found(v), None, "{v}");
+        }
+    }
+
+    #[test]
+    fn cidr_parser_is_strict() {
+        let net = |s: &str| parse_cidr(s).map(|n| n.to_string());
+        for v in [
+            "10.0.0.0/8",
+            "10.0.0.5/24",
+            "0.0.0.0/0",
+            "8.8.8.8/32",
+            "2001:db8::/32",
+            "::/0",
+            "::1/128",
+            "::ffff:10.0.0.0/104",
+        ] {
+            assert_eq!(net(v).as_deref(), Some(v), "{v}");
+        }
+        for v in [
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "2001:db8::/1000",
+            "10.0.0.0/024",
+            "10.0.0.0/+24",
+            "10.0.0.0/-1",
+            "10.0.0.0/0x8",
+            "10.0.0.0/ 8",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0",
+            "10.0.0/8",
+            "0x0a000000/8",
+            "0177.0.0.0/8",
+            "127.1/8",
+            "10.0.0.0/8/",
+            "10.0.0.0/8/24",
+            "[::1]/128",
+            "",
+        ] {
+            assert_eq!(net(v), None, "{v}");
+        }
+    }
+
+    #[test]
+    fn overlap_boundaries_v4() {
+        let o = |a: &str, ap: u8, b: &str, bp: u8| {
+            v4_overlaps(a.parse().unwrap(), ap, b.parse().unwrap(), bp)
+        };
+        // Supernet, subnet, equal, everything.
+        assert!(o("8.0.0.0", 5, "10.0.0.0", 8));
+        assert!(o("10.0.0.0", 8, "8.0.0.0", 5));
+        assert!(o("10.0.0.0", 8, "10.0.0.0", 8));
+        assert!(o("10.1.2.0", 24, "10.0.0.0", 8));
+        assert!(o("0.0.0.0", 0, "10.0.0.0", 8));
+        assert!(o("0.0.0.0", 0, "255.255.255.255", 32));
+        // 8.0.0.0/6 is 8-11 and holds 10/8; 8.0.0.0/7 is 8-9 and does not.
+        assert!(o("8.0.0.0", 6, "10.0.0.0", 8));
+        assert!(!o("8.0.0.0", 7, "10.0.0.0", 8));
+        // One address either side of 10/8, and its first and last address.
+        assert!(!o("9.255.255.255", 32, "10.0.0.0", 8));
+        assert!(o("10.0.0.0", 32, "10.0.0.0", 8));
+        assert!(o("10.255.255.255", 32, "10.0.0.0", 8));
+        assert!(!o("11.0.0.0", 32, "10.0.0.0", 8));
+        assert!(!o("9.0.0.0", 8, "10.0.0.0", 8));
+        assert!(!o("11.0.0.0", 8, "10.0.0.0", 8));
+        // 172.16/12 edges.
+        assert!(!o("172.15.255.255", 32, "172.16.0.0", 12));
+        assert!(o("172.16.0.0", 32, "172.16.0.0", 12));
+        assert!(o("172.31.255.255", 32, "172.16.0.0", 12));
+        assert!(!o("172.32.0.0", 32, "172.16.0.0", 12));
+        assert!(o("172.0.0.0", 8, "172.16.0.0", 12));
+        assert!(!o("172.32.0.0", 11, "172.16.0.0", 12));
+        // Host routes.
+        assert!(o("1.2.3.4", 32, "1.2.3.4", 32));
+        assert!(!o("1.2.3.4", 32, "1.2.3.5", 32));
+        assert!(o("1.2.3.4", 31, "1.2.3.5", 32));
+    }
+
+    #[test]
+    fn overlap_boundaries_v6() {
+        let o = |a: &str, ap: u8, b: &str, bp: u8| {
+            v6_overlaps(a.parse().unwrap(), ap, b.parse().unwrap(), bp)
+        };
+        assert!(o("2001:db8::", 32, "2001:db8:ffff::", 48));
+        assert!(o("2001:db8:ffff::", 48, "2001:db8::", 32));
+        assert!(o("2000::", 3, "2001:db8::", 32));
+        assert!(o("::", 0, "fe80::", 10));
+        assert!(!o("2001:db9::", 32, "2001:db8::", 32));
+        assert!(!o("2001:db7:ffff::", 48, "2001:db8::", 32));
+        assert!(o(
+            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+            128,
+            "2001:db8::",
+            32
+        ));
+        assert!(!o("2001:db9::", 128, "2001:db8::", 32));
+        // fe80::/10 is fe80-febf.
+        assert!(!o("fe7f:ffff::", 32, "fe80::", 10));
+        assert!(o("fe80::", 128, "fe80::", 10));
+        assert!(o("febf:ffff::", 32, "fe80::", 10));
+        assert!(!o("fec0::", 32, "fe80::", 10));
+        assert!(o("fe00::", 7, "fe80::", 10)); // fe00-feff
+        assert!(!o("fe00::", 9, "fe80::", 10)); // fe00-fe7f
+                                                // fc00::/7 is fc00-fdff.
+        assert!(o("fdff::", 16, "fc00::", 7));
+        assert!(!o("fe00::", 16, "fc00::", 7));
+        assert!(!o("fbff::", 16, "fc00::", 7));
+        // Host routes.
+        assert!(o("::1", 128, "::1", 128));
+        assert!(!o("::2", 128, "::1", 128));
+        assert!(o("::", 127, "::1", 128));
+    }
+
+    #[test]
+    fn cidr_policy_tests_overlap_not_base() {
+        let net = |s: &str| parse_cidr(s).unwrap_or_else(|| panic!("bad test cidr {s}"));
+        // The supernet case: a public base address that contains 10.0.0.0/8.
+        let err = enforce_cidr_policy("t", &net("8.0.0.0/5"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overlaps 10.0.0.0/8"), "{err}");
+        assert!(err.contains("blocked by block_internal policy"), "{err}");
+        // It holds no link-local space, so it is open without the policy.
+        assert!(enforce_cidr_policy("t", &net("8.0.0.0/5"), false).is_ok());
+
+        // Anything touching the always-blocked tier is refused in both modes,
+        // including the whole address space and the IPv4-mapped block.
+        for v in [
+            "0.0.0.0/0",
+            "::/0",
+            "169.254.0.0/16",
+            "169.254.169.254/32",
+            "169.0.0.0/8",
+            "::ffff:169.254.0.0/112",
+            "::ffff:0:0/96",
+            "::ffff:0:0/95",
+            "fe80::/10",
+            "fe00::/7",
+        ] {
+            for block_internal in [false, true] {
+                let err = enforce_cidr_policy("t", &net(v), block_internal)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("always blocked"), "{v}: {err}");
+            }
+        }
+
+        // Inside, equal to, or containing a `block_internal` range — v4, v6
+        // and v4-mapped — refused with the policy and open without it.
+        for (v, range) in [
+            ("10.0.0.0/24", "10.0.0.0/8"),
+            ("10.0.0.0/8", "10.0.0.0/8"),
+            ("127.0.0.1/32", "127.0.0.0/8"),
+            ("172.16.0.0/12", "172.16.0.0/12"),
+            ("172.0.0.0/8", "172.16.0.0/12"),
+            ("192.168.1.0/24", "192.168.0.0/16"),
+            ("192.0.0.0/8", "192.168.0.0/16"),
+            ("100.64.0.0/10", "100.64.0.0/10"),
+            ("198.18.0.0/15", "198.18.0.0/15"),
+            ("2001:db8::/32", "2001:db8::/32"),
+            ("2001:db8:1::/48", "2001:db8::/32"),
+            ("2001::/16", "2001:db8::/32"),
+            ("fc00::/7", "fc00::/7"),
+            ("fd00::/8", "fc00::/7"),
+            ("::1/128", "::1/128"),
+            ("::/127", "::1/128"),
+            ("::ffff:10.0.0.0/104", "10.0.0.0/8"),
+            ("::ffff:127.0.0.1/128", "127.0.0.0/8"),
+        ] {
+            let err = enforce_cidr_policy("t", &net(v), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("overlaps {range}")), "{v}: {err}");
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{v}: {err}"
+            );
+            assert!(enforce_cidr_policy("t", &net(v), false).is_ok(), "{v} open");
+        }
+
+        // Public ranges pass in both modes.
+        for v in [
+            "93.184.216.0/24",
+            "8.8.8.0/24",
+            "1.0.0.0/8",
+            "11.0.0.0/8",
+            "172.32.0.0/11",
+            "192.169.0.0/16",
+            "2606:4700::/32",
+            "2a00::/12",
+            "2001:db9::/32",
+            "2001:db7::/32",
+            "::ffff:93.184.216.0/120",
+            "::2/127",
+        ] {
+            assert!(enforce_cidr_policy("t", &net(v), true).is_ok(), "{v}");
+            assert!(enforce_cidr_policy("t", &net(v), false).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn resolved_host_policy_checks_every_answer() {
+        fn all_public(_: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![
+                ip("93.184.216.34"),
+                ip("2606:2800:220:1:248:1893:25c8:1946"),
+            ])
+        }
+        fn one_internal(_: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![ip("93.184.216.34"), ip("10.0.0.1")])
+        }
+        fn metadata(_: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![ip("169.254.169.254")])
+        }
+        fn mapped_loopback(_: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![ip("::ffff:127.0.0.1")])
+        }
+        fn empty(_: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![])
+        }
+        fn failing(_: &str) -> std::io::Result<Vec<IpAddr>> {
+            Err(std::io::Error::other("no such host"))
+        }
+
+        assert!(enforce_resolved_host_policy_with("t", "h.example", all_public).is_ok());
+        let err = enforce_resolved_host_policy_with("t", "h.example", one_internal)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blocked by block_internal policy"), "{err}");
+        let err = enforce_resolved_host_policy_with("t", "h.example", mapped_loopback)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("loopback"), "{err}");
+        let err = enforce_resolved_host_policy_with("t", "h.example", metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        for resolver in [empty as HostResolver, failing] {
+            let err = enforce_resolved_host_policy_with("t", "h.example", resolver)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                "validation error: argument 't' could not resolve host 'h.example' to verify it is public (block_internal)"
+            );
+        }
+    }
+
+    #[test]
+    fn hostname_policy_order() {
+        // The denylist wins in both modes.
+        for block_internal in [false, true] {
+            let err = enforce_hostname_policy("t", "api.localhost", block_internal)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                "validation error: argument 't' target resolves to an internal name — always blocked"
+            );
+        }
+        // An embedded literal is treated as that address: a public one needs
+        // no lookup, an internal one is refused under the policy, link-local
+        // is refused regardless.
+        assert!(enforce_hostname_policy("t", "93-184-216-34.example.com", true).is_ok());
+        assert!(enforce_hostname_policy("t", "93.184.216.34.nip.io", true).is_ok());
+        let err = enforce_hostname_policy("t", "127.0.0.1.nip.io", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("loopback") && err.contains("block_internal"),
+            "{err}"
+        );
+        assert!(enforce_hostname_policy("t", "127.0.0.1.nip.io", false).is_ok());
+        let err = enforce_hostname_policy("t", "169.254.169.254.nip.io", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        // Resolution happens only under the policy. `.invalid` is reserved by
+        // RFC 2606 and never resolves: open without the policy, refused with it.
+        assert!(enforce_hostname_policy("t", "no-such-host.invalid", false).is_ok());
+        let err = enforce_hostname_policy("t", "no-such-host.invalid", true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "validation error: argument 't' could not resolve host 'no-such-host.invalid' to verify it is public (block_internal)"
+        );
     }
 }

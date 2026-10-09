@@ -18,6 +18,7 @@ from toolclad.manifest import (
     find_unknown_keys,
     load_manifest,
     load_manifest_with_options,
+    validate_manifest_with_custom_types,
 )
 from toolclad.validator import (
     ValidationError,
@@ -51,6 +52,7 @@ __all__ = [
     "find_unknown_keys",
     "load_manifest",
     "load_manifest_with_options",
+    "validate_manifest_with_custom_types",
     "ValidationError",
     "validate_arg",
     "validate_arg_mode",

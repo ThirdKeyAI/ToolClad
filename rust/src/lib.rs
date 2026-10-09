@@ -519,6 +519,10 @@ const EGRESS_BINARIES: &[&str] = &[
     "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
 ];
 
+/// Argument types that name a network destination. In an egress manifest each
+/// must set `block_internal = true`.
+const NETWORK_TARGET_TYPES: &[&str] = &["scope_target", "url", "ip_address", "cidr"];
+
 fn command_basename(s: &str) -> String {
     s.rsplit(['/', '\\'])
         .next()
@@ -528,6 +532,13 @@ fn command_basename(s: &str) -> String {
 
 /// True if the manifest's command dispatches one of the known egress binaries
 /// (checked across `tool.binary`, `command.exec[0]`, and `command.template`).
+///
+/// An `executor`-only manifest runs whatever its executor script decides:
+/// `tool.binary` is still checked, but a script that reaches the network
+/// through some other program is invisible here. Such a manifest is an egress
+/// manifest only when its author declares it — `network_egress = true`,
+/// `[http]` or `[browser]` — so the escape hatch is the author's
+/// responsibility.
 fn command_invokes_egress_binary(m: &Manifest) -> bool {
     let mut names: Vec<String> = Vec::new();
     if !m.tool.binary.is_empty() {
@@ -547,8 +558,91 @@ fn command_invokes_egress_binary(m: &Manifest) -> bool {
     names.iter().any(|n| EGRESS_BINARIES.contains(&n.as_str()))
 }
 
-/// Validate internal consistency of a parsed manifest.
+/// True if the manifest reaches the network from its arguments: the author
+/// declared `network_egress = true`, the backend is `[http]` or `[browser]`,
+/// or the command dispatches a known egress binary.
+fn is_egress_manifest(m: &Manifest) -> bool {
+    m.tool.network_egress
+        || m.http.is_some()
+        || m.browser.is_some()
+        || command_invokes_egress_binary(m)
+}
+
+/// Every argument definition in the manifest with the name used to report
+/// it: top-level args by name, session and browser command args by their key
+/// path. Sorted so a refusal names the same argument on every load.
+fn all_arg_defs(m: &Manifest) -> Vec<(String, &types::ArgDef)> {
+    let mut out: Vec<(String, &types::ArgDef)> =
+        m.args.iter().map(|(n, d)| (n.clone(), d)).collect();
+    if let Some(session) = &m.session {
+        for (cmd, def) in &session.commands {
+            for (n, d) in &def.args {
+                out.push((format!("session.commands.{cmd}.args.{n}"), d));
+            }
+        }
+    }
+    if let Some(browser) = &m.browser {
+        for (cmd, def) in &browser.commands {
+            for (n, d) in &def.args {
+                out.push((format!("browser.commands.{cmd}.args.{n}"), d));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Egress safety (TC-15): a tool that connects to a network target must
+/// default-deny internal/SSRF addresses. In an egress manifest every
+/// `scope_target`, `url`, `ip_address` or `cidr` argument must set
+/// `block_internal = true`. A custom type over one of those bases is refused
+/// outright: the custom type cannot carry `block_internal`, and the author
+/// should use the built-in type.
+fn egress_lint(
+    manifest: &Manifest,
+    custom_types: &HashMap<String, CustomTypeDef>,
+) -> Result<(), ToolCladError> {
+    if !is_egress_manifest(manifest) {
+        return Ok(());
+    }
+    for (name, def) in all_arg_defs(manifest) {
+        let type_name = def.type_name.as_str();
+        if NETWORK_TARGET_TYPES.contains(&type_name) {
+            if !def.block_internal {
+                return Err(ToolCladError::ManifestError(format!(
+                    "argument '{name}' is a network target for an egress binary but block_internal is not set; \
+                     set block_internal = true to default-deny internal/SSRF targets"
+                )));
+            }
+        } else if let Some(custom) = custom_types.get(type_name) {
+            if NETWORK_TARGET_TYPES.contains(&custom.base.as_str()) {
+                return Err(ToolCladError::ManifestError(format!(
+                    "argument '{name}' uses custom type '{type_name}' as a network target; \
+                     custom types cannot carry block_internal — use the built-in {} type",
+                    custom.base
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate internal consistency of a parsed manifest with no custom types in
+/// scope: every argument type must be built in.
 fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
+    validate_manifest_with_custom_types(manifest, &HashMap::new())
+}
+
+/// Validate internal consistency of a parsed manifest with the custom types
+/// of a `toolclad.toml` in scope (see [`load_custom_types`]). A custom type
+/// name is accepted wherever a built-in type is, with its base type checked;
+/// the egress lint then also refuses a custom type over a network-target base
+/// in an egress manifest. The loaders call the no-custom-types form; a runtime
+/// that loads custom types calls this after parsing.
+pub fn validate_manifest_with_custom_types(
+    manifest: &Manifest,
+    custom_types: &HashMap<String, CustomTypeDef>,
+) -> Result<(), ToolCladError> {
     // Validate dispatch mode.
     let valid_dispatch = ["exec", "callback"];
     if !valid_dispatch.contains(&manifest.tool.dispatch.as_str()) {
@@ -594,35 +688,29 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
         }
     }
 
-    // Validate argument types and constraints.
+    // Validate argument types and constraints. A custom type stands in for
+    // its base type.
     for (name, def) in &manifest.args {
-        if !validator::SUPPORTED_TYPES.contains(&def.type_name.as_str()) {
-            return Err(ToolCladError::ManifestError(format!(
-                "unknown type '{}' for argument '{}'",
-                def.type_name, name
-            )));
+        let custom = custom_types.get(&def.type_name);
+        let base = custom.map_or(def.type_name.as_str(), |c| c.base.as_str());
+        if !validator::SUPPORTED_TYPES.contains(&base) {
+            return Err(ToolCladError::ManifestError(match custom {
+                Some(c) => format!(
+                    "custom type '{}' has invalid base type '{}'",
+                    def.type_name, c.base
+                ),
+                None => format!("unknown type '{}' for argument '{}'", def.type_name, name),
+            }));
         }
-        if def.type_name == "enum" && def.allowed.is_none() {
+        let has_allowed = def.allowed.is_some() || custom.is_some_and(|c| c.allowed.is_some());
+        if base == "enum" && !has_allowed {
             return Err(ToolCladError::ManifestError(format!(
                 "argument '{name}' is type 'enum' but has no 'allowed' list"
             )));
         }
     }
 
-    // Egress safety: a tool that connects to a network target must default-deny
-    // internal/SSRF addresses. If the command invokes a known network-egress
-    // binary and a scope_target/url arg does not set block_internal, refuse the
-    // manifest. (HTTP/MCP/browser backends are separate egress surfaces.)
-    if command_invokes_egress_binary(manifest) {
-        for (name, def) in &manifest.args {
-            if matches!(def.type_name.as_str(), "scope_target" | "url") && !def.block_internal {
-                return Err(ToolCladError::ManifestError(format!(
-                    "argument '{name}' is a network target for an egress binary but block_internal is not set; \
-                     set block_internal = true to default-deny internal/SSRF targets"
-                )));
-            }
-        }
-    }
+    egress_lint(manifest, custom_types)?;
 
     // Validate that mapping keys reference existing args, and that a mapping
     // over an enum covers every allowed value: a missing case must be a load
@@ -1008,6 +1096,262 @@ format = "text"
         assert!(parse_manifest(whois).is_ok());
     }
 
+    /// A oneshot manifest with one argument, for the egress lint tests.
+    fn egress_manifest(
+        binary: &str,
+        tool_extra: &str,
+        arg_type: &str,
+        arg_extra: &str,
+        backend: &str,
+    ) -> String {
+        format!(
+            r#"
+[tool]
+name = "t"
+version = "1.0.0"
+binary = "{binary}"
+description = "x"
+{tool_extra}
+
+[args.target]
+position = 1
+required = true
+type = "{arg_type}"
+{arg_extra}
+
+{backend}
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    const LINT: &str = "is a network target for an egress binary but block_internal is not set";
+
+    #[test]
+    fn test_egress_lint_trigger_set() {
+        let cmd = |bin: &str| format!("[command]\nexec = [\"{bin}\", \"{{target}}\"]");
+        // nmap, like curl, is on the binary list.
+        let err = parse_manifest(&egress_manifest(
+            "nmap",
+            "",
+            "scope_target",
+            "",
+            &cmd("nmap"),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&egress_manifest(
+            "nmap",
+            "",
+            "scope_target",
+            "block_internal = true",
+            &cmd("nmap")
+        ))
+        .is_ok());
+        // A binary off the list needs the flag once the manifest declares
+        // egress — and not before.
+        assert!(parse_manifest(&egress_manifest(
+            "mytool",
+            "",
+            "scope_target",
+            "",
+            &cmd("mytool")
+        ))
+        .is_ok());
+        let err = parse_manifest(&egress_manifest(
+            "mytool",
+            "network_egress = true",
+            "scope_target",
+            "",
+            &cmd("mytool"),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&egress_manifest(
+            "mytool",
+            "network_egress = true",
+            "scope_target",
+            "block_internal = true",
+            &cmd("mytool")
+        ))
+        .is_ok());
+        // [http] is an egress backend.
+        let http = "[http]\nmethod = \"GET\"\nurl = \"https://api.example.com/\"";
+        let err = parse_manifest(&egress_manifest("none", "", "url", "", http))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&egress_manifest(
+            "none",
+            "",
+            "url",
+            "block_internal = true",
+            http
+        ))
+        .is_ok());
+        // A non-egress binary does not require the flag.
+        assert!(parse_manifest(&egress_manifest(
+            "whois",
+            "",
+            "scope_target",
+            "",
+            &cmd("whois")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn test_egress_lint_covers_every_network_type() {
+        let cmd = "[command]\nexec = [\"curl\", \"{target}\"]";
+        for ty in ["scope_target", "url", "ip_address", "cidr"] {
+            let err = parse_manifest(&egress_manifest("curl", "", ty, "", cmd))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(LINT), "{ty}: {err}");
+            assert!(
+                parse_manifest(&egress_manifest(
+                    "curl",
+                    "",
+                    ty,
+                    "block_internal = true",
+                    cmd
+                ))
+                .is_ok(),
+                "{ty}"
+            );
+        }
+        // A non-network type never needs the flag.
+        assert!(parse_manifest(&egress_manifest("curl", "", "string", "", cmd)).is_ok());
+    }
+
+    #[test]
+    fn test_browser_manifest_is_egress_for_command_args() {
+        let browser = |arg_extra: &str| {
+            format!(
+                r#"
+[tool]
+name = "web"
+version = "1.0.0"
+binary = "chrome"
+description = "x"
+
+[command]
+
+[browser]
+engine = "cdp"
+
+[browser.commands.navigate]
+description = "Navigate"
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+{arg_extra}
+
+[output]
+format = "text"
+"#
+            )
+        };
+        let err = parse_manifest(&browser("")).unwrap_err().to_string();
+        assert!(
+            err.contains("argument 'browser.commands.navigate.args.url' is a network target"),
+            "{err}"
+        );
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&browser("block_internal = true")).is_ok());
+    }
+
+    #[test]
+    fn test_executor_only_manifest_is_egress_only_by_declaration() {
+        // Nothing can inspect what the executor runs, so the lint has no
+        // binary to key on; the author must declare egress.
+        let exec_only = |tool_extra: &str| {
+            egress_manifest(
+                "runner",
+                tool_extra,
+                "scope_target",
+                "",
+                "[command]\nexecutor = \"/opt/runner.sh\"",
+            )
+        };
+        assert!(parse_manifest(&exec_only("")).is_ok());
+        let err = parse_manifest(&exec_only("network_egress = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LINT), "{err}");
+    }
+
+    #[test]
+    fn test_custom_network_type_refused_in_egress_manifest() {
+        let custom = |base: &str| {
+            HashMap::from([(
+                "api_host".to_string(),
+                CustomTypeDef {
+                    base: base.to_string(),
+                    allowed: None,
+                    pattern: None,
+                    min: None,
+                    max: None,
+                    min_float: None,
+                    max_float: None,
+                },
+            )])
+        };
+        let cmd = "[command]\nexec = [\"curl\", \"{target}\"]";
+        let mut m = parse_manifest(&egress_manifest(
+            "curl",
+            "",
+            "url",
+            "block_internal = true",
+            cmd,
+        ))
+        .unwrap();
+        m.args.get_mut("target").unwrap().type_name = "api_host".to_string();
+        // Refused for every network base — even though this arg set
+        // block_internal itself; the refusal is unconditional.
+        for base in ["scope_target", "url", "ip_address", "cidr"] {
+            let err = validate_manifest_with_custom_types(&m, &custom(base))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "manifest error: argument 'target' uses custom type 'api_host' as a network target; \
+                     custom types cannot carry block_internal — use the built-in {base} type"
+                )
+            );
+        }
+        // A custom type over a non-network base is fine in an egress manifest.
+        assert!(validate_manifest_with_custom_types(&m, &custom("string")).is_ok());
+        // Without the custom types in scope the name is simply unknown.
+        let err = validate_manifest_with_custom_types(&m, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown type 'api_host'"), "{err}");
+        // A custom type over an unsupported base is refused.
+        let err = validate_manifest_with_custom_types(&m, &custom("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid base type 'nope'"), "{err}");
+        // Not an egress manifest: a custom network type is permitted.
+        let mut w = parse_manifest(&egress_manifest(
+            "whois",
+            "",
+            "scope_target",
+            "",
+            "[command]\nexec = [\"whois\", \"{target}\"]",
+        ))
+        .unwrap();
+        w.args.get_mut("target").unwrap().type_name = "api_host".to_string();
+        assert!(validate_manifest_with_custom_types(&w, &custom("scope_target")).is_ok());
+    }
+
     #[test]
     fn test_manifest_missing_command() {
         let toml_str = r#"
@@ -1347,6 +1691,7 @@ risk_tier = "low"
 position = 1
 required = true
 type = "url"
+block_internal = true
 description = "URL to navigate to"
 
 [browser.commands.click]
@@ -1967,7 +2312,8 @@ format = "text"
         let m = parse_manifest(&oneshot("", "", command, output)).unwrap();
         assert!(m.command.defaults.unwrap().contains_key("max_byte"));
 
-        let remote = oneshot("", "", "", "")
+        // `[http]` makes this an egress manifest, so the target needs the flag.
+        let remote = oneshot("", "block_internal = true", "", "")
             + "\n[http]\nmethod = \"GET\"\nurl = \"https://example.com/\"\n\
                [http.headers]\nX-Anything = \"1\"\n\n\
                [mcp]\nserver = \"s\"\ntool = \"t\"\n[mcp.field_map]\nwhatever = \"x\"\n";
@@ -2204,6 +2550,7 @@ human_approval = false
 position = 1
 required = true
 type = "url"
+block_internal = true
 description = "URL"
 
 [browser.state]

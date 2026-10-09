@@ -863,6 +863,12 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	if err := checkDeclaredArgs(m, args); err != nil {
 		return nil, err
 	}
+	// Manifests built in memory never passed LoadManifest's egress lint;
+	// run it here so an [http] backend (always egress) and a
+	// network_egress tool get the same block_internal requirement.
+	if err := m.LintEgress(nil); err != nil {
+		return nil, err
+	}
 
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
@@ -963,6 +969,12 @@ func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope
 		return nil, fmt.Errorf("manifest %q has no [mcp] section or mcp.server/mcp.tool", m.Tool.Name)
 	}
 	if err := checkDeclaredArgs(m, args); err != nil {
+		return nil, err
+	}
+	// Manifests built in memory never passed LoadManifest's egress lint;
+	// run it here so an [http] backend (always egress) and a
+	// network_egress tool get the same block_internal requirement.
+	if err := m.LintEgress(nil); err != nil {
 		return nil, err
 	}
 

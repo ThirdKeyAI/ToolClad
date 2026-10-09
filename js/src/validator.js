@@ -1,9 +1,13 @@
 import { existsSync, statSync } from "node:fs";
+import { promises as dns } from "node:dns";
 import {
   parseCanonicalIp,
   parseCidr,
   parseIpv6,
   enforceIpPolicy,
+  enforceCidrPolicy,
+  embeddedIpv4Literal,
+  internalNameReason,
   looksLikeIpLiteral,
   hasPunycodeLabel,
 } from "./hostpolicy.js";
@@ -138,17 +142,102 @@ function runValidation(handler, type, argDef, value, execMode) {
 }
 
 /**
- * Validate an argument value against its declared type definition.
- * Returns the cleaned/coerced value on success, throws on failure.
- *
- * @param {object} argDef - Argument definition from the manifest
- * @param {*} value - The raw value to validate
- * @param {boolean} [execMode=false] - true only when the manifest declared
- *   command.exec directly; enables allow_whitespace. A template compiled to
- *   exec is still template mode (strict).
- * @returns {*} The validated and possibly coerced value
+ * The one step the synchronous validator cannot perform. A hostname under
+ * `block_internal` can only be shown to be public by resolving it and testing
+ * every answer, and Node has no synchronous resolver. Rather than fork the
+ * validator into a sync and an async copy, a type handler returns one of
+ * these in place of the value; the sync entry points refuse it and the async
+ * entry points satisfy it with a bounded `dns.promises.lookup`. Everything
+ * before this point (hygiene, structure, the literal and CIDR policy, the
+ * internal-name denylist, embedded literals) is one implementation that runs
+ * identically on both paths.
  */
-export function validateArgMode(argDef, value, execMode = false) {
+class HostResolution {
+  /**
+   * @param {string} host - The name to resolve
+   * @param {(addresses: object[]) => *} complete - Applies the policy to the
+   *   parsed answers and returns the validated value
+   */
+  constructor(host, complete) {
+    this.host = host;
+    this.complete = complete;
+  }
+}
+
+const UNRESOLVED_HOST_MESSAGE =
+  "hostname cannot be verified without DNS resolution; pass an IP literal or use validateArgAsync";
+
+/** Sync entry points: a pending resolution is a refusal, never a pass. */
+function settleSync(out) {
+  if (out instanceof HostResolution) {
+    throw new Error(UNRESOLVED_HOST_MESSAGE);
+  }
+  return out;
+}
+
+/** Async entry points: a pending resolution is satisfied by a lookup. */
+async function settleAsync(out) {
+  if (out instanceof HostResolution) {
+    return out.complete(await resolveHostAddresses(out.host));
+  }
+  return out;
+}
+
+/** Upper bound on one lookup. A resolver that does not answer cannot show a name is public. */
+const RESOLVE_TIMEOUT_MS = 2000;
+
+function couldNotResolve(host) {
+  return new Error(`could not resolve host '${host}' to verify it is public (block_internal)`);
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`lookup timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Resolve `host` to every A/AAAA answer, each parsed as a canonical literal.
+ * Any failure — a lookup error, the timeout, an empty answer set, an answer
+ * the strict parser does not accept — is a refusal: a name that cannot be
+ * resolved cannot be shown to be public.
+ *
+ * Seam for a follow-up outside this wave: the addresses returned here are
+ * what the policy approved, but the tool will resolve the name again on its
+ * own and may be answered differently (the resolve-then-reconnect window).
+ * A runtime should pin the approved address into the invocation, e.g.
+ * `curl --resolve host:443:ip`, rather than hand the tool the bare name.
+ * @param {string} host
+ * @returns {Promise<object[]>} Parsed addresses from parseCanonicalIp
+ */
+async function resolveHostAddresses(host) {
+  let answers;
+  try {
+    answers = await withTimeout(dns.lookup(host, { all: true }), RESOLVE_TIMEOUT_MS);
+  } catch {
+    throw couldNotResolve(host);
+  }
+  if (!Array.isArray(answers) || answers.length === 0) {
+    throw couldNotResolve(host);
+  }
+  const addresses = [];
+  for (const answer of answers) {
+    const ip = parseCanonicalIp(String(answer && answer.address));
+    if (ip === null) {
+      throw couldNotResolve(host);
+    }
+    addresses.push(ip);
+  }
+  return addresses;
+}
+
+/**
+ * The shared validation pipeline. May return a HostResolution, which the
+ * entry point settles.
+ */
+function validateArgCore(argDef, value, execMode) {
   const type = argDef.type;
 
   const handler = TYPE_HANDLERS[type];
@@ -159,6 +248,25 @@ export function validateArgMode(argDef, value, execMode = false) {
 }
 
 /**
+ * Validate an argument value against its declared type definition.
+ * Returns the cleaned/coerced value on success, throws on failure.
+ *
+ * Synchronous: a `scope_target` or `url` hostname under `block_internal`
+ * cannot be verified without DNS resolution and is refused here; pass an IP
+ * literal or use validateArgAsync.
+ *
+ * @param {object} argDef - Argument definition from the manifest
+ * @param {*} value - The raw value to validate
+ * @param {boolean} [execMode=false] - true only when the manifest declared
+ *   command.exec directly; enables allow_whitespace. A template compiled to
+ *   exec is still template mode (strict).
+ * @returns {*} The validated and possibly coerced value
+ */
+export function validateArgMode(argDef, value, execMode = false) {
+  return settleSync(validateArgCore(argDef, value, execMode));
+}
+
+/**
  * Strict (template-mode) validation: whitespace is always rejected.
  * @param {object} argDef - Argument definition from the manifest
  * @param {*} value - The raw value to validate
@@ -166,6 +274,19 @@ export function validateArgMode(argDef, value, execMode = false) {
  */
 export function validateArg(argDef, value) {
   return validateArgMode(argDef, value, false);
+}
+
+/**
+ * validateArgMode with DNS resolution: the same pipeline, but a hostname
+ * under `block_internal` is resolved (bounded to 2 s) and every A/AAAA
+ * answer is held to the range policy. Resolution failure is a refusal.
+ * @param {object} argDef - Argument definition from the manifest
+ * @param {*} value - The raw value to validate
+ * @param {boolean} [execMode=false] - See validateArgMode
+ * @returns {Promise<*>} The validated and possibly coerced value
+ */
+export async function validateArgAsync(argDef, value, execMode = false) {
+  return settleAsync(validateArgCore(argDef, value, execMode));
 }
 
 const TYPE_HANDLERS = {
@@ -409,14 +530,14 @@ function validateScopeTarget(argDef, value) {
   }
 
   // CIDR ranges: a canonical base address with an in-bounds prefix. The
-  // policy applies to the base address; testing the whole range for overlap
-  // with each blocked prefix is a later wave.
+  // whole range is tested for overlap with each blocked prefix, so a
+  // supernet with a public base address (`8.0.0.0/5`) is still refused.
   if (str.includes("/")) {
     const cidr = parseCidr(str);
     if (cidr === null) {
       throw new Error(`Invalid scope_target: ${str} (must be IP, CIDR, or hostname)`);
     }
-    enforceIpPolicy(cidr.ip, blockInternal);
+    enforceCidrPolicy(cidr, blockInternal);
     return str;
   }
 
@@ -429,14 +550,53 @@ function validateScopeTarget(argDef, value) {
     );
   }
 
-  // Hostname: structural regex plus a non-numeric rightmost label.
+  // Hostname: structural regex plus a non-numeric rightmost label, then the
+  // hostname policy shared with the url host.
   if (HOSTNAME_RE.test(str) && tldNotAllNumeric(str)) {
-    // Hostname strengthening (internal-suffix denylist, embedded IP
-    // literals, DNS resolution under block_internal) plugs in here in a
-    // later wave, via hostpolicy.js.
-    return str;
+    return applyHostnamePolicy(str, blockInternal, str);
   }
   throw new Error(`Invalid scope_target: ${str} (must be IP, CIDR, or hostname)`);
+}
+
+/**
+ * Hostname policy shared by `scope_target` and the host of a `url`, applied
+ * after the structural checks (punycode, non-canonical literals, the LDH
+ * regex) have passed:
+ *
+ * 1. Embedded IPv4 literal (`127.0.0.1.nip.io`, `10-0-0-1.nip.io`): the
+ *    address written in the name is held to the literal policy, since a
+ *    wildcard-DNS zone answers with exactly that address. An address the
+ *    policy allows continues as an ordinary hostname.
+ * 2. Internal-name denylist, with or without `block_internal`.
+ * 3. Under `block_internal`, a name can only be shown to be public by
+ *    resolving it. That step is returned as a HostResolution for the entry
+ *    point to satisfy (async) or refuse (sync); the completion applies the
+ *    range policy to every answer, so a name that resolves to one public and
+ *    one internal address (rebinding, split horizon) is refused.
+ *
+ * @param {string} host - The hostname
+ * @param {boolean} blockInternal
+ * @param {string} value - The validated value to return on success
+ * @returns {string|HostResolution}
+ */
+function applyHostnamePolicy(host, blockInternal, value) {
+  const embedded = embeddedIpv4Literal(host);
+  if (embedded !== null) {
+    enforceIpPolicy(embedded, blockInternal);
+  }
+  const internal = internalNameReason(host);
+  if (internal !== null) {
+    throw new Error(`target ${internal}`);
+  }
+  if (!blockInternal) {
+    return value;
+  }
+  return new HostResolution(host, (addresses) => {
+    for (const ip of addresses) {
+      enforceIpPolicy(ip, true);
+    }
+    return value;
+  });
 }
 
 /**
@@ -578,9 +738,12 @@ function validateUrl(argDef, value) {
   if (hasPunycodeLabel(host)) {
     throw new Error(`URL host must not contain punycode (xn--) labels: ${host}`);
   }
+  const blockInternal = argDef.block_internal === true;
   const ip = parseCanonicalIp(host);
+  let out;
   if (ip !== null) {
-    enforceIpPolicy(ip, argDef.block_internal === true);
+    enforceIpPolicy(ip, blockInternal);
+    out = str;
   } else {
     if (looksLikeIpLiteral(host)) {
       throw new Error(
@@ -593,16 +756,14 @@ function validateUrl(argDef, value) {
     if (!HOSTNAME_RE.test(host)) {
       throw new Error(`URL host is not a valid hostname or IP literal: ${host}`);
     }
-    // Hostname strengthening (internal-suffix denylist, embedded IP
-    // literals, DNS resolution under block_internal) plugs in here in a
-    // later wave, via hostpolicy.js.
+    out = applyHostnamePolicy(host, blockInternal, str);
   }
 
   // Step 8 — SCOPE HOOK: when `argDef.scope_check` is set, the scope checker
   // (a later wave) is consulted here with `host`. Not implemented yet; the
   // flag is parsed and carried so manifests can already declare it.
 
-  return str;
+  return out;
 }
 
 function validatePath(argDef, value) {
@@ -637,8 +798,8 @@ function validateIpAddress(argDef, value) {
 
 /**
  * `address/prefix` with a canonical base address and an in-bounds prefix.
- * The policy applies to the base address; testing the whole range for
- * overlap with each blocked prefix is a later wave.
+ * The whole range is tested for overlap with each blocked prefix, so a
+ * supernet with a public base address is refused along with its contents.
  */
 function validateCidr(argDef, value) {
   const str = String(value);
@@ -658,7 +819,7 @@ function validateCidr(argDef, value) {
   if (ip.family === 6 && prefix > 128) {
     throw new Error(`Invalid CIDR prefix for IPv6: /${prefixText}`);
   }
-  enforceIpPolicy(ip, argDef.block_internal === true);
+  enforceCidrPolicy({ ip, prefix }, argDef.block_internal === true);
   return str;
 }
 
@@ -735,19 +896,10 @@ function validateRegexMatch(argDef, value) {
 }
 
 /**
- * Validate an argument using custom type definitions.
- * @param {object} argDef - Argument definition
- * @param {*} value - Value to validate
- * @param {object} customTypes - Map of custom type name to definition
- * @param {boolean} [execMode=false] - See validateArgMode
- * @returns {*} Validated value
+ * The shared custom-type pipeline. May return a HostResolution, which the
+ * entry point settles.
  */
-export function validateArgWithCustomTypesMode(
-  argDef,
-  value,
-  customTypes,
-  execMode = false
-) {
+function validateArgWithCustomTypesCore(argDef, value, customTypes, execMode) {
   if (customTypes && Object.hasOwn(customTypes, argDef.type)) {
     const custom = customTypes[argDef.type];
     const handler = TYPE_HANDLERS[custom.base];
@@ -769,7 +921,25 @@ export function validateArgWithCustomTypesMode(
     };
     return runValidation(handler, custom.base, synthetic, value, execMode);
   }
-  return validateArgMode(argDef, value, execMode);
+  return validateArgCore(argDef, value, execMode);
+}
+
+/**
+ * Validate an argument using custom type definitions. Synchronous: see
+ * validateArgMode for the hostname rule under `block_internal`.
+ * @param {object} argDef - Argument definition
+ * @param {*} value - Value to validate
+ * @param {object} customTypes - Map of custom type name to definition
+ * @param {boolean} [execMode=false] - See validateArgMode
+ * @returns {*} Validated value
+ */
+export function validateArgWithCustomTypesMode(
+  argDef,
+  value,
+  customTypes,
+  execMode = false
+) {
+  return settleSync(validateArgWithCustomTypesCore(argDef, value, customTypes, execMode));
 }
 
 /**
@@ -781,4 +951,21 @@ export function validateArgWithCustomTypesMode(
  */
 export function validateArgWithCustomTypes(argDef, value, customTypes) {
   return validateArgWithCustomTypesMode(argDef, value, customTypes, false);
+}
+
+/**
+ * validateArgWithCustomTypesMode with DNS resolution: see validateArgAsync.
+ * @param {object} argDef - Argument definition
+ * @param {*} value - Value to validate
+ * @param {object} customTypes - Map of custom type name to definition
+ * @param {boolean} [execMode=false] - See validateArgMode
+ * @returns {Promise<*>} Validated value
+ */
+export async function validateArgWithCustomTypesAsync(
+  argDef,
+  value,
+  customTypes,
+  execMode = false
+) {
+  return settleAsync(validateArgWithCustomTypesCore(argDef, value, customTypes, execMode));
 }

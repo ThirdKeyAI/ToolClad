@@ -579,6 +579,127 @@ def load_custom_types(path: str) -> Dict[str, CustomTypeDef]:
 
 
 # ---------------------------------------------------------------------------
+# Egress lint
+# ---------------------------------------------------------------------------
+#
+# A tool that connects to a network destination derived from its arguments
+# must default-deny internal / SSRF targets. The question "is this an egress
+# tool" is answered by the manifest, not guessed from a value at call time:
+# ``tool.network_egress = true``, an ``[http]`` or ``[browser]`` backend, or a
+# command whose program is one of the known egress binaries. For such a
+# manifest every network-typed argument must set ``block_internal = true``.
+#
+# An ``executor``-only manifest cannot be inspected for a binary — the script
+# is opaque — so it is an egress manifest only through ``network_egress``,
+# ``[http]`` or ``[browser]``. The escape hatch is the author's
+# responsibility: declare ``network_egress = true`` when the script reaches
+# the network.
+
+# Basenames of binaries that connect to a destination taken from their
+# arguments. Identical to the list in the other runtimes; not expanded here.
+EGRESS_BINARIES: FrozenSet[str] = frozenset({
+    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh",
+    "ping", "fping", "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
+})
+
+# Argument types whose value names a network destination.
+NETWORK_TARGET_TYPES: FrozenSet[str] = frozenset({
+    "scope_target", "url", "ip_address", "cidr",
+})
+
+
+def _command_basename(program: str) -> str:
+    """The lowercase final path component of ``program``, splitting on both
+    ``/`` and ``\\`` as the Rust runtime does."""
+    return program.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _template_first_token(template: str) -> str:
+    """The program a legacy template invokes. The template is tokenized the
+    same way the executor will; a template the tokenizer refuses (it is
+    reported when the command is compiled) falls back to whitespace
+    splitting so the lint still sees a quoted or escaped program name."""
+    from toolclad.executor import tokenize_template  # the executor imports this module
+
+    try:
+        tokens = tokenize_template(template)
+    except ValueError:
+        tokens = template.split()
+    return tokens[0] if tokens else ""
+
+
+def is_egress_manifest(manifest: Manifest) -> bool:
+    """True if the manifest declares or implies network egress: the
+    ``network_egress`` flag, an ``[http]`` or ``[browser]`` backend, or a
+    program (``tool.binary``, ``exec[0]`` or the template's first token)
+    whose basename is in ``EGRESS_BINARIES``."""
+    if manifest.tool.network_egress or manifest.http is not None or manifest.browser is not None:
+        return True
+    programs: List[str] = []
+    if manifest.tool.binary:
+        programs.append(manifest.tool.binary)
+    if manifest.command.exec:
+        programs.append(manifest.command.exec[0])
+    if manifest.command.template:
+        first = _template_first_token(manifest.command.template)
+        if first:
+            programs.append(first)
+    return any(_command_basename(p) in EGRESS_BINARIES for p in programs)
+
+
+def _iter_args(manifest: Manifest) -> Iterator[ArgDef]:
+    """Every argument definition in the manifest: ``[args.*]``, then the
+    per-command arguments of ``[session]`` and ``[browser]`` (a browser
+    manifest carries its ``url`` arguments under its commands)."""
+    yield from manifest.args.values()
+    if manifest.session is not None:
+        for command in manifest.session.commands.values():
+            yield from command.args.values()
+    if manifest.browser is not None:
+        for command in manifest.browser.commands.values():
+            yield from command.args.values()
+
+
+def _lint_egress(
+    manifest: Manifest, custom_types: Optional[Mapping[str, CustomTypeDef]] = None
+) -> None:
+    """Refuse an egress manifest whose network-typed arguments do not set
+    ``block_internal``. With ``custom_types`` available, an argument whose
+    custom type has a network base is refused as well: a custom type cannot
+    carry ``block_internal``, so it can never satisfy the rule."""
+    if not is_egress_manifest(manifest):
+        return
+    for arg in _iter_args(manifest):
+        if arg.type in NETWORK_TARGET_TYPES:
+            if not arg.block_internal:
+                raise ValueError(
+                    f"argument '{arg.name}' is a network target for an egress binary "
+                    "but block_internal is not set; set block_internal = true to "
+                    "default-deny internal/SSRF targets"
+                )
+        elif custom_types and arg.type in custom_types:
+            base = custom_types[arg.type].base
+            if base in NETWORK_TARGET_TYPES:
+                raise ValueError(
+                    f"argument '{arg.name}' uses custom type '{arg.type}' as a "
+                    f"network target; custom types cannot carry block_internal — "
+                    f"use the built-in {base} type"
+                )
+
+
+def validate_manifest_with_custom_types(
+    manifest: Manifest, custom_types: Mapping[str, CustomTypeDef]
+) -> None:
+    """Re-run the egress lint on a loaded manifest with the custom types of
+    a ``toolclad.toml`` in hand, so an argument that routes a network target
+    through a custom type is refused at load rather than at call time.
+    ``load_manifest`` cannot do this itself because the CLI does not load
+    ``toolclad.toml`` yet. Raises ``ValueError`` with the same wording as
+    the load-time lint."""
+    _lint_egress(manifest, custom_types)
+
+
+# ---------------------------------------------------------------------------
 # Manifest key allowlist
 # ---------------------------------------------------------------------------
 #
@@ -867,3 +988,8 @@ def _validate_manifest(manifest: Manifest) -> None:
                 "manifest is missing [output] block "
                 "(or set tool.dispatch = \"callback\" for validator-only manifests)"
             )
+
+    # Egress safety: refuse a network target that is not default-deny on a
+    # manifest that reaches the network. Custom types are not known at load;
+    # validate_manifest_with_custom_types repeats the lint with them.
+    _lint_egress(manifest)

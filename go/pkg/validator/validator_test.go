@@ -1,11 +1,34 @@
 package validator
 
 import (
+	"errors"
+	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 )
+
+// stubResolver replaces the DNS seam for the duration of the test with a
+// fixed answer table (host -> addresses). Names absent from the table fail
+// to resolve. Tests never depend on live DNS: every positive hostname case
+// under block_internal goes through this stub.
+func stubResolver(t *testing.T, table map[string][]string) {
+	t.Helper()
+	prev := lookupHost
+	lookupHost = func(host string) ([]netip.Addr, error) {
+		ips, ok := table[strings.ToLower(host)]
+		if !ok {
+			return nil, errors.New("stub resolver: no such host")
+		}
+		addrs := make([]netip.Addr, 0, len(ips))
+		for _, ip := range ips {
+			addrs = append(addrs, netip.MustParseAddr(ip).Unmap())
+		}
+		return addrs, nil
+	}
+	t.Cleanup(func() { lookupHost = prev })
+}
 
 func intPtr(v int) *int           { return &v }
 func floatPtr(v float64) *float64 { return &v }
@@ -980,6 +1003,7 @@ func TestURLPorts(t *testing.T) {
 }
 
 func TestURLBlockInternal(t *testing.T) {
+	stubResolver(t, map[string][]string{"example.com": {"93.184.216.34"}})
 	open := &manifest.ArgDef{Name: "u", Type: "url"}
 	blocking := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: true}
 
@@ -1007,7 +1031,7 @@ func TestURLBlockInternal(t *testing.T) {
 		t.Errorf("public literal under block_internal must pass: %v", err)
 	}
 	if _, err := ValidateArg(blocking, "https://example.com/"); err != nil {
-		t.Errorf("hostname under block_internal must pass this wave: %v", err)
+		t.Errorf("hostname resolving to a public address under block_internal must pass: %v", err)
 	}
 }
 
@@ -1107,6 +1131,7 @@ func TestSplitURLHostPort(t *testing.T) {
 }
 
 func TestScopeTargetBlockInternal(t *testing.T) {
+	stubResolver(t, map[string][]string{"example.com": {"93.184.216.34"}})
 	open := &manifest.ArgDef{Name: "t", Type: "scope_target"}
 	blocking := &manifest.ArgDef{Name: "t", Type: "scope_target", BlockInternal: true}
 
@@ -1373,5 +1398,319 @@ func TestCanonicalIPHelpers(t *testing.T) {
 		if tldNotAllNumeric(v) {
 			t.Errorf("tldNotAllNumeric(%q) must be false", v)
 		}
+	}
+}
+
+// D1: the internal-name denylist applies with or without block_internal,
+// to a scope_target and to the host of a url, case-insensitively and with
+// one trailing dot ignored.
+func TestInternalNameDenylist(t *testing.T) {
+	names := []string{
+		"localhost",
+		"api.localhost",
+		"printer.local",
+		"metadata.google.internal",
+		"db.internal",
+		"x.home.arpa",
+		"nas.lan",
+		"wiki.intranet",
+		"fs.corp",
+		"vault.private",
+		"LOCALHOST",
+		"Metadata.Google.Internal",
+		"localhost.",
+	}
+	const want = "target resolves to an internal name — always blocked"
+	for _, blockInternal := range []bool{false, true} {
+		scope := &manifest.ArgDef{Name: "t", Type: "scope_target", BlockInternal: blockInternal}
+		url := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: blockInternal}
+		for _, n := range names {
+			_, err := ValidateArg(scope, n)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("scope_target %q block_internal=%v: want internal-name refusal, got %v", n, blockInternal, err)
+			}
+			_, err = ValidateArg(url, "http://"+n+":8080/path")
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("url host %q block_internal=%v: want internal-name refusal, got %v", n, blockInternal, err)
+			}
+		}
+	}
+	exact := "validation error for 't': " + want
+	if _, err := ValidateArg(&manifest.ArgDef{Name: "t", Type: "scope_target"}, "localhost"); err == nil || err.Error() != exact {
+		t.Errorf("want %q, got %v", exact, err)
+	}
+	// A suffix must be a whole label: these merely contain the words.
+	for _, n := range []string{"localhost.example.com", "internal-tools.example.com", "mylocal.example.com", "corp.example.com"} {
+		if isInternalName(n) {
+			t.Errorf("%q must not be an internal name", n)
+		}
+	}
+}
+
+// D2: an IP literal embedded in the leading labels of a hostname is put
+// through the range policy; the shape alone is never a refusal.
+func TestEmbeddedIPLiteral(t *testing.T) {
+	open := &manifest.ArgDef{Name: "t", Type: "scope_target"}
+	blocking := &manifest.ArgDef{Name: "t", Type: "scope_target", BlockInternal: true}
+	stubResolver(t, map[string][]string{"93-184-216-34.example.com": {"93.184.216.34"}})
+
+	// Metadata is always blocked, even without block_internal.
+	_, err := ValidateArg(open, "169.254.169.254.nip.io")
+	if err == nil || !strings.Contains(err.Error(), "always blocked") {
+		t.Errorf("169.254.169.254.nip.io without block_internal: want always-blocked, got %v", err)
+	}
+	// Loopback / private forms are blocked under block_internal.
+	for _, v := range []string{"127.0.0.1.nip.io", "10-0-0-1.nip.io", "192.168.1.1.sslip.io", "172-16-0-1.nip.io"} {
+		_, err := ValidateArg(blocking, v)
+		if err == nil || !strings.Contains(err.Error(), "blocked by block_internal policy") {
+			t.Errorf("%q with block_internal: want policy refusal, got %v", v, err)
+		}
+	}
+	// ...and allowed without it, like any other hostname.
+	for _, v := range []string{"127.0.0.1.nip.io", "10-0-0-1.nip.io"} {
+		if _, err := ValidateArg(open, v); err != nil {
+			t.Errorf("%q without block_internal: unexpected error %v", v, err)
+		}
+	}
+	// A public embedded address continues through the ordinary checks.
+	if _, err := ValidateArg(blocking, "93-184-216-34.example.com"); err != nil {
+		t.Errorf("public dashed quad under block_internal must pass: %v", err)
+	}
+	// url hosts get the same treatment.
+	u := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: true}
+	if _, err := ValidateArg(u, "http://127.0.0.1.nip.io/x"); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Errorf("url 127.0.0.1.nip.io: want loopback refusal, got %v", err)
+	}
+	if _, err := ValidateArg(&manifest.ArgDef{Name: "u", Type: "url"}, "http://169.254.169.254.xip.io/"); err == nil || !strings.Contains(err.Error(), "always blocked") {
+		t.Errorf("url 169.254.169.254.xip.io: want always-blocked, got %v", err)
+	}
+
+	// The extractor itself.
+	for _, c := range []struct {
+		host string
+		want string
+	}{
+		{"127.0.0.1.nip.io", "127.0.0.1"},
+		{"10-0-0-1.nip.io", "10.0.0.1"},
+		{"10-0-0-1", "10.0.0.1"},
+		{"255-255-255-255.x", "255.255.255.255"},
+		{"example.com", ""},
+		{"1.2.3.example.com", ""},    // only three numeric labels
+		{"010.0.0.1.nip.io", ""},     // non-canonical quad is not extracted
+		{"256-0-0-1.nip.io", ""},     // group out of range
+		{"10-0-0.nip.io", ""},        // three groups
+		{"10-0-0-1-2.nip.io", ""},    // five groups
+		{"1000-0-0-1.nip.io", ""},    // four digits
+		{"a-b-c-d.nip.io", ""},       // not digits
+		{"::ffff:127.0.0.1.nip", ""}, // not a dotted quad
+	} {
+		addr, ok := embeddedIPLiteral(c.host)
+		if c.want == "" {
+			if ok {
+				t.Errorf("%q: must not extract an address, got %v", c.host, addr)
+			}
+			continue
+		}
+		if !ok || addr.String() != c.want {
+			t.Errorf("%q: want %s, got %v (ok=%v)", c.host, c.want, addr, ok)
+		}
+	}
+}
+
+// D3: a range is tested for overlap with every blocked range, for IPv4 and
+// IPv6, as a scope_target and as a cidr.
+func TestCIDROverlap(t *testing.T) {
+	for _, typ := range []string{"scope_target", "cidr"} {
+		open := &manifest.ArgDef{Name: "c", Type: typ}
+		blocking := &manifest.ArgDef{Name: "c", Type: typ, BlockInternal: true}
+		refused := []string{
+			"8.0.0.0/5",           // public base, contains 10.0.0.0/8
+			"10.0.0.0/24",         // inside 10.0.0.0/8
+			"10.1.2.3/8",          // unmasked spelling of the same range
+			"192.0.0.0/8",         // contains 192.168.0.0/16 and 192.0.2.0/24
+			"0.0.0.0/0",           // contains everything
+			"2001:db8::/32",       // documentation range exactly
+			"2001:db8:1::/48",     // inside it
+			"2001::/16",           // contains it
+			"fc00::/7",            // unique-local
+			"fd00::/8",            // inside unique-local
+			"::/0",                // everything
+			"::ffff:10.0.0.0/104", // IPv4-mapped spelling of 10.0.0.0/8
+		}
+		for _, v := range refused {
+			_, err := ValidateArg(blocking, v)
+			if err == nil || !strings.Contains(err.Error(), "blocked") {
+				t.Errorf("%s %q with block_internal: want overlap refusal, got %v", typ, v, err)
+			}
+		}
+		// The supernet case carries the policy wording of the range it
+		// overlaps.
+		want := "validation error for 'c': target resolves to a private address (blocked by block_internal policy)"
+		if _, err := ValidateArg(blocking, "8.0.0.0/5"); err == nil || err.Error() != want {
+			t.Errorf("%s 8.0.0.0/5: want %q, got %v", typ, want, err)
+		}
+		// Link-local overlap is refused with or without block_internal.
+		for _, v := range []string{"169.254.0.0/16", "169.0.0.0/8", "160.0.0.0/4", "fe80::/10", "fe80::/64", "fe00::/7", "0.0.0.0/0", "::/0"} {
+			for _, def := range []*manifest.ArgDef{open, blocking} {
+				_, err := ValidateArg(def, v)
+				if err == nil || !strings.Contains(err.Error(), "always blocked") {
+					t.Errorf("%s %q block_internal=%v: want always-blocked, got %v", typ, v, def.BlockInternal, err)
+				}
+			}
+		}
+		for _, v := range []string{"93.184.216.0/24", "8.8.8.0/24", "2606:4700::/32", "2606:4700:4700::/48", "1.0.0.0/8"} {
+			if _, err := ValidateArg(blocking, v); err != nil {
+				t.Errorf("%s %q with block_internal: unexpected error %v", typ, v, err)
+			}
+		}
+		// Without block_internal, a non-public range that avoids link-local
+		// still passes.
+		for _, v := range []string{"8.0.0.0/5", "10.0.0.0/24", "2001:db8::/32"} {
+			if _, err := ValidateArg(open, v); err != nil {
+				t.Errorf("%s %q without block_internal: unexpected error %v", typ, v, err)
+			}
+		}
+	}
+
+	// unmapPrefix boundaries.
+	if got := unmapPrefix(netip.MustParsePrefix("::ffff:10.0.0.0/104")); got != netip.MustParsePrefix("10.0.0.0/8") {
+		t.Errorf("unmapPrefix(::ffff:10.0.0.0/104) = %v", got)
+	}
+	if got := unmapPrefix(netip.MustParsePrefix("::ffff:0.0.0.0/95")); got != netip.MustParsePrefix("::ffff:0.0.0.0/95") {
+		t.Errorf("a prefix shorter than the mapped block must be left alone, got %v", got)
+	}
+	if got := unmapPrefix(netip.MustParsePrefix("10.0.0.0/8")); got != netip.MustParsePrefix("10.0.0.0/8") {
+		t.Errorf("unmapPrefix(10.0.0.0/8) = %v", got)
+	}
+}
+
+// D4: under block_internal a name is resolved and every answer is put
+// through the range policy; resolution failure is a refusal. Without
+// block_internal no resolution is attempted at all.
+func TestDNSResolutionUnderBlockInternal(t *testing.T) {
+	// Fail closed through the real resolver: .invalid is reserved by RFC
+	// 2606 and never resolves. This is the only lookup a test may cause.
+	const unresolvable = "no-such-host.invalid"
+	for _, typ := range []string{"scope_target", "url"} {
+		value := unresolvable
+		if typ == "url" {
+			value = "https://" + unresolvable + "/x"
+		}
+		blocking := &manifest.ArgDef{Name: "h", Type: typ, BlockInternal: true}
+		want := "validation error for 'h': could not resolve host '" + unresolvable + "' to verify it is public (block_internal)"
+		if _, err := ValidateArg(blocking, value); err == nil || err.Error() != want {
+			t.Errorf("%s %q: want %q, got %v", typ, value, want, err)
+		}
+		open := &manifest.ArgDef{Name: "h", Type: typ}
+		if _, err := ValidateArg(open, value); err != nil {
+			t.Errorf("%s %q without block_internal must not resolve: %v", typ, value, err)
+		}
+	}
+
+	// Without block_internal the seam is never consulted.
+	called := false
+	prev := lookupHost
+	lookupHost = func(string) ([]netip.Addr, error) { called = true; return nil, errors.New("must not be called") }
+	t.Cleanup(func() { lookupHost = prev })
+	for _, def := range []*manifest.ArgDef{{Name: "h", Type: "scope_target"}, {Name: "h", Type: "url"}} {
+		v := "example.com"
+		if def.Type == "url" {
+			v = "https://example.com/"
+		}
+		if _, err := ValidateArg(def, v); err != nil {
+			t.Errorf("%s without block_internal: %v", def.Type, err)
+		}
+	}
+	if called {
+		t.Fatal("resolver consulted without block_internal")
+	}
+
+	// Every answer is checked: one internal address among public ones is
+	// enough to refuse, in either family and in mapped form.
+	stubResolver(t, map[string][]string{
+		"public.example":      {"93.184.216.34", "2606:4700::1111"},
+		"rebinding.example":   {"93.184.216.34", "10.0.0.1"},
+		"v6-internal.example": {"2606:4700::1111", "fc00::1"},
+		"mapped.example":      {"::ffff:127.0.0.1"},
+		"metadata.example":    {"169.254.169.254"},
+		"empty.example":       {},
+	})
+	blocking := &manifest.ArgDef{Name: "h", Type: "scope_target", BlockInternal: true}
+	if _, err := ValidateArg(blocking, "public.example"); err != nil {
+		t.Errorf("all-public answers must pass: %v", err)
+	}
+	for host, wantSub := range map[string]string{
+		"rebinding.example":   "resolves to a private address (blocked by block_internal policy)",
+		"v6-internal.example": "unique-local",
+		"mapped.example":      "loopback",
+		"metadata.example":    "always blocked",
+		"empty.example":       "could not resolve host 'empty.example'",
+		"missing.example":     "could not resolve host 'missing.example'",
+	} {
+		_, err := ValidateArg(blocking, host)
+		if err == nil || !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("%q: want %q, got %v", host, wantSub, err)
+		}
+	}
+	u := &manifest.ArgDef{Name: "h", Type: "url", BlockInternal: true}
+	if _, err := ValidateArg(u, "https://rebinding.example:8443/path"); err == nil || !strings.Contains(err.Error(), "private") {
+		t.Errorf("url rebinding.example: want private refusal, got %v", err)
+	}
+	if _, err := ValidateArg(u, "https://public.example/"); err != nil {
+		t.Errorf("url public.example: %v", err)
+	}
+	// Literals never touch the resolver.
+	if _, err := ValidateArg(blocking, "93.184.216.34"); err != nil {
+		t.Errorf("literal under block_internal: %v", err)
+	}
+}
+
+// ValidateManifestWithCustomTypes runs the egress lint with the custom type
+// table visible: a custom type whose base is a network target cannot carry
+// block_internal and is refused in an egress manifest.
+func TestValidateManifestWithCustomTypes(t *testing.T) {
+	customTypes := map[string]*manifest.CustomTypeDef{
+		"host":     {Base: "scope_target"},
+		"endpoint": {Base: "url"},
+		"severity": {Base: "enum", Allowed: []string{"low", "high"}},
+		"broken":   {Base: "nonexistent"},
+	}
+	egress := func(argType string) *manifest.Manifest {
+		return &manifest.Manifest{
+			Tool:    manifest.ToolMeta{Name: "t"},
+			Args:    map[string]*manifest.ArgDef{"target": {Name: "target", Type: argType, BlockInternal: true}},
+			Command: manifest.CommandDef{Exec: []string{"curl", "{target}"}},
+		}
+	}
+	want := "argument 'target' uses custom type 'host' as a network target; custom types cannot carry block_internal — use the built-in scope_target type"
+	if err := ValidateManifestWithCustomTypes(egress("host"), customTypes); err == nil || err.Error() != want {
+		t.Errorf("want %q, got %v", want, err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("endpoint"), customTypes); err == nil || !strings.Contains(err.Error(), "use the built-in url type") {
+		t.Errorf("custom url base: want refusal, got %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("severity"), customTypes); err != nil {
+		t.Errorf("custom enum in an egress manifest is fine: %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("scope_target"), customTypes); err != nil {
+		t.Errorf("built-in scope_target with block_internal: %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("broken"), customTypes); err == nil || !strings.Contains(err.Error(), "invalid base type") {
+		t.Errorf("invalid base: want refusal, got %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("nope"), customTypes); err == nil || !strings.Contains(err.Error(), "unknown type") {
+		t.Errorf("unknown type: want refusal, got %v", err)
+	}
+	// A non-egress manifest may use a custom network type.
+	m := egress("host")
+	m.Command.Exec = []string{"whois", "{target}"}
+	if err := ValidateManifestWithCustomTypes(m, customTypes); err != nil {
+		t.Errorf("custom network type in a non-egress manifest must pass: %v", err)
+	}
+	// The built-in requirement still applies with custom types present.
+	m = egress("url")
+	m.Args["target"].BlockInternal = false
+	if err := ValidateManifestWithCustomTypes(m, customTypes); err == nil || !strings.Contains(err.Error(), "block_internal is not set") {
+		t.Errorf("built-in url without block_internal: want refusal, got %v", err)
 	}
 }

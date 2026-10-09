@@ -49,10 +49,11 @@ func TestBuildCommand(t *testing.T) {
 				Tool: manifest.ToolMeta{Name: "nmap"},
 				Args: map[string]*manifest.ArgDef{
 					"target": {
-						Name:     "target",
-						Position: 1,
-						Required: true,
-						Type:     "scope_target",
+						Name:          "target",
+						Position:      1,
+						Required:      true,
+						Type:          "scope_target",
+						BlockInternal: true, // required: nmap is an egress binary
 					},
 				},
 				Command: manifest.CommandDef{
@@ -62,8 +63,8 @@ func TestBuildCommand(t *testing.T) {
 					},
 				},
 			},
-			args: map[string]string{"target": "10.0.0.1"},
-			want: "nmap --max-rate 1000 10.0.0.1",
+			args: map[string]string{"target": "93.184.216.34"},
+			want: "nmap --max-rate 1000 93.184.216.34",
 		},
 		{
 			name: "template with mappings",
@@ -71,10 +72,11 @@ func TestBuildCommand(t *testing.T) {
 				Tool: manifest.ToolMeta{Name: "nmap"},
 				Args: map[string]*manifest.ArgDef{
 					"target": {
-						Name:     "target",
-						Position: 1,
-						Required: true,
-						Type:     "scope_target",
+						Name:          "target",
+						Position:      1,
+						Required:      true,
+						Type:          "scope_target",
+						BlockInternal: true, // required: nmap is an egress binary
 					},
 					"scan_type": {
 						Name:     "scan_type",
@@ -97,8 +99,8 @@ func TestBuildCommand(t *testing.T) {
 					},
 				},
 			},
-			args: map[string]string{"target": "10.0.0.1", "scan_type": "service"},
-			want: "nmap -sT -sV 10.0.0.1",
+			args: map[string]string{"target": "93.184.216.34", "scan_type": "service"},
+			want: "nmap -sT -sV 93.184.216.34",
 		},
 		{
 			name: "missing required arg",
@@ -1098,7 +1100,9 @@ func TestExecuteHTTPRejectsSecretInURLArg(t *testing.T) {
 	m := &manifest.Manifest{
 		Tool: manifest.ToolMeta{Name: "secret_arg", TimeoutSeconds: 5},
 		Args: map[string]*manifest.ArgDef{
-			"target": {Name: "target", Type: "url", Required: true},
+			// block_internal is required by the egress lint for an [http]
+			// manifest; the metacharacter check still fires first.
+			"target": {Name: "target", Type: "url", Required: true, BlockInternal: true},
 		},
 		Http: &manifest.HttpDef{Method: "GET", URL: "{target}"},
 	}

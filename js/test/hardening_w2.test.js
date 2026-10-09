@@ -346,6 +346,7 @@ required = false
 type = "url"
 description = "url"
 schemes = ["https"]
+block_internal = true
 
 [args.speed]
 position = 5
