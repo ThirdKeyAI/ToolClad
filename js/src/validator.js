@@ -1,4 +1,12 @@
 import { existsSync, statSync } from "node:fs";
+import {
+  parseCanonicalIp,
+  parseCidr,
+  parseIpv6,
+  enforceIpPolicy,
+  looksLikeIpLiteral,
+  hasPunycodeLabel,
+} from "./hostpolicy.js";
 
 /**
  * Shell metacharacters that indicate injection attempts.
@@ -263,12 +271,6 @@ function validateEnum(argDef, value) {
   return str;
 }
 
-function hasPunycodeLabel(host) {
-  return host.split(".").some(
-    (label) => label.length >= 4 && label.slice(0, 4).toLowerCase() === "xn--"
-  );
-}
-
 // RFC 1035 §2.3.4 caps a fully-qualified domain name at 253 octets.
 // IPv6 textual form maxes out at 45 chars. We use 253 as the upper bound
 // for any scope_target shape — hostnames, IPv4, IPv6, and CIDRs all fit
@@ -276,13 +278,67 @@ function hasPunycodeLabel(host) {
 // against buffer-pathological payloads.
 const SCOPE_TARGET_MAX_LEN = 253;
 
+/** RFC 1035 §2.3.4 caps each DNS label at 63 octets. */
+const DNS_LABEL_MAX_LEN = 63;
+
+/** Structural hostname: LDH labels joined by dots (same regex as Rust). */
+const HOSTNAME_RE =
+  /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/;
+
+/**
+ * Something shaped like CIDR notation. Used only to choose the error message
+ * for a value containing `/`; the strict parse is `parseCidr`.
+ */
+const CIDR_SHAPE_RE = /^[0-9a-fA-F.:]+\/[0-9]{1,3}$/;
+
+/** Schemes a `url` argument accepts when the manifest sets no `schemes`. */
+const DEFAULT_URL_SCHEMES = Object.freeze(["http", "https"]);
+
+/**
+ * Schemes a `url` argument never accepts, even when a manifest lists one in
+ * `schemes`: each is either a non-network scheme a fetcher would turn into
+ * local file or code access, or a protocol-smuggling vector (gopher and dict
+ * speak raw bytes to an arbitrary port).
+ */
+const DENIED_URL_SCHEMES = new Set([
+  "javascript",
+  "data",
+  "file",
+  "blob",
+  "about",
+  "gopher",
+  "dict",
+  "ftp",
+  "ldap",
+  "jar",
+  "netdoc",
+  "mailto",
+  "ws",
+  "wss",
+]);
+
+/**
+ * True if the rightmost DNS label is not entirely numeric: a real TLD is
+ * never all digits (RFC 3696 §2), which also rejects dotted-decimal IPs
+ * that the strict parser already refused.
+ */
+function tldNotAllNumeric(host) {
+  const tld = host.slice(host.lastIndexOf(".") + 1);
+  return tld.length > 0 && !/^[0-9]+$/.test(tld);
+}
+
+function hasOverlongLabel(host) {
+  return host.split(".").some((label) => label.length > DNS_LABEL_MAX_LEN);
+}
+
 function validateScopeTarget(argDef, value) {
   // Scope validation rules (aligned across Rust, Python, JS, Go):
   // 1. Reject shell metacharacters  2. Block * and ? wildcards
   // 3. Surface specific failure modes (traversal, IDN, non-ASCII, slashes)
   //    BEFORE the generic regex catch-all so forensic triage and per-fence
   //    bite-rate analysis can distinguish attack shapes.
-  // 4. Accept valid IPv4, IPv6, CIDR, or hostname.
+  // 4. Accept a canonical IP literal, a CIDR with a canonical base, or a
+  //    hostname — under the host policy of hostpolicy.js.
   const str = String(value);
   if (str.length === 0) {
     throw new Error("scope_target must not be empty");
@@ -305,18 +361,12 @@ function validateScopeTarget(argDef, value) {
     throw new Error(`Wildcard not allowed in scope_target: ${str}`);
   }
 
-  const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
-  const ipv6Re = /^[0-9a-fA-F:]+$/;
-  const cidrRe = /^[0-9a-fA-F.:]+\/\d{1,3}$/;
-  const hostnameRe =
-    /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/;
-
   if (str.includes("../") || str.includes("..\\") || str.includes("/..")) {
     throw new Error(
       `scope_target must not contain path traversal sequences: ${str}`
     );
   }
-  if (str.includes("/") && !cidrRe.test(str) && !ipv4Re.test(str) && !ipv6Re.test(str)) {
+  if (str.includes("/") && !CIDR_SHAPE_RE.test(str)) {
     throw new Error(
       `scope_target must not contain '/' (use CIDR notation for ranges): ${str}`
     );
@@ -337,34 +387,221 @@ function validateScopeTarget(argDef, value) {
       `scope_target must not contain punycode (xn--) labels — IDN/IDNA hostnames are rejected to prevent homoglyph bypass; gate IDN registration upstream if needed: ${str}`
     );
   }
-
-  if (
-    !ipv4Re.test(str) &&
-    !ipv6Re.test(str) &&
-    !cidrRe.test(str) &&
-    !hostnameRe.test(str)
-  ) {
-    throw new Error(`Invalid scope_target: ${str} (must be IP, CIDR, or hostname)`);
+  // Per-label DNS length: the total-length check above does not bound an
+  // individual label.
+  if (hasOverlongLabel(str)) {
+    throw new Error(
+      `scope_target has a DNS label exceeding ${DNS_LABEL_MAX_LEN} octets (RFC 1035 §2.3.4): ${str}`
+    );
   }
-  return str;
+
+  const blockInternal = argDef.block_internal === true;
+
+  // Canonical IP literals only. The strict parsers accept dotted-quad IPv4
+  // and standard IPv6 and nothing else, so integer/hex/octal/shorthand
+  // encodings (2130706433, 0x7f000001, 0177.0.0.1, 127.1 — all of which a
+  // libc resolver would expand to 127.0.0.1) fail here and are rejected as
+  // non-canonical literals below.
+  const ip = parseCanonicalIp(str);
+  if (ip !== null) {
+    enforceIpPolicy(ip, blockInternal);
+    return str;
+  }
+
+  // CIDR ranges: a canonical base address with an in-bounds prefix. The
+  // policy applies to the base address; testing the whole range for overlap
+  // with each blocked prefix is a later wave.
+  if (str.includes("/")) {
+    const cidr = parseCidr(str);
+    if (cidr === null) {
+      throw new Error(`Invalid scope_target: ${str} (must be IP, CIDR, or hostname)`);
+    }
+    enforceIpPolicy(cidr.ip, blockInternal);
+    return str;
+  }
+
+  // A non-canonical IP-literal encoding must not slip through as a
+  // "hostname": a downstream resolver would expand it to an address. No
+  // legitimate hostname is all-numeric labels or a 0x-prefixed hex literal.
+  if (looksLikeIpLiteral(str)) {
+    throw new Error(
+      `scope_target looks like a non-canonical IP literal; use dotted-quad IPv4 or standard IPv6: ${str}`
+    );
+  }
+
+  // Hostname: structural regex plus a non-numeric rightmost label.
+  if (HOSTNAME_RE.test(str) && tldNotAllNumeric(str)) {
+    // Hostname strengthening (internal-suffix denylist, embedded IP
+    // literals, DNS resolution under block_internal) plugs in here in a
+    // later wave, via hostpolicy.js.
+    return str;
+  }
+  throw new Error(`Invalid scope_target: ${str} (must be IP, CIDR, or hostname)`);
 }
 
-function validateUrl(argDef, value) {
-  const str = String(value);
-  let parsed;
-  try {
-    parsed = new URL(str);
-  } catch {
-    throw new Error(`Invalid URL: ${str}`);
+/**
+ * Split a URL into its lowercased scheme and everything after `://`.
+ * A value without `://` is not a URL for our purposes; a bare `scheme:` form
+ * (`mailto:`, `javascript:`) is refused here rather than parsed.
+ * @param {string} str
+ * @returns {{scheme: string, rest: string}}
+ * @throws {Error} when the value has no `scheme://` prefix
+ */
+export function splitUrlScheme(str) {
+  const idx = str.indexOf("://");
+  const scheme = idx === -1 ? "" : str.slice(0, idx).toLowerCase();
+  // RFC 3986 §3.1: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+  if (idx === -1 || !/^[a-z][a-z0-9+.-]*$/.test(scheme)) {
+    throw new Error(`Invalid URL: ${str} (expected scheme://host)`);
   }
-  if (argDef.schemes && argDef.schemes.length > 0) {
-    const scheme = parsed.protocol.replace(":", "");
-    if (!argDef.schemes.includes(scheme)) {
+  return { scheme, rest: str.slice(idx + 3) };
+}
+
+const URL_PORT_MESSAGE = "URL port must be 1-65535";
+
+/**
+ * Extract the host from the part of a URL after `://`. The authority is
+ * everything up to the first `/`, `?` or `#`; an `@` inside it is userinfo
+ * and is refused outright. A bracketed IPv6 literal is unwrapped and must be
+ * canonical; otherwise the host ends at the first `:` and whatever follows
+ * must be a plain decimal port in 1-65535.
+ *
+ * This is deliberately not a WHATWG parser: nothing is normalized, so what
+ * a reviewer reads in the manifest is what the host policy sees.
+ *
+ * @param {string} rest - The URL text after `://`
+ * @returns {{host: string, port: number|null, bracketed: boolean}}
+ * @throws {Error} on userinfo, an empty or malformed host, or a bad port
+ */
+export function parseUrlAuthority(rest) {
+  const end = rest.search(/[/?#]/);
+  const authority = end === -1 ? rest : rest.slice(0, end);
+  if (authority.includes("@")) {
+    throw new Error("URL must not contain userinfo (user:pass@host)");
+  }
+
+  let host;
+  let portText = null;
+  let bracketed = false;
+  if (authority.startsWith("[")) {
+    const close = authority.indexOf("]");
+    if (close === -1) {
+      throw new Error(`Invalid URL authority: unterminated IPv6 bracket: ${authority}`);
+    }
+    host = authority.slice(1, close);
+    if (parseIpv6(host) === null) {
       throw new Error(
-        `URL scheme "${scheme}" not in allowed schemes: [${argDef.schemes.join(", ")}]`
+        `Invalid URL authority: bracketed host '${host}' is not a canonical IPv6 literal`
       );
     }
+    bracketed = true;
+    const after = authority.slice(close + 1);
+    if (after !== "") {
+      if (!after.startsWith(":")) {
+        throw new Error(
+          `Invalid URL authority: unexpected text after IPv6 bracket: ${authority}`
+        );
+      }
+      portText = after.slice(1);
+    }
+  } else {
+    const colon = authority.indexOf(":");
+    if (colon === -1) {
+      host = authority;
+    } else {
+      host = authority.slice(0, colon);
+      portText = authority.slice(colon + 1);
+    }
   }
+
+  if (host === "") {
+    throw new Error("URL host must not be empty");
+  }
+
+  let port = null;
+  if (portText !== null) {
+    // Plain decimal only: Number() would accept "+1", "0x50", " 80".
+    if (!/^[0-9]{1,5}$/.test(portText)) {
+      throw new Error(`${URL_PORT_MESSAGE} (got '${portText}')`);
+    }
+    port = Number(portText);
+    if (port < 1 || port > 65535) {
+      throw new Error(`${URL_PORT_MESSAGE} (got '${portText}')`);
+    }
+  }
+
+  return { host, port, bracketed };
+}
+
+/**
+ * The `url` validator, in order: the string-derived hygiene has already run
+ * (whitespace is never admitted for a `url`, opt-in or not); then the shell
+ * metacharacter blocklist, which rejects `{` and `}` and therefore any
+ * `{_secret:…}` reference; then a structural parse — `scheme://`, the scheme
+ * allowlist, the scheme denylist, no userinfo, host extraction with an
+ * optional port — and finally the host policy of hostpolicy.js.
+ *
+ * The value is returned untouched. This is not a WHATWG / RFC 3986
+ * normalizer: the fetcher downstream will parse the value again with its own
+ * rules, so anything a human reviewer of the manifest could misread is
+ * refused here rather than normalized away.
+ */
+function validateUrl(argDef, value) {
+  const str = String(value);
+  // Step 1 (continued): the metacharacter blocklist.
+  checkInjection(str);
+
+  // Step 2: `scheme://rest`.
+  const { scheme, rest } = splitUrlScheme(str);
+
+  // Step 3: allowlist — the manifest's `schemes` when set, else http/https.
+  const allowed =
+    Array.isArray(argDef.schemes) && argDef.schemes.length > 0
+      ? argDef.schemes.map((s) => String(s).toLowerCase())
+      : DEFAULT_URL_SCHEMES;
+  if (!allowed.includes(scheme)) {
+    throw new Error(
+      `URL scheme "${scheme}" not in allowed schemes: [${allowed.join(", ")}]`
+    );
+  }
+
+  // Step 4: explicit denial, even when a manifest lists the scheme.
+  if (DENIED_URL_SCHEMES.has(scheme)) {
+    throw new Error(`URL scheme "${scheme}" is never allowed for a url argument`);
+  }
+
+  // Steps 5-6: no userinfo; host and optional port.
+  const { host } = parseUrlAuthority(rest);
+
+  // Step 7: host policy — the same checks as scope_target, since curl and
+  // wget-style fetchers are the prime SSRF vector.
+  if (hasPunycodeLabel(host)) {
+    throw new Error(`URL host must not contain punycode (xn--) labels: ${host}`);
+  }
+  const ip = parseCanonicalIp(host);
+  if (ip !== null) {
+    enforceIpPolicy(ip, argDef.block_internal === true);
+  } else {
+    if (looksLikeIpLiteral(host)) {
+      throw new Error(
+        `URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname: ${host}`
+      );
+    }
+    if (host.length > SCOPE_TARGET_MAX_LEN || hasOverlongLabel(host)) {
+      throw new Error("URL host exceeds DNS length limits (RFC 1035 §2.3.4)");
+    }
+    if (!HOSTNAME_RE.test(host)) {
+      throw new Error(`URL host is not a valid hostname or IP literal: ${host}`);
+    }
+    // Hostname strengthening (internal-suffix denylist, embedded IP
+    // literals, DNS resolution under block_internal) plugs in here in a
+    // later wave, via hostpolicy.js.
+  }
+
+  // Step 8 — SCOPE HOOK: when `argDef.scope_check` is set, the scope checker
+  // (a later wave) is consulted here with `host`. Not implemented yet; the
+  // flag is parsed and carried so manifests can already declare it.
+
   return str;
 }
 
@@ -380,42 +617,48 @@ function validatePath(argDef, value) {
   return str;
 }
 
+/**
+ * A canonical IPv4 or IPv6 literal, under the same egress policy as every
+ * other address-carrying type: link-local is always refused, the rest of
+ * the non-public table under `block_internal`.
+ */
 function validateIpAddress(argDef, value) {
   const str = String(value);
-  const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
-  const ipv6Re = /^[0-9a-fA-F:]+$/;
-  if (!ipv4Re.test(str) && !ipv6Re.test(str)) {
-    throw new Error(`Invalid IP address: ${str}`);
-  }
-  if (ipv4Re.test(str)) {
-    const octets = str.split(".").map(Number);
-    if (octets.some((o) => o < 0 || o > 255)) {
+  const ip = parseCanonicalIp(str);
+  if (ip === null) {
+    if (/^[0-9.]+$/.test(str)) {
       throw new Error(`Invalid IPv4 address: ${str}`);
     }
+    throw new Error(`Invalid IP address: ${str}`);
   }
+  enforceIpPolicy(ip, argDef.block_internal === true);
   return str;
 }
 
+/**
+ * `address/prefix` with a canonical base address and an in-bounds prefix.
+ * The policy applies to the base address; testing the whole range for
+ * overlap with each blocked prefix is a later wave.
+ */
 function validateCidr(argDef, value) {
   const str = String(value);
-  const cidrRe = /^[0-9a-fA-F.:]+\/\d{1,3}$/;
-  if (!cidrRe.test(str)) {
+  const slash = str.indexOf("/");
+  if (slash === -1) {
     throw new Error(`Invalid CIDR notation: ${str}`);
   }
-  const [addr, prefix] = str.split("/");
-  const prefixNum = Number(prefix);
-  // IPv4 check
-  if (addr.includes(".")) {
-    validateIpAddress(argDef, addr);
-    if (prefixNum < 0 || prefixNum > 32) {
-      throw new Error(`Invalid CIDR prefix for IPv4: /${prefix}`);
-    }
-  } else {
-    // IPv6
-    if (prefixNum < 0 || prefixNum > 128) {
-      throw new Error(`Invalid CIDR prefix for IPv6: /${prefix}`);
-    }
+  const ip = parseCanonicalIp(str.slice(0, slash));
+  const prefixText = str.slice(slash + 1);
+  if (ip === null || !/^[0-9]{1,3}$/.test(prefixText)) {
+    throw new Error(`Invalid CIDR notation: ${str}`);
   }
+  const prefix = Number(prefixText);
+  if (ip.family === 4 && prefix > 32) {
+    throw new Error(`Invalid CIDR prefix for IPv4: /${prefixText}`);
+  }
+  if (ip.family === 6 && prefix > 128) {
+    throw new Error(`Invalid CIDR prefix for IPv6: /${prefixText}`);
+  }
+  enforceIpPolicy(ip, argDef.block_internal === true);
   return str;
 }
 

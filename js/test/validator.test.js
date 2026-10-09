@@ -200,7 +200,15 @@ describe("validateArg - ip_address", () => {
 
   it("accepts valid IPv6", () => {
     assert.equal(validateArg({ type: "ip_address" }, "::1"), "::1");
-    assert.equal(validateArg({ type: "ip_address" }, "fe80::1"), "fe80::1");
+    assert.equal(
+      validateArg({ type: "ip_address" }, "2001:4860:4860::8888"),
+      "2001:4860:4860::8888"
+    );
+  });
+
+  it("refuses link-local even without block_internal", () => {
+    assert.throws(() => validateArg({ type: "ip_address" }, "fe80::1"), /always blocked/);
+    assert.throws(() => validateArg({ type: "ip_address" }, "169.254.169.254"), /always blocked/);
   });
 
   it("rejects invalid IPs", () => {

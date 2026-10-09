@@ -122,11 +122,11 @@ cd go && go run ./cmd/toolclad test ../examples/whois_lookup.clad.toml --arg tar
 | `port` | 1-65535 | Network ports |
 | `boolean` | Exactly `"true"` or `"false"` | Feature flags |
 | `enum` | Value in declared `allowed` list | Scan types |
-| `scope_target` | Injection-safe, no wildcards, valid IP/CIDR/hostname | Targets |
-| `url` | Valid URL, optional `schemes` restriction, `scope_check` | Web targets |
+| `scope_target` | Injection-safe, no wildcards, canonical IP/CIDR/hostname; link-local always blocked, `block_internal` blocks loopback/private/reserved ranges | Targets |
+| `url` | `scheme://host[:port]`; `schemes` allowlist (default `http`/`https`), dangerous schemes and userinfo refused, same host policy as `scope_target`, `scope_check` | Web targets |
 | `path` | No traversal (`../`), no absolute paths | File paths |
-| `ip_address` | Valid IPv4 or IPv6 | Addresses |
-| `cidr` | Valid CIDR notation (IPv4 + IPv6) | Network ranges |
+| `ip_address` | Canonical IPv4 or IPv6, same host policy as `scope_target` | Addresses |
+| `cidr` | Canonical CIDR notation (IPv4 + IPv6), host policy on the base address | Network ranges |
 
 ### Extended Types
 

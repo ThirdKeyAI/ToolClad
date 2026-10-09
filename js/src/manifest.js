@@ -230,6 +230,30 @@ export function loadManifestWithOptions(path, options = {}) {
     );
   }
 
+  // Per-argument policy keys. `block_internal` is a real field with a false
+  // default so the validator reads one value per argument instead of
+  // guessing; `schemes` must be a list so the url allowlist never iterates
+  // a string.
+  if (requireTable(manifest.args, "args")) {
+    for (const [name, def] of Object.entries(manifest.args)) {
+      const section = `args.${name}`;
+      if (!isTable(def)) {
+        throw new Error(`Invalid manifest: ${section} must be a table`);
+      }
+      def.block_internal = takeBool(def, section, "block_internal", false);
+      def.scope_check = takeBool(def, section, "scope_check", false);
+      if (
+        def.schemes !== undefined &&
+        (!Array.isArray(def.schemes) ||
+          !def.schemes.every((scheme) => typeof scheme === "string"))
+      ) {
+        throw new Error(
+          `Invalid manifest: ${section}.schemes must be an array of strings`
+        );
+      }
+    }
+  }
+
   const isCallback = dispatch === "callback";
 
   // Callback dispatch is for validator-only embeddings — no backend or

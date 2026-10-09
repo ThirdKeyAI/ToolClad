@@ -799,6 +799,62 @@ func interpolateString(template string, ctx map[string]string) string {
 	return result
 }
 
+// expandHTTPTemplate turns one [http] template string into its final form.
+// Secrets are expanded on the manifest template FIRST and argument values
+// are interpolated afterwards, so a validated argument can never introduce
+// a {_secret:name} reference of its own: by the time the argument text is
+// in place, no secret expansion happens any more. The url validator's
+// metacharacter blocklist also rejects braces, but the ordering here does
+// not rely on that check being the only defense.
+func expandHTTPTemplate(template string, cleaned map[string]string) (string, error) {
+	withSecrets, err := injectTemplateVars(template)
+	if err != nil {
+		return "", err
+	}
+	return interpolateString(withSecrets, cleaned), nil
+}
+
+// buildHTTPRequest assembles the request for an [http] manifest from
+// already-validated arguments without sending it. The URL, every header
+// value and the body template each go through expandHTTPTemplate.
+func buildHTTPRequest(m *manifest.Manifest, cleaned map[string]string) (*http.Request, error) {
+	url, err := expandHTTPTemplate(m.Http.URL, cleaned)
+	if err != nil {
+		return nil, err
+	}
+
+	headers := make(map[string]string)
+	for k, v := range m.Http.Headers {
+		hv, err := expandHTTPTemplate(v, cleaned)
+		if err != nil {
+			return nil, err
+		}
+		headers[k] = hv
+	}
+
+	method := strings.ToUpper(m.Http.Method)
+	if method == "" {
+		method = "GET"
+	}
+	var bodyReader io.Reader
+	if m.Http.BodyTemplate != "" && method != "GET" && method != "HEAD" {
+		body, err := expandHTTPTemplate(m.Http.BodyTemplate, cleaned)
+		if err != nil {
+			return nil, err
+		}
+		bodyReader = strings.NewReader(body)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("building HTTP request: %w", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return req, nil
+}
+
 // ExecuteHTTP performs an HTTP request based on the manifest's [http] section.
 func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, error) {
 	if m.Http == nil || m.Http.URL == "" {
@@ -832,45 +888,9 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 		cleaned[name] = validated
 	}
 
-	// Interpolate URL
-	url := interpolateString(m.Http.URL, cleaned)
-	url, err := injectTemplateVars(url)
+	req, err := buildHTTPRequest(m, cleaned)
 	if err != nil {
 		return nil, err
-	}
-
-	// Interpolate headers
-	headers := make(map[string]string)
-	for k, v := range m.Http.Headers {
-		hv := interpolateString(v, cleaned)
-		hv, err := injectTemplateVars(hv)
-		if err != nil {
-			return nil, err
-		}
-		headers[k] = hv
-	}
-
-	// Interpolate body
-	method := strings.ToUpper(m.Http.Method)
-	if method == "" {
-		method = "GET"
-	}
-	var bodyReader io.Reader
-	if m.Http.BodyTemplate != "" && method != "GET" && method != "HEAD" {
-		body := interpolateString(m.Http.BodyTemplate, cleaned)
-		body, err = injectTemplateVars(body)
-		if err != nil {
-			return nil, err
-		}
-		bodyReader = strings.NewReader(body)
-	}
-
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("building HTTP request: %w", err)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
 	}
 
 	timeout := time.Duration(m.Tool.TimeoutSeconds) * time.Second

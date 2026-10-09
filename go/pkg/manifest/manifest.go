@@ -102,9 +102,11 @@ type ArgDef struct {
 	Sanitize   []string `toml:"sanitize"`
 	Schemes    []string `toml:"schemes"`
 	ScopeCheck bool     `toml:"scope_check"`
-	// BlockInternal rejects loopback, private, link-local and other
-	// non-public targets for network-typed arguments. Registered as a known
-	// key; the host policy is not implemented here.
+	// BlockInternal rejects loopback, private, CGNAT, unspecified,
+	// broadcast, documentation, benchmarking and reserved targets for the
+	// network-typed arguments (scope_target, url, ip_address, cidr). The
+	// link-local / cloud-metadata ranges are refused regardless of this
+	// flag. The range table lives in validator/hostpolicy.go.
 	BlockInternal bool `toml:"block_internal"`
 	// AllowLeadingDash permits a value that starts with '-' or '+'. Off by
 	// default so a user value can never be parsed as an option by the tool.

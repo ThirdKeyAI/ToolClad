@@ -625,9 +625,15 @@ def _validate_output_schema(manifest: Manifest, parsed: Any) -> None:
 
 
 def _interpolate_http(template: str, args: Dict[str, str]) -> str:
-    """Interpolate arg placeholders then resolve secret references."""
-    result = _interpolate(template, args)
-    return inject_template_vars(result)
+    """Resolve ``{_secret:…}`` on the manifest template, then interpolate args.
+
+    Secrets are expanded first so an argument value can never introduce a
+    secret reference of its own: by the time arguments are substituted,
+    every ``{_secret:name}`` the manifest wrote has already been replaced
+    and nothing expands them again. A ``{_secret:…}`` arriving inside an
+    argument therefore stays literal.
+    """
+    return _interpolate(inject_template_vars(template), args)
 
 
 def _execute_http(
@@ -645,15 +651,15 @@ def _execute_http(
     scan_id = _generate_scan_id()
     effective_timeout = timeout or manifest.tool.timeout_seconds
 
-    # Interpolate URL, headers, and body with args + secrets.
+    # Manifest secrets first, then args (see _interpolate_http): an
+    # argument can never carry a secret reference into the request.
     url = _interpolate_http(http.url, args)
     headers = {k: _interpolate_http(v, args) for k, v in http.headers.items()}
     body: Optional[bytes] = None
     if http.body_template is not None:
         # JSON-escape values to prevent injection into JSON body
         escaped_args = {k: json.dumps(v)[1:-1] for k, v in args.items()}  # strip quotes from json.dumps
-        body_str = _interpolate(http.body_template, escaped_args)
-        body_str = inject_template_vars(body_str)
+        body_str = _interpolate(inject_template_vars(http.body_template), escaped_args)
         body = body_str.encode("utf-8")
 
     envelope: Dict[str, Any] = {

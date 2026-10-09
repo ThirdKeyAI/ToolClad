@@ -25,6 +25,66 @@ fn inject_template_vars(template: &str) -> Result<String, ToolCladError> {
     Ok(result)
 }
 
+/// The interpolated parts of an HTTP backend request.
+#[derive(Debug)]
+struct HttpRequestParts {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+/// Build the URL, headers and body of an HTTP backend request.
+///
+/// Order matters: `{_secret:name}` references are expanded on the manifest
+/// template FIRST, then validated arguments are interpolated. A value that
+/// smuggles a `{_secret:…}` reference therefore lands after secret expansion
+/// has already happened and stays a literal: it can never pull a secret into
+/// an attacker-chosen URL, header or body. The `url` validator independently
+/// rejects `{` and `}`; this ordering does not rely on that.
+fn build_http_request(
+    manifest: &Manifest,
+    validated: &HashMap<String, String>,
+) -> Result<HttpRequestParts, ToolCladError> {
+    let http = manifest.http.as_ref().ok_or_else(|| {
+        ToolCladError::ExecutionError("manifest has no [http] section".to_string())
+    })?;
+
+    // URL: secrets on the template, then arguments.
+    let mut url = inject_template_vars(&http.url)?;
+    for (k, v) in validated {
+        url = url.replace(&format!("{{{k}}}"), v);
+    }
+
+    // Headers: same order for every value.
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(http.headers.len());
+    for (hk, hv) in &http.headers {
+        let mut val = inject_template_vars(hv)?;
+        for (k, v) in validated {
+            val = val.replace(&format!("{{{k}}}"), v);
+        }
+        headers.push((hk.clone(), val));
+    }
+
+    // Body: secrets on the template, then JSON-escaped arguments.
+    let body = match http.body_template {
+        Some(ref body_tmpl) => {
+            let mut b = inject_template_vars(body_tmpl)?;
+            for (k, v) in validated {
+                // JSON-escape the value to prevent injection into JSON body.
+                let escaped = serde_json::to_string(v)
+                    .unwrap_or_else(|_| format!("\"{}\"", v))
+                    .trim_matches('"')
+                    .to_string();
+                b = b.replace(&format!("{{{k}}}"), &escaped);
+            }
+            Some(b)
+        }
+        None => None,
+    };
+
+    Ok(HttpRequestParts { url, headers, body })
+}
+
 /// Execute an HTTP backend tool, returning an evidence envelope.
 fn execute_http(
     manifest: &Manifest,
@@ -39,39 +99,7 @@ fn execute_http(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
 
-    // Interpolate URL with args and secrets.
-    let mut url = http.url.clone();
-    for (k, v) in validated {
-        url = url.replace(&format!("{{{k}}}"), v);
-    }
-    url = inject_template_vars(&url)?;
-
-    // Build headers with interpolation.
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for (hk, hv) in &http.headers {
-        let mut val = hv.clone();
-        for (k, v) in validated {
-            val = val.replace(&format!("{{{k}}}"), v);
-        }
-        val = inject_template_vars(&val)?;
-        headers.push((hk.clone(), val));
-    }
-
-    // Build body from template if present, with JSON-safe escaping.
-    let body = if let Some(ref body_tmpl) = http.body_template {
-        let mut b = body_tmpl.clone();
-        for (k, v) in validated {
-            // JSON-escape the value to prevent injection into JSON body.
-            let escaped = serde_json::to_string(v)
-                .unwrap_or_else(|_| format!("\"{}\"", v))
-                .trim_matches('"')
-                .to_string();
-            b = b.replace(&format!("{{{k}}}"), &escaped);
-        }
-        Some(inject_template_vars(&b)?)
-    } else {
-        None
-    };
+    let HttpRequestParts { url, headers, body } = build_http_request(manifest, validated)?;
 
     // Execute the HTTP request with timeout.
     let client = reqwest::blocking::Client::builder()
@@ -1390,12 +1418,103 @@ mod tests {
         assert!(result.command.contains("10.0.1.1"));
     }
 
+    /// Serializes tests that touch `TOOLCLAD_SECRET_*` environment variables,
+    /// which are process-global and would otherwise race across threads.
+    static SECRET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_inject_template_vars_with_env() {
+        let _guard = SECRET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TOOLCLAD_SECRET_API_KEY", "test-key-123");
         let result = inject_template_vars("Bearer {_secret:api_key}").unwrap();
-        assert_eq!(result, "Bearer test-key-123");
         std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
+        assert_eq!(result, "Bearer test-key-123");
+    }
+
+    /// An `[http]` manifest whose URL, a header and the body all echo the
+    /// `target` argument, and whose Authorization header carries a secret.
+    fn http_manifest() -> Manifest {
+        let mut m = minimal_manifest();
+        m.command = CommandDef::default();
+        m.http = Some(HttpDef {
+            method: "POST".to_string(),
+            url: "{target}".to_string(),
+            headers: HashMap::from([
+                (
+                    "Authorization".to_string(),
+                    "Bearer {_secret:api_key}".to_string(),
+                ),
+                ("X-Echo".to_string(), "{target}".to_string()),
+            ]),
+            body_template: Some(r#"{"q":"{target}"}"#.to_string()),
+            success_status: vec![],
+            error_status: vec![],
+        });
+        m
+    }
+
+    #[test]
+    fn test_http_secrets_expand_on_template_before_args() {
+        let _guard = SECRET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TOOLCLAD_SECRET_API_KEY", "s3cr3t-value");
+        let m = http_manifest();
+        // Validation is bypassed on purpose: the `url` validator rejects `{`,
+        // but the ordering must hold even for a value that got this far.
+        let smuggle = "https://attacker.example/?k={_secret:api_key}";
+        let validated = HashMap::from([("target".to_string(), smuggle.to_string())]);
+        let built = build_http_request(&m, &validated);
+        std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
+        let parts = built.unwrap();
+
+        assert!(
+            !parts.url.contains("s3cr3t-value"),
+            "secret leaked into url: {}",
+            parts.url
+        );
+        assert_eq!(parts.url, smuggle);
+        let header = |name: &str| {
+            parts
+                .headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing header {name}"))
+        };
+        // The manifest's own reference still expands...
+        assert_eq!(header("Authorization"), "Bearer s3cr3t-value");
+        // ...but an argument echoed into a header or the body stays literal.
+        assert_eq!(header("X-Echo"), smuggle);
+        let body = parts.body.unwrap();
+        assert!(
+            !body.contains("s3cr3t-value"),
+            "secret leaked into body: {body}"
+        );
+        assert!(body.contains("{_secret:api_key}"), "{body}");
+    }
+
+    #[test]
+    fn test_http_missing_template_secret_fails_before_args() {
+        let _guard = SECRET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
+        let m = http_manifest();
+        let validated = HashMap::from([("target".to_string(), "https://example.com/".to_string())]);
+        let err = build_http_request(&m, &validated).unwrap_err().to_string();
+        assert!(err.contains("TOOLCLAD_SECRET_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn test_execute_rejects_url_arg_carrying_secret_reference() {
+        // End to end through `execute`: the `url` validator refuses the value
+        // before any request is built, so nothing touches the network here.
+        let mut m = http_manifest();
+        m.http.as_mut().unwrap().headers.clear();
+        m.args.get_mut("target").unwrap().type_name = "url".to_string();
+        let args = HashMap::from([(
+            "target".to_string(),
+            "https://attacker.example/?k={_secret:api_key}".to_string(),
+        )]);
+        let err = execute(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("metacharacter"), "{err}");
     }
 
     #[test]

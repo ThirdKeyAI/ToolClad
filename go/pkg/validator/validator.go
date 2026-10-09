@@ -4,8 +4,7 @@ package validator
 import (
 	"fmt"
 	"math"
-	"net"
-	"net/url"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -18,9 +17,36 @@ import (
 // shellMetacharacters contains characters that indicate injection attempts.
 const shellMetacharacters = ";|&$`(){}[]<>!\n\r"
 
+// hostnameRe is the structural hostname check: dot-separated LDH labels of
+// 1-63 characters that neither start nor end with a hyphen. No trailing dot
+// is admitted, so the rightmost label is always the TLD that
+// tldNotAllNumeric inspects.
 var hostnameRe = regexp.MustCompile(
-	`^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.)*(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.?$`,
+	`^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.)*(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)$`,
 )
+
+// defaultURLSchemes is the scheme allowlist used when an arg sets none.
+var defaultURLSchemes = []string{"http", "https"}
+
+// deniedURLSchemes are never permitted, even when a manifest lists one in
+// `schemes`: each either executes content, reads local files, or speaks a
+// protocol that can be driven at an internal service by a crafted URL.
+var deniedURLSchemes = map[string]bool{
+	"javascript": true,
+	"data":       true,
+	"file":       true,
+	"blob":       true,
+	"about":      true,
+	"gopher":     true,
+	"dict":       true,
+	"ftp":        true,
+	"ldap":       true,
+	"jar":        true,
+	"netdoc":     true,
+	"mailto":     true,
+	"ws":         true,
+	"wss":        true,
+}
 
 // ValidationError represents a failed argument validation.
 type ValidationError struct {
@@ -332,31 +358,34 @@ func validateEnum(def *manifest.ArgDef, value string) (string, error) {
 	return "", newErr(def.Name, fmt.Sprintf("value %q not in allowed values: %v", value, def.Allowed))
 }
 
+// isValidHostname is the structural hostname check plus the rule that the
+// rightmost label is not all digits — no valid TLD is numeric (RFC 3696
+// §2), which also stops dotted-decimal IP forms from passing as names.
 func isValidHostname(value string) bool {
-	return hostnameRe.MatchString(value) && len(value) <= 253
+	return len(value) <= 253 && hostnameRe.MatchString(value) && tldNotAllNumeric(value)
 }
 
 func isValidIP(value string) bool {
-	return net.ParseIP(value) != nil
+	_, ok := parseCanonicalIP(value)
+	return ok
+}
+
+// parseCanonicalCIDR parses only canonical CIDR text: a canonical address
+// (see parseCanonicalIP) followed by a decimal prefix length in range.
+func parseCanonicalCIDR(value string) (netip.Prefix, bool) {
+	if !strings.Contains(value, "/") {
+		return netip.Prefix{}, false
+	}
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil || prefix.Addr().Zone() != "" {
+		return netip.Prefix{}, false
+	}
+	return prefix, true
 }
 
 func isValidCIDR(value string) bool {
-	if !strings.Contains(value, "/") {
-		return false
-	}
-	_, _, err := net.ParseCIDR(value)
-	return err == nil
-}
-
-// hasPunycodeLabel returns true if any DNS label in `host` is an A-label
-// (xn-- prefix, case-insensitive). Used to defend against IDN homoglyph bypass.
-func hasPunycodeLabel(host string) bool {
-	for _, label := range strings.Split(host, ".") {
-		if len(label) >= 4 && strings.EqualFold(label[:4], "xn--") {
-			return true
-		}
-	}
-	return false
+	_, ok := parseCanonicalCIDR(value)
+	return ok
 }
 
 func isASCII(s string) bool {
@@ -418,33 +447,166 @@ func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain punycode (xn--) labels — IDN/IDNA hostnames are rejected to prevent homoglyph bypass; gate IDN registration upstream if needed: %q", value))
 	}
 
-	if !isValidIP(value) && !isValidCIDR(value) && !isValidHostname(value) {
+	// Canonical IP literals only (see parseCanonicalIP): the egress policy
+	// is applied to the literal address.
+	if addr, ok := parseCanonicalIP(value); ok {
+		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+
+	// CIDR ranges: the policy is applied to the base address.
+	if prefix, ok := parseCanonicalCIDR(value); ok {
+		if err := enforceIPPolicy(def.Name, prefix.Addr(), def.BlockInternal); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+
+	// A non-canonical IP-literal encoding must not slip through as a
+	// "hostname": a downstream resolver would expand it to an address. No
+	// legitimate hostname is all-numeric labels or a 0x-prefixed hex literal.
+	if looksLikeIPLiteral(value) {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target looks like a non-canonical IP literal; use dotted-quad IPv4 or standard IPv6: %q", value))
+	}
+
+	if !isValidHostname(value) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid scope target: %q (must be a valid IP, CIDR, or hostname)", value))
 	}
 	return value, nil
 }
 
+// validateURL is the structural url validator. The string-derived hygiene
+// rules (NUL, control characters, quotes and backslash, whitespace — never
+// permitted for url — and the leading dash) have already run in
+// ValidateArgMode; the shell-metacharacter blocklist here rejects `{` and
+// `}` so a url value can never carry a {_secret:…} reference. The rest is a
+// deliberate hand parse rather than net/url, which accepts any scheme,
+// spaces in the path and other forms a fetcher would happily act on.
 func validateURL(def *manifest.ArgDef, value string) (string, error) {
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
 	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", newErr(def.Name, fmt.Sprintf("invalid URL: %q", value))
+
+	// scheme://rest — a value without "://" is not a URL.
+	scheme, rest, found := strings.Cut(value, "://")
+	if !found {
+		return "", newErr(def.Name, fmt.Sprintf("invalid URL: %q (expected scheme://host)", value))
 	}
-	if len(def.Schemes) > 0 {
-		found := false
-		for _, s := range def.Schemes {
-			if s == parsed.Scheme {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return "", newErr(def.Name, fmt.Sprintf("URL scheme %q not in allowed schemes: %v", parsed.Scheme, def.Schemes))
+	scheme = strings.ToLower(scheme)
+
+	// Scheme allowlist: def.Schemes when non-empty, else http and https.
+	allowed := def.Schemes
+	if len(allowed) == 0 {
+		allowed = defaultURLSchemes
+	}
+	schemeAllowed := false
+	for _, s := range allowed {
+		if strings.ToLower(s) == scheme {
+			schemeAllowed = true
+			break
 		}
 	}
+	if !schemeAllowed {
+		return "", newErr(def.Name, fmt.Sprintf("URL scheme %q not in allowed schemes: %v", scheme, allowed))
+	}
+
+	// Explicit denial, even when a manifest lists the scheme in `schemes`.
+	if deniedURLSchemes[scheme] {
+		return "", newErr(def.Name, fmt.Sprintf("URL scheme %q is never permitted", scheme))
+	}
+
+	// Userinfo: an "@" before the first "/" of the authority hides the real
+	// host from a human reviewer and is a classic SSRF decoy.
+	authority := rest
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		authority = rest[:i]
+	}
+	if strings.Contains(authority, "@") {
+		return "", newErr(def.Name, "URL must not contain userinfo (user:password@host)")
+	}
+
+	// Host: everything between "://" and the first "/", "?" or "#".
+	hostport := rest
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		hostport = rest[:i]
+	}
+	host, port, err := splitURLHostPort(hostport)
+	if err != nil {
+		return "", newErr(def.Name, err.Error())
+	}
+	if port != "" {
+		n, convErr := strconv.Atoi(port)
+		if convErr != nil || !allASCIIDigits(port) {
+			return "", newErr(def.Name, fmt.Sprintf("invalid URL port: %q", port))
+		}
+		if n < 1 || n > 65535 {
+			return "", newErr(def.Name, fmt.Sprintf("URL port %d out of range 1-65535", n))
+		}
+	}
+
+	// Host policy: punycode, canonical-literal rule, range table.
+	if hasPunycodeLabel(host) {
+		return "", newErr(def.Name, "URL host must not contain punycode (xn--) labels")
+	}
+	if addr, ok := parseCanonicalIP(host); ok {
+		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+			return "", err
+		}
+	} else if looksLikeIPLiteral(host) {
+		return "", newErr(def.Name, fmt.Sprintf("URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname: %q", host))
+	} else if !isValidHostname(host) {
+		return "", newErr(def.Name, fmt.Sprintf("URL host is not a valid hostname or IP literal: %q", host))
+	}
+
+	// SCOPE HOOK: when def.ScopeCheck is set, the scope checker will be
+	// consulted here with `host` once scope enforcement lands. Until then
+	// scope_check is parsed and carried on the ArgDef but not applied.
+
 	return value, nil
+}
+
+// splitURLHostPort separates the authority (already stripped of any path,
+// query or fragment) into host and optional port. A bracketed IPv6 literal
+// is unwrapped and must be a canonical IPv6 address; an unbracketed value
+// splits at its last ":" so an unbracketed IPv6 form can never pass as a
+// host. An empty host is an error, as is a ":" with nothing after it; the
+// port, when present, is returned unparsed for the caller to range-check.
+func splitURLHostPort(hostport string) (host, port string, err error) {
+	if hostport == "" {
+		return "", "", fmt.Errorf("URL host must not be empty")
+	}
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.IndexByte(hostport, ']')
+		if end < 0 {
+			return "", "", fmt.Errorf("URL host has an unterminated IPv6 bracket: %q", hostport)
+		}
+		host = hostport[1:end]
+		addr, ok := parseCanonicalIP(host)
+		if !ok || !addr.Is6() {
+			return "", "", fmt.Errorf("URL host is not a valid IPv6 literal: %q", host)
+		}
+		tail := hostport[end+1:]
+		if tail == "" {
+			return host, "", nil
+		}
+		if !strings.HasPrefix(tail, ":") {
+			return "", "", fmt.Errorf("unexpected characters after IPv6 literal: %q", tail)
+		}
+		port = tail[1:]
+	} else if i := strings.LastIndexByte(hostport, ':'); i >= 0 {
+		host, port = hostport[:i], hostport[i+1:]
+	} else {
+		return hostport, "", nil
+	}
+	if host == "" {
+		return "", "", fmt.Errorf("URL host must not be empty")
+	}
+	if port == "" {
+		return "", "", fmt.Errorf("URL port must not be empty after ':' in %q", hostport)
+	}
+	return host, port, nil
 }
 
 func validatePath(def *manifest.ArgDef, value string) (string, error) {
@@ -469,8 +631,12 @@ func validatePath(def *manifest.ArgDef, value string) (string, error) {
 }
 
 func validateIPAddress(def *manifest.ArgDef, value string) (string, error) {
-	if net.ParseIP(value) == nil {
+	addr, ok := parseCanonicalIP(value)
+	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("invalid IP address: %q", value))
+	}
+	if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+		return "", err
 	}
 	return value, nil
 }
@@ -479,8 +645,12 @@ func validateCIDR(def *manifest.ArgDef, value string) (string, error) {
 	if !strings.Contains(value, "/") {
 		return "", newErr(def.Name, fmt.Sprintf("CIDR notation requires '/': %q", value))
 	}
-	if _, _, err := net.ParseCIDR(value); err != nil {
+	prefix, ok := parseCanonicalCIDR(value)
+	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("invalid CIDR: %q", value))
+	}
+	if err := enforceIPPolicy(def.Name, prefix.Addr(), def.BlockInternal); err != nil {
+		return "", err
 	}
 	return value, nil
 }

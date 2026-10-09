@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Any, Dict, List
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Tuple
 
+from toolclad.hostpolicy import (
+    enforce_ip_policy,
+    has_punycode_label,
+    looks_like_ip_literal,
+    parse_canonical_cidr,
+    parse_canonical_ip,
+    tld_not_all_numeric,
+)
 from toolclad.manifest import ArgDef
 
 # Shell metacharacters that indicate injection attempts.
@@ -196,35 +203,34 @@ def _validate_enum(arg_def: ArgDef, value: str) -> str:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Network-typed values: scope_target, url, ip_address, cidr
+#
+# Every literal address goes through ``toolclad.hostpolicy`` — the range
+# table, the canonical-literal parsers and the punycode rule — so the policy
+# can be compared side by side with the other runtimes.
+# ---------------------------------------------------------------------------
+
 def _is_valid_hostname(value: str) -> bool:
-    """Check if value looks like a valid hostname (not IP, not CIDR)."""
-    return bool(_HOSTNAME_RE.match(value)) and len(value) <= 253
+    """Structural hostname check: RFC 1035 labels, the 253-octet cap, and a
+    rightmost label that is not all digits (a real TLD never is, RFC 3696
+    §2 — which also rejects dotted-decimal IPs that slipped past the literal
+    parser and the trailing-dot form)."""
+    return (
+        len(value) <= 253
+        and bool(_HOSTNAME_RE.match(value))
+        and tld_not_all_numeric(value)
+    )
 
 
 def _is_valid_ip(value: str) -> bool:
-    """Check if value is a valid IPv4 or IPv6 address."""
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
+    """Check if value is a canonical IPv4 or IPv6 address."""
+    return parse_canonical_ip(value) is not None
 
 
 def _is_valid_cidr(value: str) -> bool:
-    """Check if value is valid CIDR notation."""
-    try:
-        ipaddress.ip_network(value, strict=False)
-        return "/" in value
-    except ValueError:
-        return False
-
-
-def _has_punycode_label(host: str) -> bool:
-    """Returns True if any DNS label in `host` is an A-label (case-insensitive xn--)."""
-    for label in host.split("."):
-        if len(label) >= 4 and label[:4].lower() == "xn--":
-            return True
-    return False
+    """Check if value is canonical CIDR notation."""
+    return parse_canonical_cidr(value) is not None
 
 
 # RFC 1035 §2.3.4 caps a fully-qualified domain name at 253 octets.
@@ -278,30 +284,189 @@ def _validate_scope_target(arg_def: ArgDef, value: str) -> str:
             f"homoglyphs are rejected; gate IDN registration upstream if needed): {value!r}"
         )
     # Defense-in-depth against IDN homoglyph bypass via punycode.
-    if _has_punycode_label(value):
+    if has_punycode_label(value):
         raise ValidationError(
             f"scope_target must not contain punycode (xn--) labels — IDN/IDNA "
             f"hostnames are rejected to prevent homoglyph bypass; gate IDN "
             f"registration upstream if needed: {value!r}"
         )
 
-    if not (_is_valid_ip(value) or _is_valid_cidr(value) or _is_valid_hostname(value)):
+    # Canonical IP literals only (see hostpolicy.parse_canonical_ip): the
+    # egress policy is applied to the literal address.
+    ip = parse_canonical_ip(value)
+    if ip is not None:
+        enforce_ip_policy(arg_def.name, ip, arg_def.block_internal)
+        return value
+
+    # CIDR ranges: the policy is applied to the base address as written.
+    # Testing the whole range for overlap with each blocked prefix is a
+    # later wave.
+    cidr = parse_canonical_cidr(value)
+    if cidr is not None:
+        enforce_ip_policy(arg_def.name, cidr[0], arg_def.block_internal)
+        return value
+
+    # A non-canonical IP-literal encoding must not slip through as a
+    # "hostname": a downstream resolver would expand it to an address. No
+    # legitimate hostname is all-numeric labels or a 0x-prefixed hex literal.
+    if looks_like_ip_literal(value):
+        raise ValidationError(
+            "scope_target looks like a non-canonical IP literal; use "
+            f"dotted-quad IPv4 or standard IPv6: {value!r}"
+        )
+
+    if not _is_valid_hostname(value):
         raise ValidationError(
             f"Invalid scope target: {value!r} "
             "(must be a valid IP, CIDR, or hostname)"
         )
+    # Hostname strengthening (internal-suffix denylist, embedded IP
+    # literals, DNS resolution under block_internal) plugs in here in a
+    # later wave, via toolclad.hostpolicy.
     return value
 
 
+# Schemes a url argument may use when the manifest does not set `schemes`.
+_DEFAULT_URL_SCHEMES = ("http", "https")
+
+# Never permitted, even when a manifest lists one in `schemes`: each either
+# executes content, reads local files, or speaks a protocol that can be
+# driven at an internal service by a crafted URL.
+_DENIED_URL_SCHEMES = frozenset({
+    "javascript", "data", "file", "blob", "about", "gopher", "dict", "ftp",
+    "ldap", "jar", "netdoc", "mailto", "ws", "wss",
+})
+
+# A URL port: plain decimal digits only (int() would also accept a sign,
+# surrounding whitespace and non-ASCII digits), short enough to convert.
+_URL_PORT_RE = re.compile(r"[0-9]{1,5}")
+
+
+def _split_url_authority(
+    authority: str,
+) -> Tuple[str, Optional[int], Optional[ipaddress.IPv6Address]]:
+    """Split a URL authority into ``(host, port, bracketed_v6)``.
+
+    ``authority`` is everything between ``://`` and the first ``/``, ``?``
+    or ``#``, with userinfo already refused. A bracketed IPv6 literal is
+    unwrapped and must be canonical; an unbracketed one is ambiguous with a
+    port and refused. A written port must be 1-65535 in plain decimal
+    digits. Every malformed shape raises ``ValidationError``.
+    """
+    bracketed_v6: Optional[ipaddress.IPv6Address] = None
+    port_text: Optional[str] = None
+    if authority.startswith("["):
+        close = authority.find("]")
+        if close < 0:
+            raise ValidationError("URL has a malformed bracketed IPv6 host")
+        host = authority[1:close]
+        tail = authority[close + 1:]
+        if tail:
+            if not tail.startswith(":"):
+                raise ValidationError("URL has a malformed bracketed IPv6 host")
+            port_text = tail[1:]
+        parsed = parse_canonical_ip(host)
+        if not isinstance(parsed, ipaddress.IPv6Address):
+            raise ValidationError("URL bracketed host is not a valid IPv6 literal")
+        bracketed_v6 = parsed
+    else:
+        head, sep, tail = authority.rpartition(":")
+        if sep:
+            host, port_text = head, tail
+        else:
+            host = authority
+
+    if not host:
+        raise ValidationError("URL has an empty host")
+    if bracketed_v6 is None and ":" in host:
+        raise ValidationError("URL IPv6 host must be enclosed in brackets")
+
+    port: Optional[int] = None
+    if port_text is not None:
+        if _URL_PORT_RE.fullmatch(port_text) is None or not 1 <= int(port_text) <= 65535:
+            raise ValidationError("URL port must be 1-65535")
+        port = int(port_text)
+    return host, port, bracketed_v6
+
+
 def _validate_url(arg_def: ArgDef, value: str) -> str:
+    """The ``url`` validator, in order: the string-derived hygiene has
+    already run (whitespace is never admitted for a url, opt-in or not);
+    then the shell-metacharacter blocklist, which rejects ``{`` and ``}``
+    and therefore any ``{_secret:…}`` reference; then a structural parse —
+    ``scheme://``, the scheme allowlist, the scheme denylist, no userinfo,
+    host extraction with an optional port — and finally the host policy of
+    ``toolclad.hostpolicy``.
+
+    This is deliberately not a WHATWG / RFC 3986 normalizer (``urlparse``
+    accepts any scheme and tolerates spaces). The fetcher downstream will
+    parse the value again with its own rules, so anything a human reviewer
+    of the manifest could misread is refused here rather than normalized
+    away.
+    """
     _check_injection(value)
-    parsed = urlparse(value)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValidationError(f"Invalid URL: {value!r}")
-    if arg_def.schemes and parsed.scheme not in arg_def.schemes:
+
+    # Step 2: scheme://rest.
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        raise ValidationError(f"Invalid URL: {value!r} (expected scheme://host)")
+    scheme = scheme.lower()
+
+    # Step 3: allowlist — the manifest's `schemes` when set, else http/https.
+    allowed = [str(s).lower() for s in arg_def.schemes] or list(_DEFAULT_URL_SCHEMES)
+    if scheme not in allowed:
         raise ValidationError(
-            f"URL scheme '{parsed.scheme}' not in allowed schemes: {arg_def.schemes}"
+            f"URL scheme '{scheme}' is not permitted (allowed: {', '.join(allowed)})"
         )
+
+    # Step 4: explicit denial, even when a manifest lists the scheme.
+    if scheme in _DENIED_URL_SCHEMES:
+        raise ValidationError(
+            f"URL scheme '{scheme}' is never permitted for a url argument"
+        )
+
+    # Step 5: the authority ends at the first '/', '?' or '#'. An '@' before
+    # that is userinfo, which hides the real host from a reviewer.
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    if "@" in authority:
+        raise ValidationError("URL must not contain userinfo (user:pass@host)")
+
+    # Step 6: host and optional port.
+    host, _port, bracketed_v6 = _split_url_authority(authority)
+
+    # Step 7: host policy — the same checks as scope_target, since curl and
+    # wget-style fetchers are the prime SSRF vector.
+    if has_punycode_label(host):
+        raise ValidationError("URL host must not contain punycode (xn--) labels")
+    ip = bracketed_v6 if bracketed_v6 is not None else parse_canonical_ip(host)
+    if ip is not None:
+        enforce_ip_policy(arg_def.name, ip, arg_def.block_internal)
+    else:
+        if not host.isascii():
+            raise ValidationError(
+                "URL host must be ASCII (IDN hostnames are rejected to prevent "
+                "homoglyph bypass)"
+            )
+        if looks_like_ip_literal(host):
+            raise ValidationError(
+                "URL host looks like a non-canonical IP literal; use dotted-quad "
+                f"IPv4 or a hostname: {host!r}"
+            )
+        if len(host) > _SCOPE_TARGET_MAX_LEN or any(
+            len(label) > 63 for label in host.split(".")
+        ):
+            raise ValidationError("URL host exceeds DNS length limits (RFC 1035 §2.3.4)")
+        if not _is_valid_hostname(host):
+            raise ValidationError(
+                f"URL host is not a valid hostname or IP literal: {host!r}"
+            )
+        # Hostname strengthening (internal-suffix denylist, embedded IP
+        # literals, DNS resolution under block_internal) plugs in here in a
+        # later wave, via toolclad.hostpolicy.
+
+    # Step 8 — SCOPE HOOK: when arg_def.scope_check is set, the scope checker
+    # (a later wave) is consulted here with `host`. Not implemented yet; the
+    # flag is parsed and carried so manifests can already declare it.
     return value
 
 
@@ -316,20 +481,25 @@ def _validate_path(arg_def: ArgDef, value: str) -> str:
 
 
 def _validate_ip_address(arg_def: ArgDef, value: str) -> str:
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
+    """A canonical IPv4 or IPv6 literal, under the same egress policy as
+    every other address-carrying type: link-local is always refused, the
+    rest of the non-public table under ``block_internal``."""
+    ip = parse_canonical_ip(value)
+    if ip is None:
         raise ValidationError(f"Invalid IP address: {value!r}")
+    enforce_ip_policy(arg_def.name, ip, arg_def.block_internal)
     return value
 
 
 def _validate_cidr(arg_def: ArgDef, value: str) -> str:
-    try:
-        ipaddress.ip_network(value, strict=False)
-    except ValueError:
-        raise ValidationError(f"Invalid CIDR: {value!r}")
     if "/" not in value:
         raise ValidationError(f"CIDR notation requires '/': {value!r}")
+    parsed = parse_canonical_cidr(value)
+    if parsed is None:
+        raise ValidationError(f"Invalid CIDR: {value!r}")
+    # The policy applies to the base address as written. Testing the whole
+    # range for overlap with each blocked prefix is a later wave.
+    enforce_ip_policy(arg_def.name, parsed[0], arg_def.block_internal)
     return value
 
 

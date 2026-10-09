@@ -172,15 +172,22 @@ pub struct ArgDef {
     pub max_float: Option<f64>,
     #[serde(default)]
     pub clamp: bool,
+    /// `url` only: scheme allowlist, compared case-insensitively. Empty means
+    /// the default `["http", "https"]`. A scheme on the fixed denylist
+    /// (javascript, data, file, blob, about, gopher, dict, ftp, ldap, jar,
+    /// netdoc, mailto, ws, wss) is refused even when listed here.
     #[serde(default)]
     pub schemes: Vec<String>,
     #[serde(default)]
     pub scope_check: bool,
-    /// `scope_target` only: when true, reject targets that resolve to a
-    /// non-public address — loopback, private, link-local (incl. cloud-metadata
-    /// 169.254.0.0/16), unspecified, broadcast, documentation, and the IPv6
-    /// equivalents (incl. v4-mapped). SSRF defense-in-depth, opt-in per arg so
-    /// tools that legitimately target internal hosts are unaffected.
+    /// `scope_target`, `url`, `ip_address` and `cidr`: when true, reject a
+    /// literal target (or the base address of a CIDR) in a non-public range —
+    /// loopback, private, shared/CGNAT, unspecified, broadcast, documentation,
+    /// benchmarking, reserved, and the IPv6 equivalents (incl. v4-mapped); the
+    /// table lives in `crate::hostpolicy`. Link-local (incl. cloud-metadata
+    /// 169.254.0.0/16) is refused regardless of this flag. SSRF
+    /// defense-in-depth, opt-in per arg so tools that legitimately target
+    /// internal hosts are unaffected.
     #[serde(default)]
     pub block_internal: bool,
     /// Permit a value that starts with `-` or `+`. Off by default so a user

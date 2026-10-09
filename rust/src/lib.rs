@@ -103,6 +103,7 @@
 //! for the full `.clad.toml` format specification.
 
 pub mod executor;
+pub mod hostpolicy;
 pub mod types;
 pub mod validator;
 
