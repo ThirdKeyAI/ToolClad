@@ -993,3 +993,46 @@ def _validate_manifest(manifest: Manifest) -> None:
     # manifest that reaches the network. Custom types are not known at load;
     # validate_manifest_with_custom_types repeats the lint with them.
     _lint_egress(manifest)
+    _check_scope_check_types(manifest)
+    _check_arg_defaults(manifest)
+
+
+def _check_scope_check_types(manifest: Manifest) -> None:
+    """``scope_check`` is honored only on ``scope_target``, ``url``,
+    ``ip_address`` and ``cidr``; anywhere else it is a load error rather than
+    a flag that silently does nothing."""
+    from toolclad.scope import SCOPE_CHECK_TYPES
+
+    for arg in _iter_args(manifest):
+        if arg.scope_check and arg.type not in SCOPE_CHECK_TYPES:
+            raise ValueError(
+                f"argument '{arg.name}': scope_check is not supported for type '{arg.type}'"
+            )
+
+
+def _check_arg_defaults(manifest: Manifest) -> None:
+    """Validate every declared ``default`` through the strict entry point, so
+    a default that fails its own type is a load error naming the argument
+    instead of a confusing refusal (or an unvalidated substitution) at call
+    time. The scope step is deferred to the call, where the scope file is
+    known. A custom-typed argument is skipped (custom types are not known at
+    load)."""
+    from toolclad.validator import SUPPORTED_TYPES, ValidationError, _run_validation
+
+    for arg in _iter_args(manifest):
+        if arg.default is None or arg.type not in SUPPORTED_TYPES:
+            continue
+        try:
+            _run_validation(arg, _default_text(arg.default), False, check_scope=False)
+        except ValidationError as exc:
+            raise ValueError(
+                f"argument '{arg.name}': default {arg.default!r} is invalid: {exc}"
+            ) from None
+
+
+def _default_text(value: Any) -> str:
+    """The string form a default is validated and substituted as. A TOML
+    boolean renders as ``true``/``false``, not Python's ``True``."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)

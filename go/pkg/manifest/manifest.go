@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/thirdkeyai/toolclad/pkg/scope"
 )
 
 // The manifest structs below ARE the key allowlist. Every key a .clad.toml
@@ -290,9 +293,119 @@ type Manifest struct {
 	Session    *SessionDef        `toml:"session"`
 	Browser    *BrowserDef        `toml:"browser"`
 	SourcePath string             `toml:"-"`
+	// Scope is the project scope consulted by arguments that set
+	// scope_check = true. LoadManifest discovers it once (see EnsureScope)
+	// when any argument needs it; an embedder may set it directly. Nil
+	// with scope_check set is a fail-closed refusal at validation.
+	Scope *scope.ScopeDef `toml:"-"`
 
-	compiled bool
+	compiled      bool
+	scopeResolved bool
 }
+
+// scopeCheckTypes are the argument types on which scope_check is honored.
+var scopeCheckTypes = map[string]bool{
+	"scope_target": true,
+	"url":          true,
+	"ip_address":   true,
+	"cidr":         true,
+}
+
+// builtinTypes are the built-in argument types. Any other type name is a
+// custom type from toolclad.toml, resolved by the validator package.
+var builtinTypes = map[string]bool{
+	"string": true, "integer": true, "number": true, "port": true,
+	"boolean": true, "enum": true, "scope_target": true, "url": true,
+	"path": true, "ip_address": true, "cidr": true, "msf_options": true,
+	"credential_file": true, "duration": true, "regex_match": true,
+}
+
+// ScopeCheckSupported reports whether scope_check is honored on the
+// built-in type t (scope_target, url, ip_address, cidr).
+func ScopeCheckSupported(t string) bool {
+	return scopeCheckTypes[t]
+}
+
+// UsesScopeCheck reports whether any argument sets scope_check = true.
+func (m *Manifest) UsesScopeCheck() bool {
+	for _, def := range m.allArgDefs() {
+		if def.ScopeCheck {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureScope discovers the scope file once per manifest when an argument
+// sets scope_check and Scope was not set by the caller: TOOLCLAD_SCOPE_FILE,
+// else scope/scope.toml searched upward from the manifest's directory (the
+// working directory for a manifest built in memory). Not finding a file is
+// not an error here; validation then refuses fail-closed. A scope file that
+// exists but cannot be read or parsed is an error.
+func (m *Manifest) EnsureScope() error {
+	if m.Scope != nil || m.scopeResolved || !m.UsesScopeCheck() {
+		return nil
+	}
+	dir := ""
+	if m.SourcePath != "" {
+		dir = filepath.Dir(m.SourcePath)
+	}
+	s, err := scope.Discover(dir)
+	if err != nil {
+		return err
+	}
+	m.Scope = s
+	m.scopeResolved = true
+	return nil
+}
+
+// checkArgDefs applies the per-argument load-time rules: scope_check only
+// on a type that supports it, and every declared default valid for its own
+// argument (through DefaultValidator, when one is registered).
+func (m *Manifest) checkArgDefs() error {
+	all := m.allArgDefs()
+	names := make([]string, 0, len(all))
+	for name := range all {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		def := all[name]
+		t := def.Type
+		if t == "" {
+			t = "string"
+		}
+		// A custom type is checked by its base type once custom types are
+		// loaded (validator.ValidateManifestWithCustomTypes).
+		if def.ScopeCheck && builtinTypes[t] && !scopeCheckTypes[t] {
+			return fmt.Errorf("argument '%s': scope_check is not supported for type '%s'", name, t)
+		}
+	}
+	if DefaultValidator == nil {
+		return nil
+	}
+	for _, name := range names {
+		def := all[name]
+		if def.Default == nil {
+			continue
+		}
+		val := fmt.Sprintf("%v", def.Default)
+		if val == "" && (def.Type == "string" || def.Type == "") {
+			continue // an empty string default is always acceptable
+		}
+		if err := DefaultValidator(def, val, m.Scope); err != nil {
+			return fmt.Errorf("argument '%s': invalid default %q: %w", name, val, err)
+		}
+	}
+	return nil
+}
+
+// DefaultValidator validates a declared per-argument default at load. The
+// validator package registers its strict entry point here on import (this
+// package cannot import it without a cycle). Arguments of a type it does not
+// know (custom types) must be accepted; they are checked once custom types
+// are available. Nil disables the check.
+var DefaultValidator func(def *ArgDef, value string, s *scope.ScopeDef) error
 
 // ArgsSorted returns the argument definitions sorted by position.
 func (m *Manifest) ArgsSorted() []*ArgDef {
@@ -496,6 +609,12 @@ func (m *Manifest) EnsureCompiled() error {
 		return err
 	}
 	if err := m.LintEgress(nil); err != nil {
+		return err
+	}
+	if err := m.EnsureScope(); err != nil {
+		return err
+	}
+	if err := m.checkArgDefs(); err != nil {
 		return err
 	}
 	m.compiled = true
@@ -968,5 +1087,11 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	}
 
 	m.SourcePath = path
+	if err := m.EnsureScope(); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
+	if err := m.checkArgDefs(); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
 	return &m, nil
 }

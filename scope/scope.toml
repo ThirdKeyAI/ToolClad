@@ -1,0 +1,28 @@
+# Project scope definition.
+#
+# Any argument declaring `scope_check = true` is validated against this file
+# before the command is built. Types that participate: `scope_target`, `url`
+# (the host is extracted), `ip_address`, and `cidr`.
+#
+# Discovery order:
+#   1. the path in the TOOLCLAD_SCOPE_FILE environment variable
+#   2. `scope/scope.toml`, searched upward from the manifest's directory
+#
+# Enforcement is fail-closed: if an argument sets `scope_check = true` and no
+# scope file can be found, the call is refused. Blocked rules are evaluated
+# first and always win over allowed rules.
+#
+# Domain rules:
+#   "example.com"    matches exactly that host
+#   "*.example.com"  matches any strict subdomain at any depth
+#                    (app.example.com, deep.sub.example.com) but NOT the apex
+#                    example.com, and NOT a suffix match like evil-example.com
+#
+# CIDR rules: an IP matches when it is contained in the range. A CIDR argument
+# matches only when it is fully contained in an allowed range.
+
+[scope]
+allowed_domains = ["example.com", "*.example.com"]
+allowed_cidrs = []
+blocked_domains = []
+blocked_cidrs = []

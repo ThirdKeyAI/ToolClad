@@ -660,10 +660,11 @@ class TestSecretOrdering:
     def test_argument_cannot_smuggle_a_secret_into_the_url(self, monkeypatch):
         monkeypatch.setenv("TOOLCLAD_SECRET_API_KEY", _SECRET)
         m = _http_manifest(url="{target}")
-        envelope = execute(m, {"target": _SMUGGLE}, dry_run=True)
-        assert envelope["status"] == "dry_run"
-        assert _SECRET not in envelope["command"]
-        assert envelope["command"] == f"POST {_SMUGGLE}"
+        # HTTP arguments go through the same validation as the oneshot path,
+        # so a brace-carrying value is refused before anything is built.
+        with pytest.raises(ValidationError, match="metacharacters") as exc:
+            execute(m, {"target": _SMUGGLE}, dry_run=True)
+        assert _SECRET not in str(exc.value)
 
     def test_manifest_secret_still_expands_before_args(self, monkeypatch):
         monkeypatch.setenv("TOOLCLAD_SECRET_API_KEY", _SECRET)
@@ -700,13 +701,17 @@ class TestSecretOrdering:
             headers={"X-Echo": "{target}", "Authorization": "Bearer {_secret:api_key}"},
             body_template='{"t": "{target}"}',
         )
-        envelope = execute(m, {"target": "{_secret:api_key}"})
+        with pytest.raises(ValidationError, match="metacharacters"):
+            execute(m, {"target": "{_secret:api_key}"})
+        assert "req" not in captured  # refused before any request was built
+
+        envelope = execute(m, {"target": "scan123"})
         assert envelope["http_status"] == 200
         req = captured["req"]
-        assert req.full_url == "http://127.0.0.1:9/{_secret:api_key}"
-        assert req.get_header("X-echo") == "{_secret:api_key}"
+        assert req.full_url == "http://127.0.0.1:9/scan123"
+        assert req.get_header("X-echo") == "scan123"
         assert req.get_header("Authorization") == f"Bearer {_SECRET}"
-        assert req.data == b'{"t": "{_secret:api_key}"}'
+        assert req.data == b'{"t": "scan123"}'
         assert _SECRET not in req.full_url
         assert _SECRET not in req.data.decode()
 

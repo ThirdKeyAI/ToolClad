@@ -68,6 +68,9 @@ func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (m
 	if err := checkDeclaredArgs(m, args); err != nil {
 		return nil, nil, err
 	}
+	if err := m.EnsureScope(); err != nil {
+		return nil, nil, err
+	}
 
 	// allow_whitespace is honored only for a manifest that declared exec
 	// itself; the executor escape hatch always validates in strict mode.
@@ -88,7 +91,7 @@ func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (m
 			val = fmt.Sprintf("%v", argDef.Default)
 		}
 
-		validated, err := validator.ValidateArgMode(argDef, val, execMode)
+		validated, err := validator.ValidateArgIn(argDef, val, execMode, m.Scope)
 		if err != nil {
 			return nil, nil, fmt.Errorf("argument %q: %w", name, err)
 		}
@@ -869,6 +872,9 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	if err := m.LintEgress(nil); err != nil {
 		return nil, err
 	}
+	if err := m.EnsureScope(); err != nil {
+		return nil, err
+	}
 
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
@@ -887,7 +893,7 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 				continue
 			}
 		}
-		validated, err := validator.ValidateArg(argDef, val)
+		validated, err := validator.ValidateArgIn(argDef, val, false, m.Scope)
 		if err != nil {
 			return nil, fmt.Errorf("argument %q: %w", name, err)
 		}
@@ -977,6 +983,9 @@ func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope
 	if err := m.LintEgress(nil); err != nil {
 		return nil, err
 	}
+	if err := m.EnsureScope(); err != nil {
+		return nil, err
+	}
 
 	start := time.Now()
 	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
@@ -995,7 +1004,7 @@ func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope
 				continue
 			}
 		}
-		validated, err := validator.ValidateArg(argDef, val)
+		validated, err := validator.ValidateArgIn(argDef, val, false, m.Scope)
 		if err != nil {
 			return nil, fmt.Errorf("argument %q: %w", name, err)
 		}

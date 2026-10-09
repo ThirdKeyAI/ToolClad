@@ -185,7 +185,7 @@ func testCmd() *cobra.Command {
 
 				// allow_whitespace is honored only when the manifest
 				// declared exec = [...] itself.
-				validated, vErr := validator.ValidateArgMode(argDef, val, m.Command.ExecWasDeclared)
+				validated, vErr := validator.ValidateArgIn(argDef, val, m.Command.ExecWasDeclared, m.Scope)
 				status := "OK"
 				if vErr != nil {
 					status = fmt.Sprintf("FAIL: %v", vErr)

@@ -103,7 +103,7 @@ class TestPortValidation:
             validate_arg(_arg("port"), "70000")
 
     def test_port_negative(self):
-        with pytest.raises(ValidationError, match="out of range"):
+        with pytest.raises(ValidationError, match="Expected port number"):
             validate_arg(_arg("port"), "-1")
 
     def test_port_not_a_number(self):
@@ -421,9 +421,9 @@ class TestNumberValidation:
             validate_arg(_arg("number"), "abc")
 
     def test_rejects_nan_and_inf(self):
-        with pytest.raises(ValidationError, match="finite"):
+        with pytest.raises(ValidationError, match="Expected number"):
             validate_arg(_arg("number"), "NaN")
-        with pytest.raises(ValidationError, match="finite"):
+        with pytest.raises(ValidationError, match="Expected number"):
             validate_arg(_arg("number"), "inf")
 
     def test_min_max_floats(self):

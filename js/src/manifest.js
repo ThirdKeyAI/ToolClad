@@ -1,6 +1,16 @@
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import TOML from "@iarna/toml";
 import { compileCommand, lintNetworkEgress } from "./executor.js";
+import { validateDefaultValue } from "./validator.js";
+import { MANIFEST_DIR, SCOPE_CHECK_TYPES } from "./scope.js";
+
+/** Built-in argument types; anything else is a custom type from toolclad.toml. */
+const BUILTIN_TYPES = new Set([
+  "string", "integer", "number", "port", "boolean", "enum", "scope_target",
+  "url", "path", "ip_address", "cidr", "msf_options", "credential_file",
+  "duration", "regex_match",
+]);
 
 /**
  * Complete manifest key allowlist, one entry per section, in the order of the
@@ -242,6 +252,11 @@ export function loadManifestWithOptions(path, options = {}) {
       }
       def.block_internal = takeBool(def, section, "block_internal", false);
       def.scope_check = takeBool(def, section, "scope_check", false);
+      if (def.scope_check && BUILTIN_TYPES.has(def.type) && !SCOPE_CHECK_TYPES.includes(def.type)) {
+        throw new Error(
+          `Invalid manifest: ${section}: scope_check is not supported for type '${def.type}'`
+        );
+      }
       if (
         def.schemes !== undefined &&
         (!Array.isArray(def.schemes) ||
@@ -296,7 +311,38 @@ export function loadManifestWithOptions(path, options = {}) {
   // at all and is an egress manifest by definition.
   lintNetworkEgress(manifest);
 
+  validateArgDefaults(manifest);
+
+  // Recorded for scope discovery (scope/scope.toml is searched upward from
+  // here); hidden so it never shows up in serialization or key walks.
+  Object.defineProperty(manifest, MANIFEST_DIR, {
+    value: dirname(resolve(path)),
+    enumerable: false,
+  });
+
   return manifest;
+}
+
+/**
+ * Validate every declared `[args.<n>].default` through the strict pipeline:
+ * a default that fails its own type is a manifest bug and a load error.
+ * Custom types are checked when the custom type map is supplied.
+ * @param {object} manifest
+ * @param {object} [customTypes]
+ */
+function validateArgDefaults(manifest, customTypes) {
+  for (const [name, def] of Object.entries(manifest.args || {})) {
+    if (def.default === undefined) continue;
+    if (!BUILTIN_TYPES.has(def.type) && !(customTypes && Object.hasOwn(customTypes, def.type))) {
+      continue;
+    }
+    if (def.type === "string" && def.default === "") continue;
+    try {
+      validateDefaultValue(def, def.default, customTypes);
+    } catch (err) {
+      throw new Error(`Invalid manifest: args.${name}.default is invalid: ${err.message}`);
+    }
+  }
 }
 
 /**
@@ -316,6 +362,15 @@ export function validateManifestWithCustomTypes(manifest, customTypes) {
     compileCommand(manifest);
   }
   lintNetworkEgress(manifest, customTypes || {});
+  validateArgDefaults(manifest, customTypes || {});
+  for (const [name, def] of Object.entries(manifest.args || {})) {
+    const custom = customTypes && Object.hasOwn(customTypes, def.type) ? customTypes[def.type] : null;
+    if (def.scope_check === true && custom && !SCOPE_CHECK_TYPES.includes(custom.base)) {
+      throw new Error(
+        `Invalid manifest: args.${name}: scope_check is not supported for type '${def.type}'`
+      );
+    }
+  }
   return manifest;
 }
 

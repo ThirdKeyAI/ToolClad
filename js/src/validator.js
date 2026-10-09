@@ -11,6 +11,7 @@ import {
   looksLikeIpLiteral,
   hasPunycodeLabel,
 } from "./hostpolicy.js";
+import { checkScope, SCOPE_CHECK_TYPES } from "./scope.js";
 
 /**
  * Shell metacharacters that indicate injection attempts.
@@ -121,7 +122,8 @@ function checkValueHygiene(str, argDef, type, execMode) {
   }
 }
 
-function runValidation(handler, type, argDef, value, execMode) {
+function runValidation(handler, type, argDef, value, opts) {
+  const { execMode = false } = opts;
   const str = String(value);
   // Rule 1: NUL is rejected for every type, enum and numerics included.
   if (str.includes("\0")) {
@@ -138,7 +140,39 @@ function runValidation(handler, type, argDef, value, execMode) {
       throw new Error(LEADING_DASH_MESSAGE);
     }
   }
+  if (argDef.scope_check === true && opts.skipScope !== true) {
+    return afterHostPolicy(out, () => enforceScope(type, str, opts.scope));
+  }
   return out;
+}
+
+/**
+ * Scope runs after the host/IP policy: hygiene, type parse, block_internal,
+ * then scope. For a hostname still awaiting resolution the scope check is
+ * chained onto the resolution so the order holds on the async path too.
+ */
+function afterHostPolicy(out, check) {
+  if (out instanceof HostResolution) {
+    return new HostResolution(out.host, (addresses) => {
+      const value = out.complete(addresses);
+      check();
+      return value;
+    });
+  }
+  check();
+  return out;
+}
+
+/**
+ * SCOPE HOOK: hold the checked subject (the host of a `url`, otherwise the
+ * value) to the scope definition. A missing scope is the fail-closed refusal.
+ */
+function enforceScope(type, str, scope) {
+  if (!SCOPE_CHECK_TYPES.includes(type)) {
+    throw new Error(`scope_check is not supported for type '${type}'`);
+  }
+  const subject = type === "url" ? parseUrlAuthority(splitUrlScheme(str).rest).host : str;
+  checkScope(subject, scope);
 }
 
 /**
@@ -237,14 +271,61 @@ async function resolveHostAddresses(host) {
  * The shared validation pipeline. May return a HostResolution, which the
  * entry point settles.
  */
-function validateArgCore(argDef, value, execMode) {
+function validateArgCore(argDef, value, opts) {
   const type = argDef.type;
 
   const handler = TYPE_HANDLERS[type];
   if (!handler) {
     throw new Error(`Unknown argument type: ${type}`);
   }
-  return runValidation(handler, type, argDef, value, execMode);
+  return runValidation(handler, type, argDef, value, opts);
+}
+
+function normalizeOptions(options) {
+  if (options === undefined || options === null) return {};
+  if (typeof options === "boolean") return { execMode: options };
+  return options;
+}
+
+/**
+ * Validate an argument value with explicit options. Synchronous: a hostname
+ * under `block_internal` is refused (see validateArgInAsync).
+ *
+ * @param {object} argDef - Argument definition from the manifest
+ * @param {*} value - The raw value to validate
+ * @param {object} [options]
+ * @param {boolean} [options.execMode=false] - true only when the manifest
+ *   declared command.exec directly; enables allow_whitespace
+ * @param {object|null} [options.scope] - Scope definition (loadScopeFile,
+ *   discoverScope or makeScope) for arguments with `scope_check = true`;
+ *   absent is the fail-closed refusal
+ * @returns {*} The validated and possibly coerced value
+ */
+export function validateArgIn(argDef, value, options) {
+  return settleSync(validateArgCore(argDef, value, normalizeOptions(options)));
+}
+
+/**
+ * validateArgIn with DNS resolution for a hostname under `block_internal`.
+ * @param {object} argDef
+ * @param {*} value
+ * @param {object} [options] - See validateArgIn
+ * @returns {Promise<*>}
+ */
+export async function validateArgInAsync(argDef, value, options) {
+  return settleAsync(validateArgCore(argDef, value, normalizeOptions(options)));
+}
+
+/**
+ * Load-time check of a manifest-declared default: the strict (template-mode)
+ * pipeline without the scope check (the scope is discovered at call time)
+ * and without DNS (a pending resolution is left to the call-time check).
+ * @param {object} argDef
+ * @param {*} value
+ * @param {object} [customTypes]
+ */
+export function validateDefaultValue(argDef, value, customTypes) {
+  validateArgWithCustomTypesCore(argDef, value, customTypes, { skipScope: true });
 }
 
 /**
@@ -263,7 +344,7 @@ function validateArgCore(argDef, value, execMode) {
  * @returns {*} The validated and possibly coerced value
  */
 export function validateArgMode(argDef, value, execMode = false) {
-  return settleSync(validateArgCore(argDef, value, execMode));
+  return validateArgIn(argDef, value, { execMode });
 }
 
 /**
@@ -286,7 +367,7 @@ export function validateArg(argDef, value) {
  * @returns {Promise<*>} The validated and possibly coerced value
  */
 export async function validateArgAsync(argDef, value, execMode = false) {
-  return settleAsync(validateArgCore(argDef, value, execMode));
+  return validateArgInAsync(argDef, value, { execMode });
 }
 
 const TYPE_HANDLERS = {
@@ -324,10 +405,22 @@ function validateString(argDef, value) {
   return str;
 }
 
+const INTEGER_RE = /^[+-]?[0-9]+$/;
+const PORT_RE = /^[0-9]+$/;
+const NUMBER_RE = /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/;
+const DURATION_SECONDS_RE = /^[0-9]+$/;
+const DURATION_UNITS_RE = /^(?:[0-9]+h)?(?:[0-9]+m)?(?:[0-9]+s)?(?:[0-9]+ms)?$/;
+
 function validateInteger(argDef, value) {
-  const num = Number(value);
-  if (!Number.isInteger(num)) {
+  // The string form must be plain decimal before parsing: Number() alone
+  // accepts "", "0x10", " 7 " and "1e3".
+  const str = String(value);
+  if (!INTEGER_RE.test(str)) {
     throw new Error(`Expected integer, got: ${value}`);
+  }
+  const num = Number(str);
+  if (!Number.isSafeInteger(num)) {
+    throw new Error(`Integer out of range: ${value}`);
   }
   if (argDef.min !== undefined || argDef.max !== undefined) {
     if (argDef.clamp) {
@@ -346,7 +439,8 @@ function validateInteger(argDef, value) {
 }
 
 function validateNumber(argDef, value) {
-  const num = Number(value);
+  const str = String(value);
+  const num = NUMBER_RE.test(str) ? Number(str) : NaN;
   if (!Number.isFinite(num)) {
     throw new Error(`Expected finite number, got: ${value}`);
   }
@@ -367,7 +461,8 @@ function validateNumber(argDef, value) {
 }
 
 function validatePort(argDef, value) {
-  const num = Number(value);
+  const str = String(value);
+  const num = PORT_RE.test(str) ? Number(str) : NaN;
   if (!Number.isInteger(num) || num < 1 || num > 65535) {
     throw new Error(`Invalid port number: ${value} (must be 1-65535)`);
   }
@@ -759,11 +854,15 @@ function validateUrl(argDef, value) {
     out = applyHostnamePolicy(host, blockInternal, str);
   }
 
-  // Step 8 — SCOPE HOOK: when `argDef.scope_check` is set, the scope checker
-  // (a later wave) is consulted here with `host`. Not implemented yet; the
-  // flag is parsed and carried so manifests can already declare it.
+  // Step 8: scope (when `scope_check` is set) runs after this returns, in
+  // runValidation, against `host`.
 
   return out;
+}
+
+/** True if `..` is a whole path component, split on `/` and `\\`. */
+function hasDotDotComponent(str) {
+  return str.split(/[/\\]/).includes("..");
 }
 
 function validatePath(argDef, value) {
@@ -772,7 +871,7 @@ function validatePath(argDef, value) {
   if (str.startsWith("/") || (str.length >= 2 && str[1] === ":")) {
     throw new Error(`Path must be relative, not absolute: ${str}`);
   }
-  if (str.includes("../") || str.includes("..\\")) {
+  if (hasDotDotComponent(str)) {
     throw new Error(`Path traversal not allowed: ${str}`);
   }
   return str;
@@ -856,7 +955,7 @@ function validateCredentialFile(argDef, value) {
   if (str.startsWith("/") || (str.length >= 2 && str[1] === ":")) {
     throw new Error(`Credential file must be a relative path: ${str}`);
   }
-  if (str.includes("../") || str.includes("..\\")) {
+  if (hasDotDotComponent(str)) {
     throw new Error(`Path traversal not allowed: ${str}`);
   }
   if (!existsSync(str)) {
@@ -870,11 +969,10 @@ function validateCredentialFile(argDef, value) {
 
 function validateDuration(argDef, value) {
   const str = String(value);
-  // Plain integer seconds
-  if (/^\d+$/.test(str)) return str;
-  // Duration with suffix
-  if (/^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$/.test(str) && str.length > 0)
-    return str;
+  // Plain integer seconds, or unit groups in h/m/s/ms order. JS `$` without
+  // the m flag anchors at the very end, so a trailing newline fails.
+  if (DURATION_SECONDS_RE.test(str)) return str;
+  if (str.length > 0 && DURATION_UNITS_RE.test(str)) return str;
   throw new Error(
     `Invalid duration: '${str}' (e.g. '30', '5m', '2h', '1h30m', '500ms')`
   );
@@ -899,7 +997,7 @@ function validateRegexMatch(argDef, value) {
  * The shared custom-type pipeline. May return a HostResolution, which the
  * entry point settles.
  */
-function validateArgWithCustomTypesCore(argDef, value, customTypes, execMode) {
+function validateArgWithCustomTypesCore(argDef, value, customTypes, opts) {
   if (customTypes && Object.hasOwn(customTypes, argDef.type)) {
     const custom = customTypes[argDef.type];
     const handler = TYPE_HANDLERS[custom.base];
@@ -919,9 +1017,9 @@ function validateArgWithCustomTypesCore(argDef, value, customTypes, execMode) {
       min_float: custom.min_float ?? argDef.min_float,
       max_float: custom.max_float ?? argDef.max_float,
     };
-    return runValidation(handler, custom.base, synthetic, value, execMode);
+    return runValidation(handler, custom.base, synthetic, value, opts);
   }
-  return validateArgCore(argDef, value, execMode);
+  return validateArgCore(argDef, value, opts);
 }
 
 /**
@@ -939,7 +1037,7 @@ export function validateArgWithCustomTypesMode(
   customTypes,
   execMode = false
 ) {
-  return settleSync(validateArgWithCustomTypesCore(argDef, value, customTypes, execMode));
+  return settleSync(validateArgWithCustomTypesCore(argDef, value, customTypes, normalizeOptions(execMode)));
 }
 
 /**
@@ -967,5 +1065,5 @@ export async function validateArgWithCustomTypesAsync(
   customTypes,
   execMode = false
 ) {
-  return settleAsync(validateArgWithCustomTypesCore(argDef, value, customTypes, execMode));
+  return settleAsync(validateArgWithCustomTypesCore(argDef, value, customTypes, normalizeOptions(execMode)));
 }

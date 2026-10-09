@@ -21,8 +21,9 @@ import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from toolclad.manifest import Manifest
-from toolclad.validator import ValidationError, validate_arg, validate_arg_mode
+from toolclad.manifest import Manifest, _default_text
+from toolclad.scope import manifest_scope
+from toolclad.validator import ValidationError, validate_arg_in
 
 # Variables the executor injects into every command context.
 INJECTED_VARS: Tuple[str, ...] = ("_scan_id", "_output_file", "_evidence_dir")
@@ -335,6 +336,34 @@ def _check_declared_args(manifest: Manifest, args: Dict[str, str]) -> None:
     )
 
 
+def _validate_call_args(
+    manifest: Manifest, args: Dict[str, str], exec_mode: bool
+) -> Tuple[Dict[str, str], Set[str]]:
+    """Validate every declared argument for one call, on every backend.
+
+    A supplied value and a manifest default both go through the full rule
+    set, scope included (the scope file is discovered once per manifest).
+    Returns ``(values, absent)`` where ``absent`` names the optional
+    arguments that were neither supplied nor defaulted.
+    """
+    _check_declared_args(manifest, args)
+    scope = manifest_scope(manifest)
+    values: Dict[str, str] = {}
+    absent: Set[str] = set()
+    for arg_name, arg_def in manifest.args.items():
+        if arg_name in args:
+            values[arg_name] = validate_arg_in(arg_def, args[arg_name], exec_mode, scope)
+        elif arg_def.default is not None:
+            values[arg_name] = validate_arg_in(
+                arg_def, _default_text(arg_def.default), exec_mode, scope
+            )
+        elif arg_def.required:
+            raise ValidationError(f"Missing required argument: '{arg_name}'")
+        else:
+            absent.add(arg_name)
+    return values, absent
+
+
 def _resolve_context(
     manifest: Manifest, args: Dict[str, str]
 ) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
@@ -346,23 +375,11 @@ def _resolve_context(
         multi-token variables (``_<arg>_flags`` from mappings, ``_<cond>``
         from conditionals), each already split into argv tokens.
     """
-    _check_declared_args(manifest, args)
-    exec_mode = manifest.command.exec_was_declared
-    single: Dict[str, str] = {}
-    absent: Set[str] = set()
-
-    for arg_name, arg_def in manifest.args.items():
-        if arg_name in args:
-            single[arg_name] = validate_arg_mode(arg_def, args[arg_name], exec_mode)
-        elif arg_def.default is not None:
-            single[arg_name] = str(arg_def.default)
-        elif arg_def.required:
-            raise ValidationError(
-                f"Missing required argument: '{arg_name}'"
-            )
-        else:
-            single[arg_name] = ""
-            absent.add(arg_name)
+    single, absent = _validate_call_args(
+        manifest, args, manifest.command.exec_was_declared
+    )
+    for arg_name in absent:
+        single[arg_name] = ""
 
     for key, val in manifest.command.defaults.items():
         if key not in single:
@@ -646,7 +663,11 @@ def _execute_http(
     """Execute an HTTP-based manifest using urllib.request (no extra deps)."""
     http = manifest.http
     assert http is not None
-    _check_declared_args(manifest, args)
+    # The same validation as the oneshot path (strict mode): only validated
+    # values are ever interpolated into the URL, headers or body.
+    args, absent = _validate_call_args(manifest, args, False)
+    for arg_name in absent:
+        args[arg_name] = ""
 
     scan_id = _generate_scan_id()
     effective_timeout = timeout or manifest.tool.timeout_seconds
@@ -730,6 +751,12 @@ def _execute_mcp_proxy(
     """Build a delegation envelope for an MCP proxy manifest."""
     mcp = manifest.mcp
     assert mcp is not None
+    # Every argument is validated (scope included) and forwarded in its
+    # validated form. An undeclared name is refused, as on every other
+    # backend: the manifest, not the remote server, is the contract.
+    _check_declared_args(manifest, args)
+    validated, absent = _validate_call_args(manifest, args, False)
+    args = {k: v for k, v in validated.items() if k not in absent}
 
     scan_id = _generate_scan_id()
 
@@ -804,15 +831,7 @@ def execute(
     # Handle custom executor escape hatch.
     if manifest.command.executor:
         # Validate args manually since build_command() isn't called for executor mode
-        _check_declared_args(manifest, args)
-        validated_args: Dict[str, str] = {}
-        for arg_name, arg_def in manifest.args.items():
-            if arg_name in args:
-                validated_args[arg_name] = validate_arg(arg_def, args[arg_name])
-            elif arg_def.default is not None:
-                validated_args[arg_name] = str(arg_def.default)
-            elif arg_def.required:
-                raise ValidationError(f"Missing required argument: '{arg_name}'")
+        validated_args, _absent = _validate_call_args(manifest, args, False)
 
         scan_id = _generate_scan_id()
         effective_timeout = timeout or manifest.tool.timeout_seconds

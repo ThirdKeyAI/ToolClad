@@ -10,6 +10,9 @@ export {
   validateArg,
   validateArgMode,
   validateArgAsync,
+  validateArgIn,
+  validateArgInAsync,
+  validateDefaultValue,
   validateArgWithCustomTypes,
   validateArgWithCustomTypesMode,
   validateArgWithCustomTypesAsync,
@@ -18,6 +21,18 @@ export {
   splitUrlScheme,
   parseUrlAuthority,
 } from "./validator.js";
+export {
+  SCOPE_CHECK_TYPES,
+  NO_SCOPE_FILE_MESSAGE,
+  makeScope,
+  loadScopeFile,
+  discoverScope,
+  scopeForManifest,
+  ipInCidr,
+  hostMatchesRule,
+  checkScope,
+  urlHostInScope,
+} from "./scope.js";
 export {
   ALWAYS_BLOCKED_RANGES,
   BLOCK_INTERNAL_RANGES,

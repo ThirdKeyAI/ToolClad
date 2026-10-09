@@ -13,6 +13,36 @@ import (
 	"unicode"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
+	"github.com/thirdkeyai/toolclad/pkg/scope"
+)
+
+// init registers the strict entry point as the manifest loader's validator
+// for per-argument defaults, so a default that fails its own type is a load
+// error rather than a confusing refusal at run time. Types this package does
+// not know (custom types) are left for ValidateManifestWithCustomTypes.
+func init() {
+	manifest.DefaultValidator = func(def *manifest.ArgDef, value string, s *scope.ScopeDef) error {
+		d := *def
+		if d.Type == "" {
+			d.Type = "string"
+		}
+		if _, ok := typeHandlers[d.Type]; !ok {
+			return nil
+		}
+		_, err := ValidateArgIn(&d, value, false, s)
+		return err
+	}
+}
+
+// Strict string forms for the numeric and duration types, checked before
+// any parsing so lenient parser behavior (whitespace, underscores, hex,
+// NaN, infinity) can never admit a value.
+var (
+	integerRe  = regexp.MustCompile(`^[+-]?[0-9]+$`)
+	portRe     = regexp.MustCompile(`^[0-9]+$`)
+	numberRe   = regexp.MustCompile(`^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
+	secondsRe  = regexp.MustCompile(`^[0-9]+$`)
+	durationRe = regexp.MustCompile(`^(?:[0-9]+h)?(?:[0-9]+m)?(?:[0-9]+s)?(?:[0-9]+ms)?$`)
 )
 
 // shellMetacharacters contains characters that indicate injection attempts.
@@ -112,6 +142,14 @@ func ValidateArg(def *manifest.ArgDef, value string) (string, error) {
 // the sole condition under which `allow_whitespace = true` is honored, because
 // only the exec form guarantees that a value stays one argv element.
 func ValidateArgMode(def *manifest.ArgDef, value string, execMode bool) (string, error) {
+	return ValidateArgIn(def, value, execMode, nil)
+}
+
+// ValidateArgIn is the full entry point: ValidateArgMode plus the project
+// scope consulted when the argument sets scope_check = true. A nil scope
+// with scope_check set is a fail-closed refusal. Order: hygiene, type
+// parse, host/IP policy (block_internal), then scope.
+func ValidateArgIn(def *manifest.ArgDef, value string, execMode bool, sc *scope.ScopeDef) (string, error) {
 	handler, ok := typeHandlers[def.Type]
 	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("unknown type: %q", def.Type))
@@ -134,7 +172,46 @@ func ValidateArgMode(def *manifest.ArgDef, value string, execMode bool) (string,
 			return "", err
 		}
 	}
+	if def.ScopeCheck {
+		if err := checkScope(def, out, sc); err != nil {
+			return "", err
+		}
+	}
 	return out, nil
+}
+
+// checkScope applies scope_check to a validated value: the host for a url,
+// the value itself for scope_target, ip_address and cidr.
+func checkScope(def *manifest.ArgDef, value string, sc *scope.ScopeDef) error {
+	if !manifest.ScopeCheckSupported(def.Type) {
+		return newErr(def.Name, fmt.Sprintf("scope_check is not supported for type '%s'", def.Type))
+	}
+	subject := value
+	if def.Type == "url" {
+		host, err := urlHost(value)
+		if err != nil {
+			return newErr(def.Name, err.Error())
+		}
+		subject = host
+	}
+	if err := scope.Check(sc, subject); err != nil {
+		return newErr(def.Name, err.Error())
+	}
+	return nil
+}
+
+// urlHost extracts the host of a url value that validateURL has accepted,
+// with any IPv6 brackets and port removed.
+func urlHost(value string) (string, error) {
+	_, rest, found := strings.Cut(value, "://")
+	if !found {
+		return "", fmt.Errorf("invalid URL: %q (expected scheme://host)", value)
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	host, _, err := splitURLHostPort(rest)
+	return host, err
 }
 
 // checkHygiene applies the string-derived value rules in order: control
@@ -263,6 +340,9 @@ func validateString(def *manifest.ArgDef, value string) (string, error) {
 }
 
 func validateInteger(def *manifest.ArgDef, value string) (string, error) {
+	if !integerRe.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("expected integer, got: %q", value))
+	}
 	num, err := strconv.Atoi(value)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected integer, got: %q", value))
@@ -288,6 +368,9 @@ func validateInteger(def *manifest.ArgDef, value string) (string, error) {
 }
 
 func validateNumber(def *manifest.ArgDef, value string) (string, error) {
+	if !numberRe.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("expected number, got: %q", value))
+	}
 	num, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected number, got: %q", value))
@@ -325,10 +408,22 @@ func validateNumber(def *manifest.ArgDef, value string) (string, error) {
 			return "", newErr(def.Name, fmt.Sprintf("value %g is above maximum %g", num, *hi))
 		}
 	}
-	return strconv.FormatFloat(num, 'g', -1, 64), nil
+	return formatNumber(num), nil
+}
+
+// formatNumber renders the shortest round-trip form of num, with integral
+// values written without an exponent (1e2 becomes 100, 0.50 becomes 0.5).
+func formatNumber(num float64) string {
+	if num == math.Trunc(num) {
+		return strconv.FormatFloat(num, 'f', -1, 64)
+	}
+	return strconv.FormatFloat(num, 'g', -1, 64)
 }
 
 func validatePort(def *manifest.ArgDef, value string) (string, error) {
+	if !portRe.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("expected port number, got: %q", value))
+	}
 	port, err := strconv.Atoi(value)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected port number, got: %q", value))
@@ -599,10 +694,7 @@ func validateURL(def *manifest.ArgDef, value string) (string, error) {
 		}
 	}
 
-	// SCOPE HOOK: when def.ScopeCheck is set, the scope checker will be
-	// consulted here with `host` once scope enforcement lands. Until then
-	// scope_check is parsed and carried on the ArgDef but not applied.
-
+	// scope_check, when set, is applied to the host by ValidateArgIn.
 	return value, nil
 }
 
@@ -656,17 +748,21 @@ func validatePath(def *manifest.ArgDef, value string) (string, error) {
 	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
 		return "", newErr(def.Name, "path must be relative, not absolute")
 	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
-		}
-	}
-	for _, part := range strings.Split(value, "\\") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
-		}
+	if hasDotDotComponent(value) {
+		return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
 	}
 	return value, nil
+}
+
+// hasDotDotComponent reports whether any path component, splitting on both
+// '/' and '\', is exactly "..".
+func hasDotDotComponent(value string) bool {
+	for _, part := range strings.FieldsFunc(value, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func validateIPAddress(def *manifest.ArgDef, value string) (string, error) {
@@ -725,10 +821,8 @@ func validateCredentialFile(def *manifest.ArgDef, value string) (string, error) 
 	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
 		return "", newErr(def.Name, "credential file must be a relative path")
 	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected: %q", value))
-		}
+	if hasDotDotComponent(value) {
+		return "", newErr(def.Name, fmt.Sprintf("path traversal detected: %q", value))
 	}
 	info, err := os.Stat(value)
 	if err != nil {
@@ -741,13 +835,12 @@ func validateCredentialFile(def *manifest.ArgDef, value string) (string, error) 
 }
 
 func validateDuration(def *manifest.ArgDef, value string) (string, error) {
-	// Plain integer seconds
-	if _, err := strconv.Atoi(value); err == nil {
+	// Plain integer seconds, or h/m/s/ms components in that order. Go's
+	// `$` matches only at the end of the text, so a trailing newline fails.
+	if secondsRe.MatchString(value) {
 		return value, nil
 	}
-	// Duration with suffix
-	durationRe := regexp.MustCompile(`^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$`)
-	if !durationRe.MatchString(value) || value == "" {
+	if value == "" || !durationRe.MatchString(value) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid duration: %q (e.g. '30', '5m', '2h', '1h30m', '500ms')", value))
 	}
 	return value, nil
@@ -781,9 +874,15 @@ func ValidateArgWithCustomTypes(def *manifest.ArgDef, value string, customTypes 
 // merged constraints, then validated exactly like a built-in type, so value
 // hygiene and pattern anchoring apply to custom types too.
 func ValidateArgWithCustomTypesMode(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, execMode bool) (string, error) {
+	return ValidateArgWithCustomTypesIn(def, value, customTypes, execMode, nil)
+}
+
+// ValidateArgWithCustomTypesIn is ValidateArgWithCustomTypesMode with the
+// project scope for scope_check (see ValidateArgIn).
+func ValidateArgWithCustomTypesIn(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, execMode bool, sc *scope.ScopeDef) (string, error) {
 	ct, ok := customTypes[def.Type]
 	if !ok {
-		return ValidateArgMode(def, value, execMode)
+		return ValidateArgIn(def, value, execMode, sc)
 	}
 	if _, ok := typeHandlers[ct.Base]; !ok {
 		return "", newErr(def.Name, fmt.Sprintf("custom type '%s' has invalid base type '%s'", def.Type, ct.Base))
@@ -809,7 +908,7 @@ func ValidateArgWithCustomTypesMode(def *manifest.ArgDef, value string, customTy
 	if ct.MaxFloat != nil {
 		synthetic.MaxFloat = ct.MaxFloat
 	}
-	return ValidateArgMode(&synthetic, value, execMode)
+	return ValidateArgIn(&synthetic, value, execMode, sc)
 }
 
 // ValidateManifestWithCustomTypes checks a loaded manifest against the
@@ -837,6 +936,17 @@ func ValidateManifestWithCustomTypes(m *manifest.Manifest, customTypes map[strin
 		}
 		if _, ok := typeHandlers[ct.Base]; !ok {
 			return fmt.Errorf("argument '%s': custom type '%s' has invalid base type '%s'", name, def.Type, ct.Base)
+		}
+		if def.ScopeCheck && !manifest.ScopeCheckSupported(ct.Base) {
+			return fmt.Errorf("argument '%s': scope_check is not supported for type '%s'", name, ct.Base)
+		}
+		if def.Default != nil {
+			val := fmt.Sprintf("%v", def.Default)
+			if !(val == "" && ct.Base == "string") {
+				if _, err := ValidateArgWithCustomTypesIn(def, val, customTypes, false, m.Scope); err != nil {
+					return fmt.Errorf("argument '%s': invalid default %q: %w", name, val, err)
+				}
+			}
 		}
 	}
 	return m.LintEgress(customTypes)

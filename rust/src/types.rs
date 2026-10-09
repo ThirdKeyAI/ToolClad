@@ -24,6 +24,16 @@ pub struct Manifest {
     pub mcp: Option<McpProxyDef>,
     pub session: Option<SessionDef>,
     pub browser: Option<BrowserDef>,
+    /// Directory the manifest was loaded from (`None` when parsed from a
+    /// string). The scope file is discovered upward from here. Set by the
+    /// loader; not part of the TOML surface.
+    #[serde(skip)]
+    pub source_dir: Option<std::path::PathBuf>,
+    /// The project scope, loaded once at manifest load when any argument sets
+    /// `scope_check = true` and a scope file was found. Not part of the TOML
+    /// surface.
+    #[serde(skip)]
+    pub scope: Option<crate::scope::ScopeDef>,
 }
 
 /// Accepted values for `tool.mode`.
@@ -178,6 +188,10 @@ pub struct ArgDef {
     /// netdoc, mailto, ws, wss) is refused even when listed here.
     #[serde(default)]
     pub schemes: Vec<String>,
+    /// `scope_target`, `url`, `ip_address` and `cidr` only (any other type
+    /// is a load error): check the value (the host, for a `url`) against the
+    /// project scope file, failing closed when none is found. See
+    /// `crate::scope`.
     #[serde(default)]
     pub scope_check: bool,
     /// `scope_target`, `url`, `ip_address` and `cidr`: when true, reject a

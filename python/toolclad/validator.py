@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from toolclad.hostpolicy import (
     enforce_cidr_policy,
@@ -18,12 +18,16 @@ from toolclad.hostpolicy import (
 )
 from toolclad.manifest import NETWORK_TARGET_TYPES, ArgDef
 
+if TYPE_CHECKING:
+    from toolclad.manifest import CustomTypeDef
+    from toolclad.scope import ScopeDef
+
 # Shell metacharacters that indicate injection attempts.
 SHELL_METACHARACTERS = set(";|&$`(){}[]<>!\n\r")
 
 # Regex for a valid hostname label.
 _HOSTNAME_RE = re.compile(
-    r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*\.?$"
+    r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*\.?\Z"
 )
 
 
@@ -126,11 +130,18 @@ def _validate_string(arg_def: ArgDef, value: str) -> str:
     return value
 
 
+# Strict numeric shapes, matched with fullmatch: ASCII digits only (``\d``
+# would admit other scripts' digits), no whitespace, no underscores, no hex.
+_INTEGER_RE = re.compile(r"[+-]?[0-9]+")
+_PORT_RE = re.compile(r"[0-9]+")
+_NUMBER_RE = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_DURATION_SUFFIX_RE = re.compile(r"(?:[0-9]+h)?(?:[0-9]+m)?(?:[0-9]+s)?(?:[0-9]+ms)?")
+
+
 def _validate_integer(arg_def: ArgDef, value: str) -> str:
-    try:
-        num = int(value)
-    except (ValueError, TypeError):
+    if _INTEGER_RE.fullmatch(value) is None:
         raise ValidationError(f"Expected integer, got: {value!r}")
+    num = int(value)
 
     if arg_def.min is not None or arg_def.max is not None:
         lo = arg_def.min if arg_def.min is not None else num
@@ -147,10 +158,9 @@ def _validate_integer(arg_def: ArgDef, value: str) -> str:
 
 def _validate_number(arg_def: ArgDef, value: str) -> str:
     import math
-    try:
-        num = float(value)
-    except (ValueError, TypeError):
+    if _NUMBER_RE.fullmatch(value) is None:
         raise ValidationError(f"Expected number, got: {value!r}")
+    num = float(value)
     if not math.isfinite(num):
         raise ValidationError(
             f"Number must be finite (no NaN or infinity), got: {value!r}"
@@ -173,14 +183,22 @@ def _validate_number(arg_def: ArgDef, value: str) -> str:
                 raise ValidationError(f"Value {num} is below minimum {bound_lo}")
             if num > bound_hi:
                 raise ValidationError(f"Value {num} is above maximum {bound_hi}")
-    return str(num)
+    return _render_number(num)
+
+
+def _render_number(num: float) -> str:
+    """Shortest round-trip rendering of a parsed float, with integral values
+    written without an exponent or a trailing ``.0`` (``1e2`` -> ``100``,
+    ``0.50`` -> ``0.5``), matching the other runtimes."""
+    if num.is_integer():
+        return str(int(num))
+    return repr(num)
 
 
 def _validate_port(arg_def: ArgDef, value: str) -> str:
-    try:
-        port = int(value)
-    except (ValueError, TypeError):
+    if _PORT_RE.fullmatch(value) is None:
         raise ValidationError(f"Expected port number, got: {value!r}")
+    port = int(value)
     if port < 1 or port > 65535:
         raise ValidationError(f"Port {port} out of range 1-65535")
     return str(port)
@@ -470,10 +488,17 @@ def _validate_url(arg_def: ArgDef, value: str) -> str:
         # sees the host exactly as the fetcher would.
         enforce_hostname_policy(arg_def.name, host, arg_def.block_internal)
 
-    # Step 8 — SCOPE HOOK: when arg_def.scope_check is set, the scope checker
-    # (a later wave) is consulted here with `host`. Not implemented yet; the
-    # flag is parsed and carried so manifests can already declare it.
+    # Step 8 (scope) runs in _run_validation on the host, via _url_host.
     return value
+
+
+def _url_host(value: str) -> str:
+    """The host of a url value that ``_validate_url`` has already accepted
+    (a bracketed IPv6 literal is returned without its brackets)."""
+    rest = value.partition("://")[2]
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    host, _port, bracketed_v6 = _split_url_authority(authority)
+    return str(bracketed_v6) if bracketed_v6 is not None else host
 
 
 def _validate_path(arg_def: ArgDef, value: str) -> str:
@@ -511,7 +536,7 @@ def _validate_cidr(arg_def: ArgDef, value: str) -> str:
 
 def _validate_msf_options(arg_def: ArgDef, value: str) -> str:
     import re as _re
-    key_re = _re.compile(r'^[A-Z][A-Z0-9_]*$')
+    key_re = _re.compile(r'[A-Z][A-Z0-9_]*')
     # Don't use _check_injection on the whole value since ; is a valid delimiter
     metachar_no_semi = set("|&$`(){}[]<>!\n\r")
     for pair in value.split(';'):
@@ -522,7 +547,7 @@ def _validate_msf_options(arg_def: ArgDef, value: str) -> str:
         if len(parts) != 2:
             raise ValidationError(f"msf_options: invalid pair '{pair}' (expected 'KEY VALUE')")
         key, val = parts
-        if not key_re.match(key):
+        if not key_re.fullmatch(key):
             raise ValidationError(f"msf_options: invalid key '{key}' (must be uppercase alphanumeric)")
         found = set(val) & metachar_no_semi
         if found:
@@ -546,15 +571,11 @@ def _validate_credential_file(arg_def: ArgDef, value: str) -> str:
 
 
 def _validate_duration(arg_def: ArgDef, value: str) -> str:
-    import re as _re
-    # Plain integer seconds
-    try:
-        int(value)
-        return value
-    except ValueError:
-        pass
-    # Duration with suffix
-    if not _re.match(r'^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$', value) or value == '':
+    # Plain integer seconds, or h/m/s/ms components in that order; the whole
+    # value must match (no whitespace, trailing newline or underscores).
+    if value == "" or (
+        _PORT_RE.fullmatch(value) is None and _DURATION_SUFFIX_RE.fullmatch(value) is None
+    ):
         raise ValidationError(f"Invalid duration: {value!r} (e.g. '30', '5m', '2h', '1h30m', '500ms')")
     return value
 
@@ -590,8 +611,16 @@ _TYPE_HANDLERS = {
 SUPPORTED_TYPES: List[str] = sorted(_TYPE_HANDLERS.keys())
 
 
-def _run_validation(arg_def: ArgDef, str_value: str, exec_mode: bool) -> str:
-    """Apply hygiene, the type handler, and the numeric leading-dash rule."""
+def _run_validation(
+    arg_def: ArgDef,
+    str_value: str,
+    exec_mode: bool,
+    scope: Optional["ScopeDef"] = None,
+    check_scope: bool = True,
+) -> str:
+    """Apply hygiene, the type handler, the scope check and the numeric
+    leading-dash rule, in that order. ``check_scope=False`` skips the scope
+    step only (load-time validation of manifest defaults, before any call)."""
     handler = _TYPE_HANDLERS.get(arg_def.type)
     if handler is None:
         raise ValidationError(f"Unknown type: {arg_def.type!r}")
@@ -600,9 +629,34 @@ def _run_validation(arg_def: ArgDef, str_value: str, exec_mode: bool) -> str:
     if arg_def.type in STRING_DERIVED_TYPES:
         _check_hygiene(arg_def, str_value, exec_mode)
     result = handler(arg_def, str_value)
+    # SCOPE: after hygiene, type parse and host/IP policy, so an in-scope
+    # internal target is still refused by block_internal. The subject is the
+    # host for a url and the value itself otherwise.
+    if arg_def.scope_check and check_scope:
+        from toolclad.scope import SCOPE_CHECK_TYPES, check_scope as _check_scope
+
+        if arg_def.type not in SCOPE_CHECK_TYPES:
+            raise ValidationError(
+                f"argument '{arg_def.name}' scope_check is not supported for type "
+                f"'{arg_def.type}'"
+            )
+        subject = _url_host(result) if arg_def.type == "url" else result
+        _check_scope(arg_def.name, subject, scope)
     if arg_def.type in NUMERIC_TYPES:
         _check_leading_dash(arg_def, result)
     return result
+
+
+def validate_arg_in(
+    arg_def: ArgDef, value: Any, exec_mode: bool, scope: Optional["ScopeDef"] = None
+) -> str:
+    """Validate a value with the full rule set, including scope.
+
+    ``scope`` is the loaded scope file (see ``toolclad.scope``). When
+    ``arg_def.scope_check`` is set and ``scope`` is ``None`` the value is
+    refused (fail closed). ``exec_mode`` as in ``validate_arg_mode``.
+    """
+    return _run_validation(arg_def, str(value), exec_mode, scope)
 
 
 def validate_arg_mode(arg_def: ArgDef, value: Any, exec_mode: bool) -> str:
@@ -621,7 +675,7 @@ def validate_arg_mode(arg_def: ArgDef, value: Any, exec_mode: bool) -> str:
     Raises:
         ValidationError: If the value fails validation.
     """
-    return _run_validation(arg_def, str(value), exec_mode)
+    return validate_arg_in(arg_def, value, exec_mode, None)
 
 
 def validate_arg(arg_def: ArgDef, value: Any) -> str:
@@ -637,6 +691,7 @@ def validate_arg_with_custom_types_mode(
     value: Any,
     custom_types: Dict[str, "CustomTypeDef"],
     exec_mode: bool,
+    scope: Optional["ScopeDef"] = None,
 ) -> str:
     """Validate using custom type definitions.
 
@@ -649,8 +704,6 @@ def validate_arg_with_custom_types_mode(
     definition cannot carry ``block_internal``, so the author's flag would
     be silently dropped. Network targets use the built-in types.
     """
-    from toolclad.manifest import CustomTypeDef  # avoid circular import  # noqa: F811
-
     if arg_def.type in custom_types:
         custom = custom_types[arg_def.type]
         if custom.base not in _TYPE_HANDLERS:
@@ -683,10 +736,10 @@ def validate_arg_with_custom_types_mode(
             allow_leading_dash=arg_def.allow_leading_dash,
             allow_whitespace=arg_def.allow_whitespace,
         )
-        return _run_validation(synthetic, str(value), exec_mode)
+        return _run_validation(synthetic, str(value), exec_mode, scope)
 
     # Not a custom type, use standard validation
-    return validate_arg_mode(arg_def, value, exec_mode)
+    return validate_arg_in(arg_def, value, exec_mode, scope)
 
 
 def validate_arg_with_custom_types(

@@ -193,7 +193,7 @@ class TestConditionals:
             "tool {_port_flag} {target}",
             args={
                 "target": ArgDef(name="target", position=1, required=True, type="string"),
-                "port": ArgDef(name="port", position=2, required=False, type="port", default="0"),
+                "port": ArgDef(name="port", position=2, required=False, type="integer", default="0"),
             },
             conditionals={
                 "port_flag": {"when": "port != 0", "template": "-p {port}"},
@@ -414,6 +414,11 @@ class TestMcpProxyExecution:
     def _mcp_manifest(self) -> Manifest:
         return Manifest(
             tool=ToolMeta(name="mcp_tool", version="1.0.0", binary=""),
+            args={
+                "target": ArgDef(name="target", position=1, type="scope_target"),
+                "port": ArgDef(name="port", position=2, type="port"),
+                "extra": ArgDef(name="extra", position=3, type="string"),
+            },
             mcp=McpProxyDef(
                 server="security-scanner",
                 tool="run_scan",
@@ -439,9 +444,20 @@ class TestMcpProxyExecution:
         assert envelope["mcp_args"]["port_number"] == "443"
 
     def test_mcp_unmapped_args_passed_through(self):
+        # A declared argument with no field_map entry keeps its own name.
         m = self._mcp_manifest()
         envelope = execute(m, {"target": "10.0.1.1", "extra": "val"})
         assert envelope["mcp_args"]["extra"] == "val"
+
+    def test_mcp_undeclared_argument_refused(self):
+        m = self._mcp_manifest()
+        with pytest.raises(ValidationError, match="unknown argument 'smuggled'"):
+            execute(m, {"target": "10.0.1.1", "smuggled": "x"})
+
+    def test_mcp_arguments_are_validated(self):
+        m = self._mcp_manifest()
+        with pytest.raises(ValidationError):
+            execute(m, {"target": "10.0.1.1", "extra": "-iL /etc/passwd"})
 
     def test_mcp_dry_run(self):
         m = self._mcp_manifest()

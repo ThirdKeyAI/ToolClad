@@ -222,8 +222,8 @@ class TestHygiene:
         with pytest.raises(ValidationError, match="must not start with"):
             validate_arg(_arg("number"), "-0.5")
         assert validate_arg(_arg("integer", min=1, max=10, clamp=True), "-5") == "1"
-        assert validate_arg(_arg("number", min_float=0.0, max_float=1.0, clamp=True), "-5") == "0.0"
-        with pytest.raises(ValidationError, match="out of range"):
+        assert validate_arg(_arg("number", min_float=0.0, max_float=1.0, clamp=True), "-5") == "0"
+        with pytest.raises(ValidationError, match="Expected port number"):
             validate_arg(_arg("port"), "-1")
         assert validate_arg(_arg("integer", allow_leading_dash=True), "-7") == "-7"
         assert validate_arg(_arg("integer"), "+7") == "7"

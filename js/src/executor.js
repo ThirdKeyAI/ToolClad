@@ -2,7 +2,8 @@ import { spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateArgMode } from "./validator.js";
+import { validateArgIn } from "./validator.js";
+import { scopeForManifest } from "./scope.js";
 
 /**
  * One left-to-right pass over a token: `{{` and `}}` are escapes for literal
@@ -400,6 +401,11 @@ function resolveArgs(manifest, args, execMode = false) {
   const argDefs = manifest.args || {};
   const supplied = args || {};
   const resolved = {};
+  // The scope is discovered (once per manifest object) only when some
+  // argument asks for it; a missing file is passed down as null so the
+  // validator refuses fail-closed.
+  const needsScope = Object.values(argDefs).some((def) => def && def.scope_check === true);
+  const scope = needsScope ? scopeForManifest(manifest) : null;
 
   // A supplied name that [args] does not declare is refused rather than
   // silently dropped, so a caller learns when its argument never reached the
@@ -426,7 +432,7 @@ function resolveArgs(manifest, args, execMode = false) {
       if (value === undefined) continue;
     }
 
-    resolved[name] = validateArgMode(def, value, execMode);
+    resolved[name] = validateArgIn(def, value, { execMode, scope });
   }
 
   return resolved;

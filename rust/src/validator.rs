@@ -2,6 +2,7 @@ use crate::hostpolicy::{
     enforce_cidr_policy, enforce_hostname_policy, enforce_ip_policy, has_punycode_label,
     looks_like_ip_literal, parse_canonical_ip, parse_cidr,
 };
+use crate::scope::{check_scope, ScopeDef};
 use crate::types::{ArgDef, ToolCladError};
 use regex::Regex;
 use std::net::{IpAddr, Ipv6Addr};
@@ -101,6 +102,24 @@ pub fn validate_arg_mode(
     value: &str,
     exec_mode: bool,
 ) -> Result<String, ToolCladError> {
+    validate_arg_in(name, def, value, exec_mode, None)
+}
+
+/// The full validation entry point: [`validate_arg_mode`] plus the project
+/// scope consulted when the arg sets `scope_check = true` (honored on
+/// `scope_target`, `url`, `ip_address` and `cidr`; see [`crate::scope`]).
+///
+/// A `None` scope with `scope_check = true` refuses the value (fail closed).
+/// The scope check runs last, after hygiene, type parsing and the host/IP
+/// policy, so an in-scope internal target is still refused by
+/// `block_internal`.
+pub fn validate_arg_in(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    exec_mode: bool,
+    scope: Option<&ScopeDef>,
+) -> Result<String, ToolCladError> {
     // Rule 1 applies to every type, enum and numerics included.
     if value.contains('\0') {
         return Err(ToolCladError::ValidationError(format!(
@@ -114,8 +133,9 @@ pub fn validate_arg_mode(
         check_value_hygiene(name, def, value, exec_mode)?;
         return match type_name {
             "string" => validate_string(name, def, value, true),
-            "scope_target" => validate_scope_target(name, def, value),
-            "url" => validate_url(name, def, value),
+            "scope_target" => validate_scope_target(name, def, value)
+                .and_then(|out| scope_hook(name, def, scope, &out, &out).map(|_| out)),
+            "url" => validate_url(name, def, value, scope),
             "path" => validate_path(name, value),
             "msf_options" => validate_msf_options(name, def, value),
             "credential_file" => validate_credential_file(name, def, value),
@@ -125,13 +145,10 @@ pub fn validate_arg_mode(
         };
     }
 
-    let val = value.trim();
-
-    // IP and CIDR literals reject leading/trailing whitespace at the source;
-    // silently trimming would let "10.0.0.1 " through to validators that
-    // already passed structural checks.
-    let strict_no_whitespace = matches!(type_name, "ip_address" | "cidr");
-    if strict_no_whitespace && val.len() != value.len() {
+    // Nothing is trimmed: a numeric, boolean, enum, IP or CIDR value with
+    // surrounding whitespace is refused rather than silently normalized.
+    let val = value;
+    if val.trim().len() != val.len() {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' must not contain leading or trailing whitespace"
         )));
@@ -149,13 +166,29 @@ pub fn validate_arg_mode(
             .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
-        "ip_address" => validate_ip_address(name, def, val),
-        "cidr" => validate_cidr(name, def, val),
+        "ip_address" => validate_ip_address(name, def, val)
+            .and_then(|out| scope_hook(name, def, scope, &out, &out).map(|_| out)),
+        "cidr" => validate_cidr(name, def, val)
+            .and_then(|out| scope_hook(name, def, scope, &out, &out).map(|_| out)),
         _ => Err(ToolCladError::ValidationError(format!(
             "unknown argument type '{}' for '{}'",
             def.type_name, name
         ))),
     }
+}
+
+/// Run the scope check on `subject` when the arg sets `scope_check`.
+fn scope_hook(
+    name: &str,
+    def: &ArgDef,
+    scope: Option<&ScopeDef>,
+    subject: &str,
+    value: &str,
+) -> Result<(), ToolCladError> {
+    if def.scope_check {
+        check_scope(name, scope, subject, value)?;
+    }
+    Ok(())
 }
 
 /// True for C0 control characters (U+0000–U+001F), DEL (U+007F), and the C1
@@ -279,7 +312,24 @@ fn validate_string(
     Ok(val.to_string())
 }
 
+/// `integer` string form: optional sign, ASCII digits.
+static INTEGER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[+-]?[0-9]+$").unwrap());
+/// `number` string form: decimal with optional fraction and exponent. No
+/// `NaN`, `inf`, hex floats or whitespace.
+static NUMBER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$").unwrap());
+/// `duration`: plain seconds, or `h`/`m`/`s`/`ms` components in that order.
+/// The empty match is refused separately.
+static DURATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[0-9]+|(?:[0-9]+h)?(?:[0-9]+m)?(?:[0-9]+s)?(?:[0-9]+ms)?)$").unwrap()
+});
+
 fn validate_integer(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    if !INTEGER_RE.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid integer"
+        )));
+    }
     let mut n: i64 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid integer"))
     })?;
@@ -310,6 +360,11 @@ fn validate_integer(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolC
 }
 
 fn validate_number(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    if !NUMBER_RE.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid number"
+        )));
+    }
     let mut n: f64 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid number"))
     })?;
@@ -348,6 +403,11 @@ fn validate_number(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCl
 }
 
 fn validate_port(name: &str, val: &str) -> Result<String, ToolCladError> {
+    if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid port number"
+        )));
+    }
     let n: u16 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid port number"))
     })?;
@@ -360,10 +420,11 @@ fn validate_port(name: &str, val: &str) -> Result<String, ToolCladError> {
 }
 
 fn validate_boolean(name: &str, val: &str) -> Result<String, ToolCladError> {
-    match val {
-        "true" | "false" => Ok(val.to_string()),
+    let lower = val.to_ascii_lowercase();
+    match lower.as_str() {
+        "true" | "false" => Ok(lower),
         _ => Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' must be exactly 'true' or 'false'"
+            "argument '{name}' must be 'true' or 'false' (case-insensitive)"
         ))),
     }
 }
@@ -587,7 +648,12 @@ fn split_url_authority<'a>(name: &str, authority: &'a str) -> Result<UrlHost<'a>
 /// downstream will parse the value again with its own rules, so anything a
 /// human reviewer of the manifest could misread is refused here rather than
 /// normalized away.
-fn validate_url(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+fn validate_url(
+    name: &str,
+    def: &ArgDef,
+    val: &str,
+    scope: Option<&ScopeDef>,
+) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
 
     // Step 2: `scheme://rest`.
@@ -675,16 +741,20 @@ fn validate_url(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladE
         }
     }
 
-    // Step 8 — SCOPE HOOK: when `def.scope_check` is set, the scope checker
-    // (a later wave) is consulted here with `host`. Not implemented yet; the
-    // flag is parsed and carried so manifests can already declare it.
+    // Step 8: the project scope, checked against the host.
+    scope_hook(name, def, scope, host, val)?;
 
     Ok(val.to_string())
 }
 
+/// True if `..` is a whole path component, splitting on `/` and `\\`.
+fn has_parent_component(val: &str) -> bool {
+    val.split(['/', '\\']).any(|c| c == "..")
+}
+
 fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
-    if val.contains("../") || val.contains("..\\") {
+    if has_parent_component(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' path must not contain traversal sequences (../)"
         )));
@@ -768,7 +838,7 @@ fn validate_credential_file(name: &str, _def: &ArgDef, val: &str) -> Result<Stri
             "argument '{name}' must be a relative path"
         )));
     }
-    if val.contains("../") || val.contains("..\\") {
+    if has_parent_component(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' path must not contain traversal sequences"
         )));
@@ -788,13 +858,7 @@ fn validate_credential_file(name: &str, _def: &ArgDef, val: &str) -> Result<Stri
 }
 
 fn validate_duration(name: &str, _def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
-    // Try plain integer (seconds)
-    if val.parse::<u64>().is_ok() {
-        return Ok(val.to_string());
-    }
-    // Parse duration suffixes: ms, s, m, h
-    let duration_re = Regex::new(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?(?:(\d+)ms)?$").unwrap();
-    if !duration_re.is_match(val) {
+    if val.is_empty() || !DURATION_RE.is_match(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid duration (e.g. '30', '5m', '2h', '1h30m', '500ms')"
         )));
@@ -841,6 +905,19 @@ pub fn validate_arg_with_custom_types_mode(
     custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
     exec_mode: bool,
 ) -> Result<String, ToolCladError> {
+    validate_arg_with_custom_types_in(name, def, value, custom_types, exec_mode, None)
+}
+
+/// [`validate_arg_with_custom_types_mode`] with the project scope; `scope`
+/// has the same meaning as in [`validate_arg_in`].
+pub fn validate_arg_with_custom_types_in(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+    exec_mode: bool,
+    scope: Option<&ScopeDef>,
+) -> Result<String, ToolCladError> {
     // Check if the type is a custom type
     if let Some(custom) = custom_types.get(&def.type_name) {
         // Verify the base type is valid
@@ -871,11 +948,11 @@ pub fn validate_arg_with_custom_types_mode(
         if let Some(max_f) = custom.max_float {
             synthetic.max_float = Some(max_f);
         }
-        return validate_arg_mode(name, &synthetic, value, exec_mode);
+        return validate_arg_in(name, &synthetic, value, exec_mode, scope);
     }
 
     // Not a custom type, use standard validation
-    validate_arg_mode(name, def, value, exec_mode)
+    validate_arg_in(name, def, value, exec_mode, scope)
 }
 
 #[cfg(test)]
@@ -2346,5 +2423,97 @@ mod tests {
         // on structure alone.
         assert!(validate_arg("t", &make_arg("scope_target"), HOST).is_ok());
         assert!(validate_arg("u", &make_arg("url"), &format!("https://{HOST}/path")).is_ok());
+    }
+
+    // ---- W11: strictness and cross-runtime parity ----------------------
+
+    #[test]
+    fn w11_integer_strictness() {
+        let def = make_arg("integer");
+        for bad in ["", "0x10", "1_000", " 7 ", "7\n", "7 ", "1.0", "1e3", "٣"] {
+            assert!(validate_arg("n", &def, bad).is_err(), "{bad:?}");
+        }
+        let mut signed = make_arg("integer");
+        signed.allow_leading_dash = true;
+        assert_eq!(validate_arg("n", &signed, "+7").unwrap(), "7");
+        assert_eq!(validate_arg("n", &signed, "-07").unwrap(), "-7");
+        assert_eq!(validate_arg("n", &def, "007").unwrap(), "7");
+    }
+
+    #[test]
+    fn w11_port_strictness() {
+        let def = make_arg("port");
+        for bad in ["", "+80", " 80", "80 ", "0", "65536", "0x50"] {
+            assert!(validate_arg("p", &def, bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(validate_arg("p", &def, "443").unwrap(), "443");
+    }
+
+    #[test]
+    fn w11_number_strictness_and_rendering() {
+        let def = make_arg("number");
+        for bad in [
+            "NaN", "nan", "inf", "Infinity", "0x1p3", " 1.5", "1.5 ", "", ".", "1e", "1_0",
+        ] {
+            assert!(validate_arg("f", &def, bad).is_err(), "{bad:?}");
+        }
+        for (input, out) in [("1e2", "100"), ("0.50", "0.5"), (".5", "0.5"), ("3.", "3")] {
+            assert_eq!(validate_arg("f", &def, input).unwrap(), out, "{input}");
+        }
+    }
+
+    #[test]
+    fn w11_duration_strictness() {
+        let def = make_arg("duration");
+        for bad in ["", "5m\n", "1_000", " 7 ", "5 m", "m", "5x", "1m1h"] {
+            assert!(validate_arg("d", &def, bad).is_err(), "{bad:?}");
+        }
+        for good in ["30", "5m", "1h30m", "500ms", "2h5m3s10ms"] {
+            assert_eq!(validate_arg("d", &def, good).unwrap(), good);
+        }
+    }
+
+    #[test]
+    fn w11_boolean_case_insensitive() {
+        let def = make_arg("boolean");
+        assert_eq!(validate_arg("b", &def, "True").unwrap(), "true");
+        assert_eq!(validate_arg("b", &def, "FALSE").unwrap(), "false");
+        for bad in ["yes", "1", " true", "true\n", "t"] {
+            assert!(validate_arg("b", &def, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn w11_host_shape_parity() {
+        assert!(validate_arg("t", &make_arg("scope_target"), "example.com.").is_err());
+        assert!(validate_arg("u", &make_arg("url"), "https://example.com./x").is_err());
+        assert!(validate_arg("t", &make_arg("scope_target"), "2001:db8::/32").is_ok());
+        assert!(validate_arg("c", &make_arg("cidr"), "2001:db8::/32").is_ok());
+        let mut blocked = make_arg("cidr");
+        blocked.block_internal = true;
+        assert!(validate_arg("c", &blocked, "2001:db8::/32").is_err());
+    }
+
+    #[test]
+    fn w11_parent_component_refused() {
+        for t in ["path", "credential_file"] {
+            for bad in ["..", "foo/..", "foo\\..", "../x", "a/../b", "a\\..\\b"] {
+                assert!(
+                    validate_arg("p", &make_arg(t), bad).is_err(),
+                    "{t}: {bad:?}"
+                );
+            }
+        }
+        // `..` inside a component name is not traversal.
+        assert!(validate_arg("p", &make_arg("path"), "foo..bar/x").is_ok());
+        assert!(validate_arg("p", &make_arg("path"), "a/.../b").is_ok());
+    }
+
+    #[test]
+    fn w11_no_trimming_of_enum_or_ip() {
+        let mut def = make_arg("enum");
+        def.allowed = Some(vec!["ping".to_string()]);
+        assert!(validate_arg("e", &def, " ping").is_err());
+        assert!(validate_arg("i", &make_arg("ip_address"), "10.0.0.1 ").is_err());
     }
 }

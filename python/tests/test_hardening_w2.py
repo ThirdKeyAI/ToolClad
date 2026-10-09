@@ -448,7 +448,7 @@ sanitize = ["injection"]
 position = 6
 required = false
 type = "url"
-default = ""
+default = "https://example.com/"
 schemes = ["https"]
 
 [command]

@@ -16,7 +16,8 @@ from toolclad.manifest import (
     load_manifest,
     load_manifest_with_options,
 )
-from toolclad.validator import ValidationError, validate_arg_mode
+from toolclad.scope import manifest_scope
+from toolclad.validator import ValidationError, validate_arg_in
 
 
 def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
@@ -212,13 +213,14 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
         # Validate each arg individually for nice reporting. allow_whitespace
         # is honored only when the manifest declared exec directly.
         exec_mode = manifest.command.exec_was_declared
+        scope = manifest_scope(manifest)
 
         click.echo(f"  Manifest:  {manifest.source_path}")
         click.echo(f"  Arguments:")
         for arg_name, arg_def in manifest.args.items():
             if arg_name in args:
                 try:
-                    cleaned = validate_arg_mode(arg_def, args[arg_name], exec_mode)
+                    cleaned = validate_arg_in(arg_def, args[arg_name], exec_mode, scope)
                     click.echo(f"    {arg_name}={cleaned} ({arg_def.type}: OK)")
                 except ValidationError as ve:
                     click.echo(f"    {arg_name}={args[arg_name]} ({arg_def.type}: FAIL - {ve})")

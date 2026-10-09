@@ -1,7 +1,9 @@
+use crate::scope::ScopeDef;
 use crate::types::{ConditionalDef, EvidenceEnvelope, Manifest, ToolCladError};
-use crate::validator::validate_arg_mode;
+use crate::validator::validate_arg_in;
 use regex::Regex;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
@@ -658,7 +660,7 @@ fn evaluate_condition(expr: &str, vars: &HashMap<String, String>) -> bool {
 }
 
 /// Convert a TOML value to a string for interpolation.
-fn toml_value_to_string(val: &toml::Value) -> String {
+pub(crate) fn toml_value_to_string(val: &toml::Value) -> String {
     match val {
         toml::Value::String(s) => s.clone(),
         toml::Value::Integer(n) => n.to_string(),
@@ -948,6 +950,20 @@ fn check_declared_args(
     )))
 }
 
+/// The scope for one call: the one cached at load, else — for a manifest
+/// built in code, or one whose scope file appeared after load — discovered
+/// now from the manifest's source directory, once, when any argument sets
+/// `scope_check`.
+fn call_scope(manifest: &Manifest) -> Result<Option<Cow<'_, ScopeDef>>, ToolCladError> {
+    if let Some(ref scope) = manifest.scope {
+        return Ok(Some(Cow::Borrowed(scope)));
+    }
+    if manifest.args.values().any(|d| d.scope_check) {
+        return Ok(crate::scope::discover_scope(manifest.source_dir.as_deref())?.map(Cow::Owned));
+    }
+    Ok(None)
+}
+
 /// Validate all arguments, build the command, execute it, and return an evidence envelope.
 pub fn execute(
     manifest: &Manifest,
@@ -959,22 +975,24 @@ pub fn execute(
     // the manifest declared `exec` directly; a compiled template stays strict,
     // and so does the `executor` escape hatch (it takes precedence over
     // exec/template and its argument handling is opaque to us).
+    // A default is validated like a supplied value (it was type-checked at
+    // load; the scope check can only run here).
     let exec_mode = manifest.command.executor.is_none() && manifest.command.exec_was_declared;
+    let scope = call_scope(manifest)?;
+    let scope = scope.as_deref();
     let mut validated = HashMap::new();
     for (name, def) in &manifest.args {
         if let Some(val) = args.get(name) {
-            let clean = validate_arg_mode(name, def, val, exec_mode)?;
+            let clean = validate_arg_in(name, def, val, exec_mode, scope)?;
+            validated.insert(name.clone(), clean);
+        } else if let Some(ref default_val) = def.default {
+            let dv = toml_value_to_string(default_val);
+            let clean = validate_arg_in(name, def, &dv, exec_mode, scope)?;
             validated.insert(name.clone(), clean);
         } else if def.required {
-            if let Some(ref default_val) = def.default {
-                validated.insert(name.clone(), toml_value_to_string(default_val));
-            } else {
-                return Err(ToolCladError::ValidationError(format!(
-                    "missing required argument '{name}'"
-                )));
-            }
-        } else if let Some(ref default_val) = def.default {
-            validated.insert(name.clone(), toml_value_to_string(default_val));
+            return Err(ToolCladError::ValidationError(format!(
+                "missing required argument '{name}'"
+            )));
         }
     }
 
@@ -1182,12 +1200,14 @@ pub fn dry_run(
 
     // Validate all arguments (strict for the executor escape hatch).
     let exec_mode = manifest.command.executor.is_none() && manifest.command.exec_was_declared;
+    let scope = call_scope(manifest)?;
+    let scope = scope.as_deref();
     let mut validated = HashMap::new();
     let mut validations = Vec::new();
 
     for (name, def) in &manifest.args {
         if let Some(val) = args.get(name) {
-            match validate_arg_mode(name, def, val, exec_mode) {
+            match validate_arg_in(name, def, val, exec_mode, scope) {
                 Ok(clean) => {
                     validations.push(format!("{name}={clean} ({}: OK)", def.type_name));
                     validated.insert(name.clone(), clean);
@@ -1197,20 +1217,20 @@ pub fn dry_run(
                     return Err(e);
                 }
             }
-        } else if def.required {
-            if let Some(ref default_val) = def.default {
-                let dv = toml_value_to_string(default_val);
-                validated.insert(name.clone(), dv.clone());
-                validations.push(format!("{name}={dv} (default)"));
-            } else {
-                return Err(ToolCladError::ValidationError(format!(
-                    "missing required argument '{name}'"
-                )));
-            }
         } else if let Some(ref default_val) = def.default {
-            let dv = toml_value_to_string(default_val);
-            validated.insert(name.clone(), dv.clone());
+            let dv = validate_arg_in(
+                name,
+                def,
+                &toml_value_to_string(default_val),
+                exec_mode,
+                scope,
+            )?;
             validations.push(format!("{name}={dv} (default)"));
+            validated.insert(name.clone(), dv);
+        } else if def.required {
+            return Err(ToolCladError::ValidationError(format!(
+                "missing required argument '{name}'"
+            )));
         }
     }
 
@@ -1289,6 +1309,8 @@ mod tests {
             mcp: None,
             session: None,
             browser: None,
+            source_dir: None,
+            scope: None,
         }
     }
 

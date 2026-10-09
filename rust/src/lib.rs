@@ -45,11 +45,11 @@
 //! | `integer` | Numeric with optional min/max and clamping |
 //! | `number` | Float with optional `min_float`/`max_float` and clamping |
 //! | `port` | 1-65535 |
-//! | `boolean` | Exactly `"true"` or `"false"` |
+//! | `boolean` | `"true"` or `"false"`, case-insensitive, normalized to lowercase |
 //! | `enum` | Value in declared `allowed` list |
 //! | `scope_target` | Injection-safe, no wildcards, valid IP/CIDR/hostname |
 //! | `url` | Valid URL with optional scheme restriction |
-//! | `path` | No traversal (`../`) |
+//! | `path` | Relative, no `..` path component |
 //! | `ip_address` | Valid IPv4 or IPv6 |
 //! | `cidr` | Valid CIDR notation |
 //!
@@ -104,6 +104,7 @@
 
 pub mod executor;
 pub mod hostpolicy;
+pub mod scope;
 pub mod types;
 pub mod validator;
 
@@ -137,7 +138,11 @@ pub fn load_manifest_with<P: AsRef<Path>>(
     let content = std::fs::read_to_string(path).map_err(|e| {
         ToolCladError::ManifestError(format!("failed to read '{}': {e}", path.display()))
     })?;
-    parse_manifest_with(&content, options)
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    parse_manifest_impl(&content, options, Some(dir))
 }
 
 /// Parse a manifest from a TOML string.
@@ -148,9 +153,22 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
 }
 
 /// [`parse_manifest`] with explicit [`LoadOptions`].
+///
+/// The scope file for `scope_check` arguments is discovered upward from the
+/// process cwd (or taken from `TOOLCLAD_SCOPE_FILE`).
 pub fn parse_manifest_with(
     toml_str: &str,
     options: LoadOptions,
+) -> Result<Manifest, ToolCladError> {
+    parse_manifest_impl(toml_str, options, None)
+}
+
+/// Shared loader body. `source_dir` is the manifest's directory when it came
+/// from a file.
+fn parse_manifest_impl(
+    toml_str: &str,
+    options: LoadOptions,
+    source_dir: Option<&Path>,
 ) -> Result<Manifest, ToolCladError> {
     let parse_err =
         |e: toml::de::Error| ToolCladError::ManifestError(format!("TOML parse error: {e}"));
@@ -176,6 +194,13 @@ pub fn parse_manifest_with(
 
     compile_command(&mut manifest)?;
     validate_manifest(&manifest)?;
+
+    // Load the scope once, here, when any argument asks for it. No file is
+    // not an error at load: every `scope_check` argument then fails closed.
+    manifest.source_dir = source_dir.map(Path::to_path_buf);
+    if all_arg_defs(&manifest).iter().any(|(_, d)| d.scope_check) {
+        manifest.scope = scope::discover_scope(source_dir)?;
+    }
     Ok(manifest)
 }
 
@@ -710,7 +735,44 @@ pub fn validate_manifest_with_custom_types(
         }
     }
 
+    // `scope_check` is honored only on network-target types; anywhere else
+    // it would be a control that silently does nothing.
+    for (name, def) in all_arg_defs(manifest) {
+        let base = custom_types
+            .get(&def.type_name)
+            .map_or(def.type_name.as_str(), |c| c.base.as_str());
+        if def.scope_check && !scope::SCOPE_CHECK_TYPES.contains(&base) {
+            return Err(ToolCladError::ManifestError(format!(
+                "argument '{name}' scope_check is not supported for type '{}'",
+                def.type_name
+            )));
+        }
+    }
+
     egress_lint(manifest, custom_types)?;
+
+    // A per-argument default is manifest-controlled and must pass its own
+    // type through the strict entry point. The scope is checked at call time
+    // (defaults are validated again there), not here.
+    for (name, def) in all_arg_defs(manifest) {
+        let Some(ref default) = def.default else {
+            continue;
+        };
+        let value = executor::toml_value_to_string(default);
+        let mut strict = def.clone();
+        strict.scope_check = false;
+        validator::validate_arg_with_custom_types(&name, &strict, &value, custom_types).map_err(
+            |e| {
+                let msg = match e {
+                    ToolCladError::ManifestError(m) | ToolCladError::ValidationError(m) => m,
+                    other => other.to_string(),
+                };
+                ToolCladError::ManifestError(format!(
+                    "argument '{name}' has an invalid default '{value}': {msg}"
+                ))
+            },
+        )?;
+    }
 
     // Validate that mapping keys reference existing args, and that a mapping
     // over an enum covers every allowed value: a missing case must be a load
@@ -2692,5 +2754,205 @@ envelope = true
         assert_eq!(defaults.extract_mode.as_deref(), Some("accessibility_tree"));
         // Defaults for the registered-but-inert keys.
         assert_eq!(m.output.as_ref().unwrap().max_bytes, 8_388_608);
+    }
+
+    // ---- W5: scope enforcement wiring ----------------------------------
+
+    fn scope_manifest(target_extra: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "scoped"
+version = "1.0.0"
+binary = "echo"
+description = "scoped echo"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+scope_check = true
+{target_extra}
+
+[command]
+exec = ["echo", "{{target}}"]
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "toolclad-lib-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn scope_env_set() -> bool {
+        std::env::var_os(scope::SCOPE_FILE_ENV).is_some_and(|v| !v.is_empty())
+    }
+
+    #[test]
+    fn scope_check_on_unsupported_type_is_load_error() {
+        let toml = WHOIS_MANIFEST.replace(
+            "type = \"scope_target\"",
+            "type = \"string\"\nscope_check = true",
+        );
+        let err = parse_manifest(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains("argument 'target' scope_check is not supported for type 'string'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn scope_is_loaded_from_manifest_dir_and_enforced() {
+        if scope_env_set() {
+            eprintln!("skipping: TOOLCLAD_SCOPE_FILE is set");
+            return;
+        }
+        let root = scratch_dir("scope");
+        std::fs::create_dir_all(root.join("scope")).unwrap();
+        std::fs::create_dir_all(root.join("tools")).unwrap();
+        std::fs::write(
+            root.join("scope/scope.toml"),
+            "[scope]\nallowed_domains = [\"*.example.com\"]\nblocked_domains = [\"admin.example.com\"]\n",
+        )
+        .unwrap();
+        let path = root.join("tools/scoped.clad.toml");
+        std::fs::write(&path, scope_manifest("")).unwrap();
+
+        let m = load_manifest(&path).unwrap();
+        assert_eq!(m.source_dir.as_deref(), Some(root.join("tools").as_path()));
+        let sc = m.scope.as_ref().expect("scope cached at load");
+        assert_eq!(sc.allowed_domains, vec!["*.example.com"]);
+
+        let run = |v: &str| {
+            let args = HashMap::from([("target".to_string(), v.to_string())]);
+            executor::dry_run(&m, &args).map(|r| r.command)
+        };
+        assert_eq!(run("app.example.com").unwrap(), "echo app.example.com");
+        for refused in [
+            "example.com",
+            "evil-example.com",
+            "admin.example.com",
+            "other.org",
+        ] {
+            let err = run(refused).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("target '{refused}' is not in scope")),
+                "{refused}: {err}"
+            );
+        }
+
+        // A default on a scope_check arg is scope-checked at call time.
+        std::fs::write(
+            &path,
+            scope_manifest("default = \"other.org\"")
+                .replace("required = true", "required = false"),
+        )
+        .unwrap();
+        let m = load_manifest(&path).unwrap();
+        let err = executor::dry_run(&m, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in scope"), "{err}");
+
+        // A malformed scope file is a load error.
+        std::fs::write(root.join("scope/scope.toml"), "[scope]\nallowed = []\n").unwrap();
+        let err = load_manifest(&path).unwrap_err().to_string();
+        assert!(err.contains("unknown key 'scope.allowed'"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scope_check_fails_closed_without_scope_file() {
+        let root = scratch_dir("noscope");
+        if scope_env_set()
+            || root
+                .ancestors()
+                .any(|d| d.join("scope").join("scope.toml").is_file())
+        {
+            eprintln!("skipping: a scope file is reachable from the temp dir");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let path = root.join("scoped.clad.toml");
+        std::fs::write(&path, scope_manifest("")).unwrap();
+        let m = load_manifest(&path).unwrap();
+        assert!(m.scope.is_none());
+        let args = HashMap::from([("target".to_string(), "app.example.com".to_string())]);
+        let err = executor::dry_run(&m, &args).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "argument 'target' scope_check is enabled but no scope/scope.toml was found (set TOOLCLAD_SCOPE_FILE)"
+            ),
+            "{err}"
+        );
+        let err = executor::execute(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("scope_check is enabled"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- W11 K4: per-argument defaults are validated at load ------------
+
+    fn default_manifest(arg: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "defaults"
+version = "1.0.0"
+binary = "echo"
+description = "defaults"
+
+[args.x]
+position = 1
+{arg}
+
+[command]
+template = "echo {{x}}"
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    #[test]
+    fn invalid_defaults_are_load_errors() {
+        for arg in [
+            "type = \"port\"\ndefault = 0",
+            "type = \"integer\"\nmin = 1\ndefault = 0",
+            "type = \"string\"\ndefault = \"a b\"",
+            "type = \"boolean\"\ndefault = \"yes\"",
+            "type = \"enum\"\nallowed = [\"a\"]\ndefault = \"b\"",
+            "type = \"path\"\ndefault = \"../etc\"",
+        ] {
+            let err = parse_manifest(&default_manifest(arg))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("argument 'x' has an invalid default"),
+                "{arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_defaults_load() {
+        for arg in [
+            "type = \"string\"\ndefault = \"\"",
+            "type = \"port\"\ndefault = 443",
+            "type = \"integer\"\nmin = 1\ndefault = 5",
+            "type = \"boolean\"\ndefault = true",
+            "type = \"number\"\ndefault = 0.5",
+            "type = \"enum\"\nallowed = [\"a\"]\ndefault = \"a\"",
+        ] {
+            parse_manifest(&default_manifest(arg)).unwrap_or_else(|e| panic!("{arg}: {e}"));
+        }
     }
 }
