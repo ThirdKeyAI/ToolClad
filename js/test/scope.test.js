@@ -44,12 +44,12 @@ function tmpDir() {
   return mkdtempSync(join(tmpdir(), "toolclad-scope-"));
 }
 
-function withEnv(value, fn) {
+async function withEnv(value, fn) {
   const saved = process.env.TOOLCLAD_SCOPE_FILE;
   if (value === undefined) delete process.env.TOOLCLAD_SCOPE_FILE;
   else process.env.TOOLCLAD_SCOPE_FILE = value;
   try {
-    return fn();
+    return await fn();
   } finally {
     if (saved === undefined) delete process.env.TOOLCLAD_SCOPE_FILE;
     else process.env.TOOLCLAD_SCOPE_FILE = saved;
@@ -132,13 +132,13 @@ describe("scope_vectors.json (normative)", () => {
 describe("scope matching", () => {
   const check = (type, value) => validateArgIn({ type, scope_check: true }, value, { scope: SCOPE });
 
-  it("matches exact and wildcard domain rules", () => {
+  it("matches exact and wildcard domain rules", async () => {
     assert.equal(check("scope_target", "example.com"), "example.com");
     assert.equal(check("scope_target", "EXAMPLE.com"), "EXAMPLE.com");
     assert.equal(check("scope_target", "deep.sub.example.com"), "deep.sub.example.com");
   });
 
-  it("wildcard does not match the apex", () => {
+  it("wildcard does not match the apex", async () => {
     const scope = makeScope({ allowed_domains: ["*.example.com"] });
     assert.throws(
       () => validateArgIn({ type: "scope_target", scope_check: true }, "example.com", { scope }),
@@ -146,12 +146,12 @@ describe("scope matching", () => {
     );
   });
 
-  it("matches on a label boundary only", () => {
+  it("matches on a label boundary only", async () => {
     assert.throws(() => check("scope_target", "evil-example.com"), /is not in scope/);
     assert.throws(() => check("url", "https://example.com.evil.com/"), /target 'example\.com\.evil\.com' is not in scope/);
   });
 
-  it("blocked rules beat allowed rules", () => {
+  it("blocked rules beat allowed rules", async () => {
     assert.throws(() => check("scope_target", "bad.example.com"), /is not in scope/);
     // An exact blocked rule does not reach its subdomains.
     assert.equal(check("scope_target", "x.bad.example.com"), "x.bad.example.com");
@@ -159,7 +159,7 @@ describe("scope matching", () => {
     assert.throws(() => check("ip_address", "10.0.1.200"), /target '10\.0\.1\.200' is not in scope/);
   });
 
-  it("a CIDR must be fully contained in an allowed range", () => {
+  it("a CIDR must be fully contained in an allowed range", async () => {
     assert.equal(check("cidr", "10.0.1.0/26"), "10.0.1.0/26");
     assert.throws(() => check("cidr", "10.0.0.0/8"), /is not in scope/);
     // Overlaps the blocked upper half.
@@ -172,14 +172,14 @@ describe("scope matching", () => {
     assert.equal(checkScope("2001:db8:1::/48", SCOPE), undefined);
   });
 
-  it("checks the host of a url, and IP literals", () => {
+  it("checks the host of a url, and IP literals", async () => {
     assert.equal(check("url", "https://app.example.com:8443/x"), "https://app.example.com:8443/x");
     assert.equal(check("url", "http://10.0.1.5/"), "http://10.0.1.5/");
     assert.equal(check("scope_target", "2001:db8::1"), "2001:db8::1");
     assert.throws(() => check("url", "https://other.org/"), /target 'other\.org' is not in scope/);
   });
 
-  it("an in-scope target is still refused by block_internal", () => {
+  it("an in-scope target is still refused by block_internal", async () => {
     assert.throws(
       () =>
         validateArgIn({ type: "ip_address", scope_check: true, block_internal: true }, "10.0.1.5", {
@@ -200,14 +200,14 @@ describe("scope matching", () => {
     );
   });
 
-  it("an empty scope file puts nothing in scope", () => {
+  it("an empty scope file puts nothing in scope", async () => {
     assert.throws(
       () => validateArgIn({ type: "scope_target", scope_check: true }, "example.com", { scope: makeScope({}) }),
       /is not in scope/
     );
   });
 
-  it("no scope fails closed", () => {
+  it("no scope fails closed", async () => {
     assert.throws(
       () => validateArgIn({ type: "scope_target", scope_check: true }, "example.com"),
       (err) => err.message === NO_SCOPE_FILE_MESSAGE
@@ -218,7 +218,7 @@ describe("scope matching", () => {
     );
   });
 
-  it("scope_check on an unsupported type is refused at validation time", () => {
+  it("scope_check on an unsupported type is refused at validation time", async () => {
     assert.throws(
       () => validateArgIn({ type: "string", scope_check: true }, "x", { scope: SCOPE }),
       /scope_check is not supported for type 'string'/
@@ -234,23 +234,23 @@ describe("scope file loading", () => {
     return path;
   }
 
-  it("loads a valid file", () => {
+  it("loads a valid file", async () => {
     const scope = loadScopeFile(scopeFile(SCOPE_TOML));
     assert.deepEqual([...scope.allowed_domains], ["example.com", "*.example.com"]);
     assert.equal(scope.allowed_cidrs.length, 2);
   });
 
-  it("refuses unknown keys", () => {
+  it("refuses unknown keys", async () => {
     assert.throws(() => loadScopeFile(scopeFile(`[scope]\nallowed_domain = ["a.com"]\n`)), /unknown key 'scope\.allowed_domain'/);
     assert.throws(() => loadScopeFile(scopeFile(`[other]\nx = 1\n`)), /unknown key 'other'/);
   });
 
-  it("refuses a malformed CIDR", () => {
+  it("refuses a malformed CIDR", async () => {
     assert.throws(() => loadScopeFile(scopeFile(`[scope]\nallowed_cidrs = ["10.0.1.0/33"]\n`)), /invalid CIDR/);
     assert.throws(() => loadScopeFile(scopeFile(`[scope]\nblocked_cidrs = ["10.0.1/24"]\n`)), /invalid CIDR/);
   });
 
-  it("refuses a bad wildcard or domain rule", () => {
+  it("refuses a bad wildcard or domain rule", async () => {
     for (const rule of ["ex*ample.com", "*example.com", "a.*.com", "*", "*.", "Example.com", "a..com", "a_b.com"]) {
       assert.throws(
         () => loadScopeFile(scopeFile(`[scope]\nallowed_domains = ["${rule}"]\n`)),
@@ -271,7 +271,7 @@ describe("scope discovery", () => {
     if (saved !== undefined) process.env.TOOLCLAD_SCOPE_FILE = saved;
   });
 
-  it("walks upward from the manifest directory", () => {
+  it("walks upward from the manifest directory", async () => {
     const root = tmpDir();
     mkdirSync(join(root, "scope"));
     writeFileSync(join(root, "scope", "scope.toml"), SCOPE_TOML);
@@ -280,13 +280,13 @@ describe("scope discovery", () => {
     const path = join(nested, "t.clad.toml");
     writeFileSync(path, manifestToml());
     const manifest = loadManifest(path);
-    const ok = execute(manifest, { target: "app.example.com" }, { dryRun: true });
+    const ok = await execute(manifest, { target: "app.example.com" }, { dryRun: true });
     assert.deepEqual(ok.argv, ["echo", "app.example.com"]);
-    assert.throws(() => execute(manifest, { target: "other.org" }, { dryRun: true }), /target 'other\.org' is not in scope/);
+    await assert.rejects(() => execute(manifest, { target: "other.org" }, { dryRun: true }), /target 'other\.org' is not in scope/);
     assert.equal(discoverScope(nested).source, join(root, "scope", "scope.toml"));
   });
 
-  it("TOOLCLAD_SCOPE_FILE wins over the upward walk", () => {
+  it("TOOLCLAD_SCOPE_FILE wins over the upward walk", async () => {
     const root = tmpDir();
     mkdirSync(join(root, "scope"));
     writeFileSync(join(root, "scope", "scope.toml"), SCOPE_TOML);
@@ -294,29 +294,29 @@ describe("scope discovery", () => {
     writeFileSync(other, `[scope]\nallowed_domains = ["other.org"]\n`);
     const path = join(root, "t.clad.toml");
     writeFileSync(path, manifestToml());
-    withEnv(other, () => {
+    await withEnv(other, async () => {
       const manifest = loadManifest(path);
-      assert.deepEqual(execute(manifest, { target: "other.org" }, { dryRun: true }).argv, ["echo", "other.org"]);
-      assert.throws(() => execute(manifest, { target: "example.com" }, { dryRun: true }), /is not in scope/);
+      assert.deepEqual((await execute(manifest, { target: "other.org" }, { dryRun: true })).argv, ["echo", "other.org"]);
+      await assert.rejects(() => execute(manifest, { target: "example.com" }, { dryRun: true }), /is not in scope/);
     });
   });
 
-  it("an unreadable TOOLCLAD_SCOPE_FILE is an error, not a fallback", () => {
+  it("an unreadable TOOLCLAD_SCOPE_FILE is an error, not a fallback", async () => {
     const root = tmpDir();
     mkdirSync(join(root, "scope"));
     writeFileSync(join(root, "scope", "scope.toml"), SCOPE_TOML);
     const path = join(root, "t.clad.toml");
     writeFileSync(path, manifestToml());
-    withEnv(join(root, "missing.toml"), () => {
+    await withEnv(join(root, "missing.toml"), async () => {
       const manifest = loadManifest(path);
-      assert.throws(
+      await assert.rejects(
         () => execute(manifest, { target: "example.com" }, { dryRun: true }),
         /cannot read scope file/
       );
     });
   });
 
-  it("fails closed when no scope file exists anywhere", (t) => {
+  it("fails closed when no scope file exists anywhere", async (t) => {
     const root = tmpDir();
     if (discoverScope(root) !== null) {
       t.skip("a scope/scope.toml exists above the temp directory");
@@ -325,13 +325,13 @@ describe("scope discovery", () => {
     const path = join(root, "t.clad.toml");
     writeFileSync(path, manifestToml());
     const manifest = loadManifest(path);
-    assert.throws(
+    await assert.rejects(
       () => execute(manifest, { target: "example.com" }, { dryRun: true }),
       /scope_check is enabled but no scope\/scope\.toml was found/
     );
   });
 
-  it("applies on the MCP path", () => {
+  it("applies on the MCP path", async () => {
     const other = join(tmpDir(), "s.toml");
     writeFileSync(other, `[scope]\nallowed_domains = ["example.com"]\n`);
     const manifest = {
@@ -339,13 +339,13 @@ describe("scope discovery", () => {
       args: { target: { type: "scope_target", scope_check: true } },
       mcp: { server: "s", tool: "x" },
     };
-    withEnv(other, () => {
+    await withEnv(other, async () => {
       assert.equal(executeMcp(manifest, { target: "example.com" }).mapped_args.target, "example.com");
       assert.throws(() => executeMcp({ ...manifest }, { target: "evil.org" }), /is not in scope/);
     });
   });
 
-  it("applies on the CLI test command", () => {
+  it("applies on the CLI test command", async () => {
     const root = tmpDir();
     const path = join(root, "t.clad.toml");
     writeFileSync(path, manifestToml());
@@ -361,13 +361,13 @@ describe("scope discovery", () => {
 });
 
 describe("scope_check at manifest load", () => {
-  it("is refused on an unsupported built-in type", () => {
+  it("is refused on an unsupported built-in type", async () => {
     const path = join(tmpDir(), "t.clad.toml");
     writeFileSync(path, manifestToml("string"));
     assert.throws(() => loadManifest(path), /scope_check is not supported for type 'string'/);
   });
 
-  it("is refused on a custom type with an unsupported base", () => {
+  it("is refused on a custom type with an unsupported base", async () => {
     const path = join(tmpDir(), "t.clad.toml");
     writeFileSync(path, manifestToml("ticket"));
     const manifest = loadManifest(path);
@@ -377,7 +377,7 @@ describe("scope_check at manifest load", () => {
     );
   });
 
-  it("is accepted on every supported type", () => {
+  it("is accepted on every supported type", async () => {
     for (const type of ["scope_target", "url", "ip_address", "cidr"]) {
       const path = join(tmpDir(), "t.clad.toml");
       writeFileSync(path, manifestToml(type));

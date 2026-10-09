@@ -1,27 +1,107 @@
 use crate::scope::ScopeDef;
-use crate::types::{ConditionalDef, EvidenceEnvelope, Manifest, ToolCladError};
+use crate::types::{ConditionalDef, EvidenceEnvelope, Manifest, ToolCladError, ToolLimits};
 use crate::validator::validate_arg_in;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
-use std::time::Instant;
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-/// Replace `{_secret:name}` with `TOOLCLAD_SECRET_{NAME}` env var.
-fn inject_template_vars(template: &str) -> Result<String, ToolCladError> {
-    let re = Regex::new(r"\{_secret:([a-zA-Z0-9_]+)\}").unwrap();
-    let mut result = template.to_string();
-    for cap in re.captures_iter(template) {
-        let name = &cap[1];
+/// Where `{_secret:name}` values come from for one call: the file named by
+/// `TOOLCLAD_SECRETS_FILE` (read at most once, on first use) wins over the
+/// `TOOLCLAD_SECRET_<NAME>` environment variable.
+#[derive(Default)]
+struct SecretSource {
+    file: Option<Option<HashMap<String, String>>>,
+}
+
+impl SecretSource {
+    fn lookup(&mut self, name: &str) -> Result<String, ToolCladError> {
+        if self.file.is_none() {
+            self.file = Some(load_secrets_file()?);
+        }
+        if let Some(Some(map)) = &self.file {
+            if let Some(v) = map.get(name) {
+                return Ok(v.clone());
+            }
+        }
         let env_key = format!("TOOLCLAD_SECRET_{}", name.to_uppercase());
-        let val = std::env::var(&env_key).map_err(|_| {
+        std::env::var(&env_key).map_err(|_| {
             ToolCladError::ExecutionError(format!("Secret '{}' not found (set {})", name, env_key))
-        })?;
+        })
+    }
+}
+
+/// Read `TOOLCLAD_SECRETS_FILE` (top-level `name = "value"` TOML pairs), or
+/// `None` when it is unset. A file readable by group or others is refused:
+/// that check is what makes the file better than an environment variable.
+fn load_secrets_file() -> Result<Option<HashMap<String, String>>, ToolCladError> {
+    let Some(path) = std::env::var_os("TOOLCLAD_SECRETS_FILE") else {
+        return Ok(None);
+    };
+    let shown = path.to_string_lossy().to_string();
+    let err = |msg: String| ToolCladError::ExecutionError(msg);
+    let mut file = std::fs::File::open(&path).map_err(|e| {
+        err(format!(
+            "TOOLCLAD_SECRETS_FILE '{shown}' cannot be opened: {e}"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file
+            .metadata()
+            .map_err(|e| err(format!("TOOLCLAD_SECRETS_FILE '{shown}': {e}")))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(err(format!(
+                "TOOLCLAD_SECRETS_FILE '{shown}' is readable by group or others (mode {mode:04o}); chmod 600 it"
+            )));
+        }
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| {
+        err(format!(
+            "TOOLCLAD_SECRETS_FILE '{shown}' cannot be read: {e}"
+        ))
+    })?;
+    let table: toml::Table = toml::from_str(&text).map_err(|e| {
+        err(format!(
+            "TOOLCLAD_SECRETS_FILE '{shown}' is not valid TOML: {e}"
+        ))
+    })?;
+    let mut out = HashMap::with_capacity(table.len());
+    for (k, v) in table {
+        let toml::Value::String(v) = v else {
+            return Err(err(format!(
+                "TOOLCLAD_SECRETS_FILE '{shown}': value for '{k}' must be a string"
+            )));
+        };
+        out.insert(k, v);
+    }
+    Ok(Some(out))
+}
+
+static SECRET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{_secret:([a-zA-Z0-9_]+)\}").unwrap());
+
+/// Replace each `{_secret:name}` with its value from `secrets`.
+fn inject_template_vars(
+    template: &str,
+    secrets: &mut SecretSource,
+) -> Result<String, ToolCladError> {
+    let mut result = template.to_string();
+    for cap in SECRET_RE.captures_iter(template) {
+        let val = secrets.lookup(&cap[1])?;
         result = result.replace(&cap[0], &val);
     }
     Ok(result)
@@ -50,9 +130,10 @@ fn build_http_request(
     let http = manifest.http.as_ref().ok_or_else(|| {
         ToolCladError::ExecutionError("manifest has no [http] section".to_string())
     })?;
+    let mut secrets = SecretSource::default();
 
     // URL: secrets on the template, then arguments.
-    let mut url = inject_template_vars(&http.url)?;
+    let mut url = inject_template_vars(&http.url, &mut secrets)?;
     for (k, v) in validated {
         url = url.replace(&format!("{{{k}}}"), v);
     }
@@ -60,7 +141,7 @@ fn build_http_request(
     // Headers: same order for every value.
     let mut headers: Vec<(String, String)> = Vec::with_capacity(http.headers.len());
     for (hk, hv) in &http.headers {
-        let mut val = inject_template_vars(hv)?;
+        let mut val = inject_template_vars(hv, &mut secrets)?;
         for (k, v) in validated {
             val = val.replace(&format!("{{{k}}}"), v);
         }
@@ -70,7 +151,7 @@ fn build_http_request(
     // Body: secrets on the template, then JSON-escaped arguments.
     let body = match http.body_template {
         Some(ref body_tmpl) => {
-            let mut b = inject_template_vars(body_tmpl)?;
+            let mut b = inject_template_vars(body_tmpl, &mut secrets)?;
             for (k, v) in validated {
                 // JSON-escape the value to prevent injection into JSON body.
                 let escaped = serde_json::to_string(v)
@@ -93,11 +174,7 @@ fn execute_http(
     validated: &HashMap<String, String>,
 ) -> Result<EvidenceEnvelope, ToolCladError> {
     let http = manifest.http.as_ref().unwrap();
-    let scan_id = format!(
-        "{}-{}",
-        chrono::Utc::now().timestamp(),
-        &uuid::Uuid::new_v4().to_string()[..5]
-    );
+    let scan_id = new_scan_id();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
 
@@ -195,11 +272,7 @@ fn execute_mcp_proxy(
     validated: &HashMap<String, String>,
 ) -> Result<EvidenceEnvelope, ToolCladError> {
     let mcp = manifest.mcp.as_ref().unwrap();
-    let scan_id = format!(
-        "{}-{}",
-        chrono::Utc::now().timestamp(),
-        &uuid::Uuid::new_v4().to_string()[..5]
-    );
+    let scan_id = new_scan_id();
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     // Map arguments through field_map.
@@ -455,8 +528,19 @@ pub fn build_command_argv(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<Vec<String>, ToolCladError> {
+    let paths = EvidencePaths::new(manifest, new_scan_id());
+    build_argv_with(manifest, args, &paths)
+}
+
+/// [`build_command_argv`] with the injected evidence variables of one
+/// invocation, so the argv and the directories created for it agree.
+fn build_argv_with(
+    manifest: &Manifest,
+    args: &HashMap<String, String>,
+    paths: &EvidencePaths,
+) -> Result<Vec<String>, ToolCladError> {
     let tokens = compiled_exec(manifest)?;
-    let resolved = resolve_vars(manifest, args)?;
+    let resolved = resolve_vars(manifest, args, paths)?;
     let user_args: HashSet<&str> = manifest.args.keys().map(String::as_str).collect();
 
     let (mut argv, first_user_arg) = substitute_tokens(
@@ -507,6 +591,7 @@ pub fn build_command(
 fn resolve_vars(
     manifest: &Manifest,
     args: &HashMap<String, String>,
+    paths: &EvidencePaths,
 ) -> Result<ResolvedVars, ToolCladError> {
     let mut vars: HashMap<String, String> = HashMap::new();
 
@@ -536,20 +621,12 @@ fn resolve_vars(
 
     // Executor-injected single-token vars. Inserted after user args so a
     // declared arg can never shadow them.
-    let scan_id = format!(
-        "{}-{}",
-        chrono::Utc::now().timestamp(),
-        &uuid::Uuid::new_v4().to_string()[..5]
+    vars.insert("_scan_id".to_string(), paths.scan_id.clone());
+    vars.insert(
+        "_evidence_dir".to_string(),
+        path_string(&paths.evidence_dir),
     );
-    let evidence_dir = std::env::var("TOOLCLAD_EVIDENCE_DIR").unwrap_or_else(|_| {
-        let mut dir = std::env::temp_dir();
-        dir.push("toolclad-evidence");
-        dir.to_string_lossy().to_string()
-    });
-    let output_file = format!("{evidence_dir}/{scan_id}-output");
-    vars.insert("_scan_id".to_string(), scan_id);
-    vars.insert("_evidence_dir".to_string(), evidence_dir);
-    vars.insert("_output_file".to_string(), output_file);
+    vars.insert("_output_file".to_string(), path_string(&paths.output_file));
 
     let mut trusted: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -1014,39 +1091,66 @@ pub fn execute(
         ));
     }
 
-    let scan_id = format!(
-        "{}-{}",
-        chrono::Utc::now().timestamp(),
-        &uuid::Uuid::new_v4().to_string()[..5]
-    );
+    let paths = EvidencePaths::new(manifest, new_scan_id());
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let start = Instant::now();
 
-    // Phase 2: Build and execute command.
-    let (cmd_string, stdout_text, stderr_text, exit_code, status_str) =
+    // Phase 2: Build the command, then prepare the evidence directories and
+    // the per-invocation scratch directory the child runs in.
+    let (program, argv_rest, extra_env, cmd_string) =
         if let Some(ref executor_path) = manifest.command.executor {
             // Escape hatch: run custom executor with env vars.
             // SECURITY: Args are passed as env vars, not interpolated into shell command.
-            let mut cmd = Command::new(executor_path);
-            for (k, v) in &validated {
-                cmd.env(format!("TOOLCLAD_ARG_{}", k.to_uppercase()), v);
-            }
-            cmd.env("TOOLCLAD_SCAN_ID", &scan_id);
-            cmd.env("TOOLCLAD_TOOL_NAME", &manifest.tool.name);
-
-            let cmd_display = format!("{executor_path} (custom executor)");
-            run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
+            let mut env: Vec<(String, String)> = validated
+                .iter()
+                .map(|(k, v)| (format!("TOOLCLAD_ARG_{}", k.to_uppercase()), v.clone()))
+                .collect();
+            env.push(("TOOLCLAD_SCAN_ID".to_string(), paths.scan_id.clone()));
+            env.push(("TOOLCLAD_TOOL_NAME".to_string(), manifest.tool.name.clone()));
+            env.push((
+                "TOOLCLAD_EVIDENCE_DIR".to_string(),
+                path_string(&paths.evidence_dir),
+            ));
+            env.push((
+                "TOOLCLAD_OUTPUT_DIR".to_string(),
+                path_string(&paths.output_dir),
+            ));
+            let display = format!("{executor_path} (custom executor)");
+            (executor_path.clone(), Vec::new(), env, display)
         } else {
             // Array-based command construction maps directly to execve. A
             // `template` was tokenized at load into the same array, so there is
             // no string→split round-trip anywhere on the spawn path.
-            let argv = build_command_argv(manifest, &validated)?;
-            let cmd_display = argv.join(" ");
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
-
-            run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
+            let mut argv = build_argv_with(manifest, &validated, &paths)?;
+            let display = argv.join(" ");
+            let rest = argv.split_off(1);
+            (argv.remove(0), rest, Vec::new(), display)
         };
+    let program = resolve_program(&program)?;
+
+    create_private_dir(&paths.evidence_dir, true)?;
+    create_private_dir(&paths.output_dir, true)?;
+    let work_dir = paths.work_dir();
+    create_private_dir(&work_dir, false)?;
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&argv_rest).current_dir(&work_dir);
+    apply_child_env(&mut cmd, &extra_env);
+    #[cfg(unix)]
+    apply_child_limits(&mut cmd, manifest.tool.limits.as_ref());
+
+    let start = Instant::now();
+    let run = run_command_with_timeout(cmd, manifest.tool.timeout_seconds);
+    // Remove the scratch directory only when the tool left nothing in it: a
+    // file there is evidence.
+    let _ = std::fs::remove_dir(&work_dir);
+    let RunOutput {
+        stdout: stdout_text,
+        stderr: stderr_text,
+        exit_code,
+        status: status_str,
+        timed_out,
+    } = run?;
+    let scan_id = paths.scan_id;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1057,20 +1161,24 @@ pub fn execute(
         format!("sha256:{:x}", hasher.finalize())
     };
 
-    // Phase 3b: Parse output.
-    let parsed = parse_output(manifest, &stdout_text)?;
-
-    // Phase 3c: Validate against output schema if defined.
-    // (basic type check — full JSON Schema validation would require a dedicated crate)
+    // Phase 3b: Parse output. A timed-out run's output is partial, so it is
+    // returned raw rather than parsed.
     let has_custom_schema = manifest
         .output
         .as_ref()
         .is_some_and(|o| o.schema != serde_json::json!({"type": "object"}));
-    let results = if has_custom_schema {
-        // Schema is declared, use parsed output.
-        parsed
-    } else {
+    let results = if timed_out {
         serde_json::json!({"raw_output": stdout_text})
+    } else {
+        let parsed = parse_output(manifest, &stdout_text)?;
+        // Phase 3c: Validate against output schema if defined.
+        // (basic type check — full JSON Schema validation would require a dedicated crate)
+        if has_custom_schema {
+            // Schema is declared, use parsed output.
+            parsed
+        } else {
+            serde_json::json!({"raw_output": stdout_text})
+        }
     };
 
     Ok(EvidenceEnvelope {
@@ -1088,16 +1196,328 @@ pub fn execute(
     })
 }
 
-/// Run a Command with a timeout, returning (command_string, stdout, stderr, exit_code, status).
+/// The fixed `PATH` every child gets and `argv[0]` is resolved against. Never
+/// inherited: an inherited `PATH` is how a renamed binary earlier in the path
+/// wins.
+pub const CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Parent variables copied into the child, only when set.
+const CHILD_ENV_PASSTHROUGH: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ", "TERM"];
+
+/// Default `SIGTERM` → `SIGKILL` grace period, overridable with
+/// `TOOLCLAD_KILL_GRACE_MS`.
+const DEFAULT_KILL_GRACE_MS: u64 = 2000;
+
+/// A fresh scan id: `<unix_seconds>-<32 hex chars>` (128 random bits from the
+/// OS CSPRNG via `uuid`).
+fn new_scan_id() -> String {
+    format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn path_string(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// The evidence locations of one invocation.
+#[derive(Debug, Clone)]
+struct EvidencePaths {
+    scan_id: String,
+    /// `TOOLCLAD_EVIDENCE_DIR`, else `<tmpdir>/toolclad-evidence`.
+    evidence_dir: PathBuf,
+    /// `[tool.evidence] output_dir` with `{evidence_dir}`/`{scan_id}`
+    /// substituted, else `<evidence_dir>/<scan_id>-<tool_name>`.
+    output_dir: PathBuf,
+    /// `<output_dir>/scan.<ext>`, `ext` from `output.format`.
+    output_file: PathBuf,
+}
+
+impl EvidencePaths {
+    fn new(manifest: &Manifest, scan_id: String) -> Self {
+        let evidence_dir = std::env::var_os("TOOLCLAD_EVIDENCE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("toolclad-evidence"));
+        let output_dir = match manifest.tool.evidence.as_ref() {
+            Some(ev) if !ev.output_dir.is_empty() => PathBuf::from(
+                ev.output_dir
+                    .replace("{evidence_dir}", &path_string(&evidence_dir))
+                    .replace("{scan_id}", &scan_id),
+            ),
+            _ => evidence_dir.join(format!("{scan_id}-{}", manifest.tool.name)),
+        };
+        let ext = match manifest.output.as_ref().map(|o| o.format.as_str()) {
+            Some("xml") => "xml",
+            Some("json") => "json",
+            Some("csv") => "csv",
+            Some("jsonl") => "jsonl",
+            _ => "txt",
+        };
+        let output_file = output_dir.join(format!("scan.{ext}"));
+        Self {
+            scan_id,
+            evidence_dir,
+            output_dir,
+            output_file,
+        }
+    }
+
+    /// The child's working directory: `<evidence_dir>/<scan_id>-work`.
+    fn work_dir(&self) -> PathBuf {
+        self.evidence_dir.join(format!("{}-work", self.scan_id))
+    }
+}
+
+/// Create a directory with mode 0700 and refuse a symlink in its place.
 ///
-/// Uses process groups on Unix so that timeout kills can terminate all child
-/// processes, not just the top-level shell/binary.
+/// `existing_ok` allows a directory that is already there (the evidence root,
+/// a fixed `output_dir`); otherwise the directory must be new (the scratch
+/// directory). The leaf is checked with `lstat`, so a symlink pre-planted in
+/// a shared temp directory cannot redirect the tool's writes.
+fn create_private_dir(path: &Path, existing_ok: bool) -> Result<(), ToolCladError> {
+    let shown = path.display();
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(existing_ok);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|e| {
+        ToolCladError::ExecutionError(format!("cannot create directory '{shown}': {e}"))
+    })?;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        ToolCladError::ExecutionError(format!("cannot inspect directory '{shown}': {e}"))
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(ToolCladError::ExecutionError(format!(
+            "refusing evidence directory '{shown}': it is a symlink or not a directory"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(ToolCladError::ExecutionError(format!(
+                "refusing evidence directory '{shown}': owned by uid {}, not the runtime's uid {euid}",
+                meta.uid()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `argv[0]` to the file that will be executed: as given when it
+/// contains a `/`, otherwise the first executable regular file of that name
+/// on [`CHILD_PATH`].
+fn resolve_program(name: &str) -> Result<PathBuf, ToolCladError> {
+    if name.contains('/') {
+        return Ok(PathBuf::from(name));
+    }
+    if !name.is_empty() {
+        for dir in CHILD_PATH.split(':') {
+            let candidate = Path::new(dir).join(name);
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = true;
+                if meta.is_file() && executable {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(ToolCladError::ExecutionError(format!(
+        "binary '{name}' not found on PATH ({CHILD_PATH})"
+    )))
+}
+
+/// Clear the child's environment and rebuild it from the allowlist: the fixed
+/// `PATH`, `HOME`/`LANG`/`LC_ALL`/`TZ`/`TERM` when set in the parent, and
+/// `extra` (the executor hatch's `TOOLCLAD_*` variables). A
+/// `TOOLCLAD_SECRET_*` name is dropped even if it reaches `extra`, so no edit
+/// to the allowlist can hand a secret to a child.
+fn apply_child_env(cmd: &mut Command, extra: &[(String, String)]) {
+    cmd.env_clear();
+    for (k, v) in child_env(extra) {
+        cmd.env(k, v);
+    }
+}
+
+fn child_env(extra: &[(String, String)]) -> Vec<(String, std::ffi::OsString)> {
+    let mut env = vec![("PATH".to_string(), CHILD_PATH.into())];
+    for name in CHILD_ENV_PASSTHROUGH {
+        if let Some(v) = std::env::var_os(name) {
+            env.push((name.to_string(), v));
+        }
+    }
+    for (k, v) in extra {
+        env.push((k.clone(), v.into()));
+    }
+    env.retain(|(k, _)| !k.starts_with("TOOLCLAD_SECRET_"));
+    env
+}
+
+/// The rlimits applied to the child: core dumps off, `FSIZE` 1 GiB, `NOFILE`
+/// 1024 (each overridable in `[tool.limits]`), plus `NPROC`, `AS` and `CPU`
+/// only when declared. `RLIMIT_AS` stays off by default because it breaks
+/// tools that reserve large virtual mappings. `RLIMIT_NPROC` stays off by
+/// default because Linux counts it against every task the *user* owns, not
+/// the tool's own tree: on a busy host any fixed default stops a threaded
+/// tool from creating its first thread.
+#[cfg(unix)]
+fn child_rlimits(limits: Option<&ToolLimits>) -> Vec<(RlimitResource, libc::rlim_t)> {
+    let l = limits.cloned().unwrap_or_default();
+    let mut out: Vec<(RlimitResource, libc::rlim_t)> = vec![
+        (libc::RLIMIT_CORE, 0),
+        (
+            libc::RLIMIT_FSIZE,
+            l.fsize_bytes.unwrap_or(1 << 30) as libc::rlim_t,
+        ),
+        (
+            libc::RLIMIT_NOFILE,
+            l.nofile.unwrap_or(1024) as libc::rlim_t,
+        ),
+    ];
+    if let Some(v) = l.nproc {
+        out.push((libc::RLIMIT_NPROC, v as libc::rlim_t));
+    }
+    if let Some(v) = l.address_space_bytes {
+        out.push((libc::RLIMIT_AS, v as libc::rlim_t));
+    }
+    if let Some(v) = l.cpu_seconds {
+        out.push((libc::RLIMIT_CPU, v as libc::rlim_t));
+    }
+    out
+}
+
+/// The rlimit resource type differs between libcs (`c_uint` on glibc,
+/// `c_int` elsewhere); take it from the constants themselves.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+type RlimitResource = libc::c_int;
+
+/// Set umask 0077 and the rlimits in the child between `fork` and `exec`.
+#[cfg(unix)]
+fn apply_child_limits(cmd: &mut Command, limits: Option<&ToolLimits>) {
+    let rlimits = child_rlimits(limits);
+    // SAFETY: the closure runs in the forked child before exec, where only
+    // async-signal-safe operations are allowed. It reads a Vec built before
+    // the fork (no allocation) and makes only umask/getrlimit/setrlimit
+    // system calls; an error is reported from errno without allocating.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::umask(0o077);
+            for &(resource, value) in &rlimits {
+                let mut cur = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(resource, &mut cur) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Never try to raise the hard limit (that needs privilege).
+                let v = value.min(cur.rlim_max);
+                let new = libc::rlimit {
+                    rlim_cur: v,
+                    rlim_max: v,
+                };
+                if libc::setrlimit(resource, &new) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+/// `TOOLCLAD_KILL_GRACE_MS` as a non-negative integer, else the default.
+fn kill_grace() -> Duration {
+    let ms = std::env::var("TOOLCLAD_KILL_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_KILL_GRACE_MS);
+    Duration::from_millis(ms)
+}
+
+/// The outcome of one spawned run.
+#[derive(Debug)]
+struct RunOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    status: String,
+    timed_out: bool,
+}
+
+/// Read a pipe to EOF into a shared buffer, so partial output stays available
+/// even if the reader never finishes; signal `done` at EOF.
+fn spawn_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    done: mpsc::Sender<()>,
+) -> Arc<Mutex<Vec<u8>>> {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+    buf
+}
+
+fn take_text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let bytes = std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()));
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, sig: libc::c_int) {
+    // SAFETY: killpg only sends a signal; the child was started with
+    // `process_group(0)`, so its pid is its process-group id. An error (the
+    // group is already gone) is harmless.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, sig);
+    }
+}
+
+/// Spawn `cmd` with stdin on `/dev/null`, capture stdout/stderr, and enforce
+/// the deadline.
+///
+/// The child leads a new process group. On the deadline the group gets
+/// `SIGTERM`, then `SIGKILL` once the grace period (`TOOLCLAD_KILL_GRACE_MS`)
+/// passes, and the run is reported as `"timeout"` with exit code -1 and the
+/// output captured so far. The deadline also covers the pipes: a background
+/// process that keeps stdout open after the tool exits cannot hold the call.
 fn run_command_with_timeout(
     mut cmd: Command,
     timeout_seconds: u64,
-    cmd_display: &str,
-) -> Result<(String, String, String, i32, String), ToolCladError> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+) -> Result<RunOutput, ToolCladError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // SECURITY: Create a new process group so we can kill all children on timeout.
     #[cfg(unix)]
@@ -1106,89 +1526,100 @@ fn run_command_with_timeout(
     let mut child = cmd
         .spawn()
         .map_err(|e| ToolCladError::ExecutionError(format!("failed to spawn process: {e}")))?;
+    let pid = child.id();
+    let wait_err = |e: std::io::Error| ToolCladError::ExecutionError(format!("wait error: {e}"));
 
-    if timeout_seconds > 0 {
-        let pid = child.id();
+    // Read stdout/stderr in separate threads to avoid pipe buffer deadlock.
+    let (done_tx, done_rx) = mpsc::channel();
+    let stdout_buf = spawn_reader(child.stdout.take(), done_tx.clone());
+    let stderr_buf = spawn_reader(child.stderr.take(), done_tx);
 
-        // Take stdout/stderr handles before polling to avoid deadlock.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let poll = Duration::from_millis(20);
+    let mut status = None;
+    let mut readers_done = 0;
 
-        // Read stdout/stderr in separate threads to avoid pipe buffer deadlock.
-        let stdout_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(mut pipe) = stdout_pipe {
-                use std::io::Read;
-                let _ = pipe.read_to_string(&mut buf);
-            }
-            buf
-        });
-        let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(mut pipe) = stderr_pipe {
-                use std::io::Read;
-                let _ = pipe.read_to_string(&mut buf);
-            }
-            buf
-        });
-
-        // Poll child with timeout.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        // Timeout! Kill the entire process group.
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGKILL);
-                        }
-                        #[cfg(not(unix))]
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(ToolCladError::ExecutionError(format!(
-                            "process timed out after {timeout_seconds}s"
-                        )));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => return Err(ToolCladError::ExecutionError(format!("wait error: {e}"))),
-            }
-        };
-
-        let stdout = stdout_handle.join().unwrap_or_default();
-        let stderr = stderr_handle.join().unwrap_or_default();
-        let exit_code = status.code().unwrap_or(-1);
-        let status_str = if status.success() {
-            "success".to_string()
-        } else {
-            format!("error (exit code: {exit_code}): {stderr}")
-        };
-        Ok((
-            cmd_display.to_string(),
-            stdout,
-            stderr,
-            exit_code,
-            status_str,
-        ))
-    } else {
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ToolCladError::ExecutionError(format!("process error: {e}")))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        let status = if output.status.success() {
-            "success".to_string()
-        } else {
-            format!("error (exit code: {exit_code}): {stderr}")
-        };
-
-        Ok((cmd_display.to_string(), stdout, stderr, exit_code, status))
+    // Wait for the tool to exit and both pipes to close, up to the deadline.
+    while Instant::now() < deadline {
+        if status.is_none() {
+            status = child.try_wait().map_err(wait_err)?;
+        }
+        while done_rx.try_recv().is_ok() {
+            readers_done += 1;
+        }
+        if status.is_some() && readers_done == 2 {
+            break;
+        }
+        std::thread::sleep(poll);
     }
+    let timed_out = !(status.is_some() && readers_done == 2);
+
+    if timed_out {
+        // Kill sequence: SIGTERM to the group, a grace period, then SIGKILL.
+        // A child that calls setsid() leaves the group and escapes this in
+        // every language, so this is cleanup rather than containment;
+        // escape-proof cleanup needs a cgroup, which is out of scope.
+        #[cfg(unix)]
+        {
+            signal_group(pid, libc::SIGTERM);
+            let grace_end = Instant::now() + kill_grace();
+            while Instant::now() < grace_end {
+                if status.is_none() {
+                    status = child.try_wait().map_err(wait_err)?;
+                }
+                while done_rx.try_recv().is_ok() {
+                    readers_done += 1;
+                }
+                if status.is_some() && readers_done == 2 {
+                    break;
+                }
+                std::thread::sleep(poll);
+            }
+            // The rest of the group may outlive the leader; kill it either way.
+            signal_group(pid, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            let _ = child.kill();
+        }
+        if status.is_none() {
+            child.wait().map_err(wait_err)?;
+        }
+        // Give the readers a moment to drain what the pipes still hold; a
+        // process that escaped the group may keep them open, so do not wait
+        // for it.
+        let drain_end = Instant::now() + Duration::from_millis(500);
+        while readers_done < 2 && Instant::now() < drain_end {
+            if done_rx.recv_timeout(poll).is_ok() {
+                readers_done += 1;
+            }
+        }
+        return Ok(RunOutput {
+            stdout: take_text(&stdout_buf),
+            stderr: take_text(&stderr_buf),
+            exit_code: -1,
+            status: "timeout".to_string(),
+            timed_out: true,
+        });
+    }
+
+    let status = status.expect("exit status present when not timed out");
+    let stdout = take_text(&stdout_buf);
+    let stderr = take_text(&stderr_buf);
+    let exit_code = status.code().unwrap_or(-1);
+    let status = if status.success() {
+        "success".to_string()
+    } else {
+        format!("error (exit code: {exit_code}): {stderr}")
+    };
+    Ok(RunOutput {
+        stdout,
+        stderr,
+        exit_code,
+        status,
+        timed_out: false,
+    })
 }
 
 /// Dry-run: validate args and build command without executing.
@@ -1440,15 +1871,21 @@ mod tests {
         assert!(result.command.contains("10.0.1.1"));
     }
 
-    /// Serializes tests that touch `TOOLCLAD_SECRET_*` environment variables,
-    /// which are process-global and would otherwise race across threads.
-    static SECRET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that touch process-global environment variables
+    /// (`TOOLCLAD_SECRET_*`, `TOOLCLAD_SECRETS_FILE`, `TOOLCLAD_EVIDENCE_DIR`,
+    /// `TOOLCLAD_KILL_GRACE_MS`, the sentinels) or spawn a child.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_inject_template_vars_with_env() {
-        let _guard = SECRET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         std::env::set_var("TOOLCLAD_SECRET_API_KEY", "test-key-123");
-        let result = inject_template_vars("Bearer {_secret:api_key}").unwrap();
+        let result =
+            inject_template_vars("Bearer {_secret:api_key}", &mut SecretSource::default()).unwrap();
         std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
         assert_eq!(result, "Bearer test-key-123");
     }
@@ -1477,7 +1914,7 @@ mod tests {
 
     #[test]
     fn test_http_secrets_expand_on_template_before_args() {
-        let _guard = SECRET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         std::env::set_var("TOOLCLAD_SECRET_API_KEY", "s3cr3t-value");
         let m = http_manifest();
         // Validation is bypassed on purpose: the `url` validator rejects `{`,
@@ -1516,7 +1953,7 @@ mod tests {
 
     #[test]
     fn test_http_missing_template_secret_fails_before_args() {
-        let _guard = SECRET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
         let m = http_manifest();
         let validated = HashMap::from([("target".to_string(), "https://example.com/".to_string())]);
@@ -1541,8 +1978,9 @@ mod tests {
 
     #[test]
     fn test_inject_template_vars_missing_secret() {
+        let _guard = env_lock();
         std::env::remove_var("TOOLCLAD_SECRET_MISSING");
-        let result = inject_template_vars("token={_secret:missing}");
+        let result = inject_template_vars("token={_secret:missing}", &mut SecretSource::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("TOOLCLAD_SECRET_MISSING"));
@@ -1550,7 +1988,11 @@ mod tests {
 
     #[test]
     fn test_inject_template_vars_no_secrets() {
-        let result = inject_template_vars("plain text with {normal} placeholders").unwrap();
+        let result = inject_template_vars(
+            "plain text with {normal} placeholders",
+            &mut SecretSource::default(),
+        )
+        .unwrap();
         assert_eq!(result, "plain text with {normal} placeholders");
     }
 
@@ -1953,5 +2395,586 @@ mod tests {
         ]);
         let err = dry_run(&m, &args).unwrap_err().to_string();
         assert!(err.contains("whitespace"), "unexpected: {err}");
+    }
+
+    // ---- W6 / W8: spawn path and timeouts --------------------------------
+
+    /// A per-test evidence root under the temp dir, with the env lock held.
+    /// Sets `TOOLCLAD_EVIDENCE_DIR` and a short kill grace; undone on drop.
+    struct SpawnEnv {
+        root: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SpawnEnv {
+        fn new() -> Self {
+            let guard = env_lock();
+            let root = std::env::temp_dir().join(format!(
+                "toolclad-spawn-test-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            std::env::set_var("TOOLCLAD_EVIDENCE_DIR", root.join("evidence"));
+            std::env::set_var("TOOLCLAD_KILL_GRACE_MS", "200");
+            Self {
+                root,
+                _guard: guard,
+            }
+        }
+
+        fn evidence(&self) -> PathBuf {
+            self.root.join("evidence")
+        }
+    }
+
+    impl Drop for SpawnEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("TOOLCLAD_EVIDENCE_DIR");
+            std::env::remove_var("TOOLCLAD_KILL_GRACE_MS");
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn toml_str(s: &str) -> String {
+        toml::Value::String(s.to_string()).to_string()
+    }
+
+    /// Load a manifest whose command is `exec`, with optional extra TOML
+    /// appended to `[tool]` and to the document.
+    fn spawn_manifest(binary: &str, exec: &[&str], tool_extra: &str, extra: &str) -> Manifest {
+        let tool_extra = if tool_extra.contains("timeout_seconds") {
+            tool_extra.to_string()
+        } else {
+            format!("timeout_seconds = 10\n{tool_extra}")
+        };
+        let exec: Vec<String> = exec.iter().map(|e| toml_str(e)).collect();
+        crate::parse_manifest(&format!(
+            "[tool]\nname = \"spawn_test\"\nversion = \"1.0.0\"\nbinary = {}\n\
+             description = \"d\"\n{tool_extra}\n\n\
+             [command]\nexec = [{}]\n\n[output]\nformat = \"text\"\n\n{extra}",
+            toml_str(binary),
+            exec.join(", ")
+        ))
+        .unwrap_or_else(|e| panic!("manifest should load: {e}"))
+    }
+
+    fn raw(env: &EvidenceEnvelope) -> String {
+        env.results["raw_output"].as_str().unwrap().to_string()
+    }
+
+    fn env_names(output: &str) -> Vec<String> {
+        output
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn test_child_env_is_allowlisted() {
+        let _env = SpawnEnv::new();
+        std::env::set_var("TOOLCLAD_SECRET_LEAK", "sentinel");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "sentinel2");
+        std::env::set_var("LD_PRELOAD", "/tmp/x");
+        let m = spawn_manifest("printenv", &["printenv"], "", "");
+        let result = execute(&m, &HashMap::new());
+        std::env::remove_var("TOOLCLAD_SECRET_LEAK");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("LD_PRELOAD");
+        let out = raw(&result.unwrap());
+        assert!(!out.contains("sentinel"), "{out}");
+        assert!(!out.contains("/tmp/x"), "{out}");
+        assert!(
+            out.lines().any(|l| l == format!("PATH={CHILD_PATH}")),
+            "{out}"
+        );
+        for name in env_names(&out) {
+            assert!(
+                name == "PATH" || CHILD_ENV_PASSTHROUGH.contains(&name.as_str()),
+                "unexpected child variable {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_executor_hatch_env_is_allowlisted() {
+        let _env = SpawnEnv::new();
+        std::env::set_var("TOOLCLAD_SECRET_LEAK", "sentinel");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "sentinel2");
+        std::env::set_var("LD_PRELOAD", "/tmp/x");
+        let printenv = resolve_program("printenv").unwrap();
+        let m = crate::parse_manifest(&format!(
+            "[tool]\nname = \"hatch\"\nversion = \"1.0.0\"\nbinary = \"printenv\"\n\
+             description = \"d\"\n\n[args.target]\nposition = 1\nrequired = true\n\
+             type = \"string\"\ndescription = \"t\"\n\n\
+             [command]\nexecutor = {}\n\n[output]\nformat = \"text\"\n",
+            toml_str(&path_string(&printenv))
+        ))
+        .unwrap();
+        let args = HashMap::from([("target".to_string(), "abc".to_string())]);
+        let result = execute(&m, &args);
+        std::env::remove_var("TOOLCLAD_SECRET_LEAK");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("LD_PRELOAD");
+        let out = raw(&result.unwrap());
+        assert!(!out.contains("sentinel"), "{out}");
+        assert!(!out.contains("/tmp/x"), "{out}");
+        assert!(out.lines().any(|l| l == "TOOLCLAD_ARG_TARGET=abc"), "{out}");
+        assert!(
+            out.lines().any(|l| l == "TOOLCLAD_TOOL_NAME=hatch"),
+            "{out}"
+        );
+        assert!(
+            out.lines().any(|l| l == format!("PATH={CHILD_PATH}")),
+            "{out}"
+        );
+        let hatch = [
+            "TOOLCLAD_SCAN_ID",
+            "TOOLCLAD_TOOL_NAME",
+            "TOOLCLAD_EVIDENCE_DIR",
+            "TOOLCLAD_OUTPUT_DIR",
+        ];
+        let names = env_names(&out);
+        for h in hatch {
+            assert!(names.iter().any(|n| n == h), "missing {h}: {out}");
+        }
+        for name in names {
+            assert!(!name.starts_with("TOOLCLAD_SECRET_"), "{name}");
+            assert!(
+                name == "PATH"
+                    || CHILD_ENV_PASSTHROUGH.contains(&name.as_str())
+                    || hatch.contains(&name.as_str())
+                    || name.starts_with("TOOLCLAD_ARG_"),
+                "unexpected child variable {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secret_names_are_filtered_from_child_env() {
+        // The filter holds even if a future edit routes a secret into `extra`.
+        let env = child_env(&[
+            ("TOOLCLAD_SECRET_TOKEN".to_string(), "s".to_string()),
+            ("TOOLCLAD_ARG_SECRET_NAME".to_string(), "ok".to_string()),
+        ]);
+        assert!(env.iter().all(|(k, _)| !k.starts_with("TOOLCLAD_SECRET_")));
+        assert!(env.iter().any(|(k, _)| k == "TOOLCLAD_ARG_SECRET_NAME"));
+        assert_eq!(env[0], ("PATH".to_string(), CHILD_PATH.into()));
+    }
+
+    #[cfg(unix)]
+    fn write_secrets(dir: &Path, body: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(format!("secrets-{mode:o}.toml"));
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_secrets_file() {
+        let env = SpawnEnv::new();
+        let good = write_secrets(&env.root, "api_key = \"from-file\"\n", 0o600);
+        std::env::set_var("TOOLCLAD_SECRETS_FILE", &good);
+        std::env::set_var("TOOLCLAD_SECRET_API_KEY", "from-env");
+        std::env::set_var("TOOLCLAD_SECRET_OTHER", "env-only");
+
+        // The file wins over the environment variable for the same name, and
+        // the environment still serves names the file does not define.
+        let mut src = SecretSource::default();
+        assert_eq!(
+            inject_template_vars("{_secret:api_key}/{_secret:other}", &mut src).unwrap(),
+            "from-file/env-only"
+        );
+        // Read once per call: the cached file serves later placeholders.
+        std::fs::remove_file(&good).unwrap();
+        assert_eq!(src.lookup("api_key").unwrap(), "from-file");
+
+        // A missing secret is still an error.
+        let err = inject_template_vars("{_secret:absent}", &mut src)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TOOLCLAD_SECRET_ABSENT"), "{err}");
+
+        // A group/world-readable file is refused, naming the mode.
+        let loose = write_secrets(&env.root, "api_key = \"x\"\n", 0o644);
+        std::env::set_var("TOOLCLAD_SECRETS_FILE", &loose);
+        let err = inject_template_vars("{_secret:api_key}", &mut SecretSource::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mode 0644"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+
+        // No placeholder, no file read.
+        assert!(inject_template_vars("plain", &mut SecretSource::default()).is_ok());
+
+        std::env::remove_var("TOOLCLAD_SECRETS_FILE");
+        std::env::remove_var("TOOLCLAD_SECRET_API_KEY");
+        std::env::remove_var("TOOLCLAD_SECRET_OTHER");
+    }
+
+    #[test]
+    fn test_bare_argv0_resolves_against_fixed_path() {
+        let _env = SpawnEnv::new();
+        let echo = resolve_program("echo").unwrap();
+        assert!(echo.is_absolute());
+        assert!(CHILD_PATH
+            .split(':')
+            .any(|d| echo.parent() == Some(Path::new(d))));
+        let m = spawn_manifest("echo", &["echo", "hi"], "", "");
+        let env = execute(&m, &HashMap::new()).unwrap();
+        assert_eq!(env.status, "success");
+        assert_eq!(raw(&env), "hi\n");
+
+        let err = resolve_program("toolclad-no-such-binary")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'toolclad-no-such-binary'"), "{err}");
+        assert!(err.contains(CHILD_PATH), "{err}");
+    }
+
+    #[test]
+    fn test_stdin_is_dev_null() {
+        let _env = SpawnEnv::new();
+        let m = spawn_manifest("cat", &["cat"], "", "");
+        let start = Instant::now();
+        let env = execute(&m, &HashMap::new()).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(env.status, "success");
+        assert_eq!(raw(&env), "");
+    }
+
+    #[test]
+    fn test_cwd_is_scratch_dir_removed_when_empty() {
+        let env = SpawnEnv::new();
+        let m = spawn_manifest("pwd", &["pwd"], "", "");
+        let out = execute(&m, &HashMap::new()).unwrap();
+        let work = env.evidence().join(format!("{}-work", out.scan_id));
+        assert_eq!(raw(&out).trim_end(), path_string(&work));
+        assert!(!work.exists(), "an empty scratch dir is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scratch_dir_kept_when_written_with_private_modes() {
+        let env = SpawnEnv::new();
+        // `touch` writes a relative path: it lands in the scratch dir, which
+        // is then evidence and kept. umask 0077 makes the file 0600.
+        let m = spawn_manifest("touch", &["touch", "marker"], "", "");
+        let out = execute(&m, &HashMap::new()).unwrap();
+        assert_eq!(out.status, "success");
+        let work = env.evidence().join(format!("{}-work", out.scan_id));
+        assert_eq!(mode_of(&work), 0o700);
+        assert_eq!(mode_of(&work.join("marker")), 0o600);
+        assert_eq!(mode_of(&env.evidence()), 0o700);
+    }
+
+    #[test]
+    fn test_evidence_paths_table() {
+        let env = SpawnEnv::new();
+        let mut m = minimal_manifest();
+        let p = EvidencePaths::new(&m, "1-abc".to_string());
+        assert_eq!(p.evidence_dir, env.evidence());
+        assert_eq!(p.output_dir, env.evidence().join("1-abc-test_tool"));
+        assert_eq!(p.output_file, p.output_dir.join("scan.txt"));
+        for (format, ext) in [
+            ("xml", "xml"),
+            ("json", "json"),
+            ("csv", "csv"),
+            ("jsonl", "jsonl"),
+            ("text", "txt"),
+            ("other", "txt"),
+        ] {
+            m.output.as_mut().unwrap().format = format.to_string();
+            let p = EvidencePaths::new(&m, "1-abc".to_string());
+            assert_eq!(p.output_file, p.output_dir.join(format!("scan.{ext}")));
+        }
+        m.tool.evidence = Some(EvidenceMeta {
+            output_dir: "{evidence_dir}/runs/{scan_id}".to_string(),
+            capture: false,
+            hash: "sha256".to_string(),
+            screenshots: false,
+        });
+        let p = EvidencePaths::new(&m, "1-abc".to_string());
+        assert_eq!(p.output_dir, env.evidence().join("runs").join("1-abc"));
+
+        std::env::remove_var("TOOLCLAD_EVIDENCE_DIR");
+        let p = EvidencePaths::new(&minimal_manifest(), "1-abc".to_string());
+        assert_eq!(
+            p.evidence_dir,
+            std::env::temp_dir().join("toolclad-evidence")
+        );
+    }
+
+    #[test]
+    fn test_scan_id_shape_and_uniqueness() {
+        let a = new_scan_id();
+        let b = new_scan_id();
+        assert_ne!(a, b);
+        for id in [&a, &b] {
+            let (secs, rand) = id.split_once('-').unwrap();
+            assert!(secs.parse::<i64>().is_ok(), "{id}");
+            assert_eq!(rand.len(), 32, "{id}");
+            assert!(rand.bytes().all(|c| c.is_ascii_hexdigit()), "{id}");
+        }
+    }
+
+    /// `RLIMIT_NPROC` counts every task of the user, not just the tool's, so
+    /// the 512 default can stop a threaded `dd` (uutils) on a busy host. Lift
+    /// it (capped at the hard limit) where the test is not about NPROC.
+    const DD_LIMITS: &str = "[tool.limits]\nnproc = 4194304\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn test_output_dir_created_private_before_spawn() {
+        let env = SpawnEnv::new();
+        // The tool writes `{_output_file}` itself; that only works if the
+        // directory exists before the spawn.
+        let m = spawn_manifest(
+            "dd",
+            &[
+                "dd",
+                "if=/dev/zero",
+                "of={_output_file}",
+                "bs=16",
+                "count=1",
+            ],
+            "",
+            DD_LIMITS,
+        );
+        let first = execute(&m, &HashMap::new()).unwrap();
+        assert_eq!(first.status, "success", "{}", first.stderr);
+        let out_dir = env.evidence().join(format!("{}-spawn_test", first.scan_id));
+        assert_eq!(mode_of(&out_dir), 0o700);
+        assert_eq!(
+            std::fs::metadata(out_dir.join("scan.txt")).unwrap().len(),
+            16
+        );
+
+        let second = execute(&m, &HashMap::new()).unwrap();
+        assert_ne!(first.scan_id, second.scan_id);
+
+        // A declared [tool.evidence] output_dir is honored.
+        let m = spawn_manifest(
+            "dd",
+            &[
+                "dd",
+                "if=/dev/zero",
+                "of={_output_file}",
+                "bs=16",
+                "count=1",
+            ],
+            "",
+            "[tool.limits]\nnproc = 4194304\n\n[tool.evidence]\noutput_dir = \"{evidence_dir}/custom/{scan_id}\"\n",
+        );
+        let env3 = execute(&m, &HashMap::new()).unwrap();
+        let custom = env.evidence().join("custom").join(&env3.scan_id);
+        assert_eq!(mode_of(&custom), 0o700);
+        assert!(custom.join("scan.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_output_dir_is_refused() {
+        let env = SpawnEnv::new();
+        std::fs::create_dir_all(env.evidence()).unwrap();
+        let elsewhere = env.root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, env.evidence().join("fixed")).unwrap();
+        let m = spawn_manifest(
+            "dd",
+            &[
+                "dd",
+                "if=/dev/zero",
+                "of={_output_file}",
+                "bs=16",
+                "count=1",
+            ],
+            "",
+            "[tool.limits]\nnproc = 4194304\n\n[tool.evidence]\noutput_dir = \"{evidence_dir}/fixed\"\n",
+        );
+        let err = execute(&m, &HashMap::new()).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+    }
+
+    /// `/proc/self/limits` row for `name`: (soft, hard).
+    #[cfg(target_os = "linux")]
+    fn limit_row(limits: &str, name: &str) -> (String, String) {
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} row in {limits}"));
+        let mut cols = line[name.len()..].split_whitespace();
+        (
+            cols.next().unwrap().to_string(),
+            cols.next().unwrap().to_string(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_rlimits_and_umask_applied_in_child() {
+        let _env = SpawnEnv::new();
+        let m = spawn_manifest(
+            "cat",
+            &["cat", "/proc/self/limits", "/proc/self/status"],
+            "",
+            "[tool.limits]\nfsize_bytes = 4096\ncpu_seconds = 7\n",
+        );
+        let out = raw(&execute(&m, &HashMap::new()).unwrap());
+        assert_eq!(limit_row(&out, "Max core file size").0, "0");
+        assert_eq!(limit_row(&out, "Max file size").0, "4096");
+        assert_eq!(limit_row(&out, "Max cpu time").0, "7");
+        // Defaults, each capped at the inherited hard limit.
+        let nofile: u64 = limit_row(&out, "Max open files").0.parse().unwrap();
+        assert!(nofile <= 1024, "{nofile}");
+        assert!(out.lines().any(|l| l == "Umask:\t0077"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fsize_limit_stops_oversized_write() {
+        let env = SpawnEnv::new();
+        let m = spawn_manifest(
+            "dd",
+            &[
+                "dd",
+                "if=/dev/zero",
+                "of={_output_file}",
+                "bs=1024",
+                "count=8",
+            ],
+            "",
+            "[tool.limits]\nfsize_bytes = 4096\nnproc = 4194304\n",
+        );
+        let out = execute(&m, &HashMap::new()).unwrap();
+        assert_ne!(out.status, "success");
+        let file = env
+            .evidence()
+            .join(format!("{}-spawn_test", out.scan_id))
+            .join("scan.txt");
+        assert!(std::fs::metadata(&file).unwrap().len() <= 4096);
+    }
+
+    #[test]
+    fn test_kill_grace_parsing() {
+        let _guard = env_lock();
+        for (v, ms) in [
+            ("150", 150),
+            ("0", 0),
+            ("-5", DEFAULT_KILL_GRACE_MS),
+            ("abc", DEFAULT_KILL_GRACE_MS),
+            ("", DEFAULT_KILL_GRACE_MS),
+        ] {
+            std::env::set_var("TOOLCLAD_KILL_GRACE_MS", v);
+            assert_eq!(kill_grace(), Duration::from_millis(ms), "{v}");
+        }
+        std::env::remove_var("TOOLCLAD_KILL_GRACE_MS");
+        assert_eq!(kill_grace(), Duration::from_millis(DEFAULT_KILL_GRACE_MS));
+    }
+
+    #[test]
+    fn test_timeout_fires_with_timeout_envelope() {
+        let _env = SpawnEnv::new();
+        let m = spawn_manifest("sleep", &["sleep", "10"], "timeout_seconds = 1", "");
+        let start = Instant::now();
+        let out = execute(&m, &HashMap::new()).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(out.status, "timeout");
+        assert_eq!(out.exit_code, -1);
+    }
+
+    /// Re-executed by `test_timeout_keeps_partial_output_and_kills_group` as
+    /// the tool: prints its pid and a grandchild's pid, then sleeps past the
+    /// deadline. Does nothing unless it runs in a ToolClad scratch directory,
+    /// so `cargo test -- --ignored` stays fast.
+    #[test]
+    #[ignore]
+    fn timeout_helper_print_then_sleep() {
+        use std::io::Write;
+        let in_scratch = std::env::current_dir()
+            .ok()
+            .and_then(|d| {
+                d.file_name()
+                    .map(|n| n.to_string_lossy().ends_with("-work"))
+            })
+            .unwrap_or(false);
+        if !in_scratch {
+            return;
+        }
+        let mut grandchild = Command::new("sleep").arg("30").spawn().unwrap();
+        println!("partial-marker {} {}", std::process::id(), grandchild.id());
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        let _ = grandchild.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_timeout_keeps_partial_output_and_kills_group() {
+        let _env = SpawnEnv::new();
+        let exe = std::env::current_exe().unwrap();
+        let exe = path_string(&exe);
+        // The helper's test harness spawns threads; lift NPROC (capped at
+        // the hard limit) so a busy host cannot make it fail to start.
+        let m = spawn_manifest(
+            &exe,
+            &[
+                &exe,
+                "--exact",
+                "executor::tests::timeout_helper_print_then_sleep",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            "timeout_seconds = 1",
+            "[tool.limits]\nnproc = 4194304\n",
+        );
+        let start = Instant::now();
+        let out = execute(&m, &HashMap::new()).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(out.status, "timeout");
+        assert_eq!(out.exit_code, -1);
+        let text = raw(&out);
+        // The helper's harness prints its own text on the same line first.
+        let line = text
+            .lines()
+            .find_map(|l| l.split_once("partial-marker ").map(|(_, rest)| rest))
+            .unwrap_or_else(|| panic!("partial output lost: {text:?} / {}", out.stderr));
+        let pids: Vec<i32> = line
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        // Both the tool and its grandchild are gone (the grandchild, now
+        // orphaned, may linger as a zombie for a moment until init reaps it).
+        for pid in pids {
+            let gone = (0..50).any(|_| {
+                // SAFETY: signal 0 only probes for existence.
+                let alive = unsafe { libc::kill(pid, 0) } == 0
+                    && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .map(|s| s.contains(") Z "))
+                        .unwrap_or(true);
+                if alive {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                !alive
+            });
+            assert!(gone, "pid {pid} survived the timeout");
+        }
     }
 }

@@ -12,49 +12,49 @@ import { execute } from "../src/executor.js";
 // --- msf_options ---
 
 describe("validateArg - msf_options", () => {
-  it("accepts valid key-value pairs", () => {
+  it("accepts valid key-value pairs", async () => {
     assert.equal(
       validateArg({ type: "msf_options" }, "RHOSTS 10.0.0.1"),
       "RHOSTS 10.0.0.1"
     );
   });
 
-  it("accepts semicolon-separated pairs", () => {
+  it("accepts semicolon-separated pairs", async () => {
     assert.equal(
       validateArg({ type: "msf_options" }, "RHOSTS 10.0.0.1; RPORT 445"),
       "RHOSTS 10.0.0.1; RPORT 445"
     );
   });
 
-  it("rejects missing value (no space)", () => {
+  it("rejects missing value (no space)", async () => {
     assert.throws(
       () => validateArg({ type: "msf_options" }, "RHOSTS"),
       /invalid pair/
     );
   });
 
-  it("rejects lowercase keys", () => {
+  it("rejects lowercase keys", async () => {
     assert.throws(
       () => validateArg({ type: "msf_options" }, "rhosts 10.0.0.1"),
       /invalid key/
     );
   });
 
-  it("rejects pipe in value", () => {
+  it("rejects pipe in value", async () => {
     assert.throws(
       () => validateArg({ type: "msf_options" }, "RHOSTS 10.0.0.1|whoami"),
       /disallowed characters/
     );
   });
 
-  it("rejects backtick in value", () => {
+  it("rejects backtick in value", async () => {
     assert.throws(
       () => validateArg({ type: "msf_options" }, "RHOSTS `id`"),
       /disallowed characters/
     );
   });
 
-  it("allows empty string between semicolons", () => {
+  it("allows empty string between semicolons", async () => {
     assert.equal(
       validateArg({ type: "msf_options" }, "RHOSTS 10.0.0.1;;"),
       "RHOSTS 10.0.0.1;;"
@@ -65,7 +65,7 @@ describe("validateArg - msf_options", () => {
 // --- credential_file ---
 
 describe("validateArg - credential_file", () => {
-  it("accepts a valid relative file path", () => {
+  it("accepts a valid relative file path", async () => {
     const dir = mkdtempSync(join(tmpdir(), "toolclad-cred-"));
     const file = join(dir, "creds.json");
     writeFileSync(file, "{}");
@@ -82,28 +82,28 @@ describe("validateArg - credential_file", () => {
     }
   });
 
-  it("rejects absolute paths", () => {
+  it("rejects absolute paths", async () => {
     assert.throws(
       () => validateArg({ type: "credential_file" }, "/etc/passwd"),
       /relative path|Injection/
     );
   });
 
-  it("rejects path traversal", () => {
+  it("rejects path traversal", async () => {
     assert.throws(
       () => validateArg({ type: "credential_file" }, "foo/../../../etc/passwd"),
       /traversal|Injection/
     );
   });
 
-  it("rejects nonexistent file", () => {
+  it("rejects nonexistent file", async () => {
     assert.throws(
       () => validateArg({ type: "credential_file" }, "no-such-file.json"),
       /not found/
     );
   });
 
-  it("rejects a directory", () => {
+  it("rejects a directory", async () => {
     const testDir = "test-cred-dir-tmp";
     mkdirSync(testDir, { recursive: true });
     try {
@@ -124,12 +124,12 @@ describe("validateArg - credential_file", () => {
 // --- duration ---
 
 describe("validateArg - duration", () => {
-  it("accepts plain integer seconds", () => {
+  it("accepts plain integer seconds", async () => {
     assert.equal(validateArg({ type: "duration" }, "30"), "30");
     assert.equal(validateArg({ type: "duration" }, "0"), "0");
   });
 
-  it("accepts duration with suffixes", () => {
+  it("accepts duration with suffixes", async () => {
     assert.equal(validateArg({ type: "duration" }, "5m"), "5m");
     assert.equal(validateArg({ type: "duration" }, "2h"), "2h");
     assert.equal(validateArg({ type: "duration" }, "1h30m"), "1h30m");
@@ -137,7 +137,7 @@ describe("validateArg - duration", () => {
     assert.equal(validateArg({ type: "duration" }, "1h30m15s"), "1h30m15s");
   });
 
-  it("rejects invalid durations", () => {
+  it("rejects invalid durations", async () => {
     assert.throws(
       () => validateArg({ type: "duration" }, "abc"),
       /Invalid duration/
@@ -156,12 +156,12 @@ describe("validateArg - duration", () => {
 // --- regex_match ---
 
 describe("validateArg - regex_match", () => {
-  it("accepts values matching pattern", () => {
+  it("accepts values matching pattern", async () => {
     const def = { type: "regex_match", pattern: "^[a-z0-9-]+$" };
     assert.equal(validateArg(def, "my-scan-123"), "my-scan-123");
   });
 
-  it("rejects values not matching pattern", () => {
+  it("rejects values not matching pattern", async () => {
     const def = { type: "regex_match", pattern: "^[a-z]+$" };
     assert.throws(
       () => validateArg(def, "HAS-UPPER"),
@@ -169,14 +169,14 @@ describe("validateArg - regex_match", () => {
     );
   });
 
-  it("throws when pattern field is missing", () => {
+  it("throws when pattern field is missing", async () => {
     assert.throws(
       () => validateArg({ type: "regex_match" }, "anything"),
       /requires a 'pattern' field/
     );
   });
 
-  it("rejects injection even when pattern matches", () => {
+  it("rejects injection even when pattern matches", async () => {
     const def = { type: "regex_match", pattern: ".*" };
     assert.throws(
       () => validateArg(def, "foo;bar"),
@@ -188,7 +188,7 @@ describe("validateArg - regex_match", () => {
 // --- validateArgWithCustomTypes ---
 
 describe("validateArgWithCustomTypes", () => {
-  it("falls through to validateArg when no custom type matches", () => {
+  it("falls through to validateArg when no custom type matches", async () => {
     const result = validateArgWithCustomTypes(
       { type: "integer" },
       42,
@@ -197,7 +197,7 @@ describe("validateArgWithCustomTypes", () => {
     assert.equal(result, 42);
   });
 
-  it("applies custom type with base=enum", () => {
+  it("applies custom type with base=enum", async () => {
     const customTypes = {
       severity: {
         base: "enum",
@@ -212,7 +212,7 @@ describe("validateArgWithCustomTypes", () => {
     assert.equal(result, "high");
   });
 
-  it("rejects disallowed value in custom enum type", () => {
+  it("rejects disallowed value in custom enum type", async () => {
     const customTypes = {
       severity: {
         base: "enum",
@@ -230,7 +230,7 @@ describe("validateArgWithCustomTypes", () => {
     );
   });
 
-  it("applies custom type with base=integer and min/max", () => {
+  it("applies custom type with base=integer and min/max", async () => {
     const customTypes = {
       thread_count: {
         base: "integer",
@@ -257,7 +257,7 @@ describe("validateArgWithCustomTypes", () => {
     );
   });
 
-  it("throws on invalid base type", () => {
+  it("throws on invalid base type", async () => {
     const customTypes = {
       bad_type: { base: "nonexistent" },
     };
@@ -276,25 +276,25 @@ describe("validateArgWithCustomTypes", () => {
 // --- executor session/browser gates ---
 
 describe("execute - session/browser gates", () => {
-  it("throws on session manifest", () => {
+  it("throws on session manifest", async () => {
     const manifest = {
       tool: { name: "psql", description: "test" },
       session: { startup_command: "psql" },
       args: {},
     };
-    assert.throws(
+    await assert.rejects(
       () => execute(manifest, {}),
       /session mode is parsed but not yet executable/
     );
   });
 
-  it("throws on browser manifest", () => {
+  it("throws on browser manifest", async () => {
     const manifest = {
       tool: { name: "browser", description: "test" },
       browser: { engine: "cdp" },
       args: {},
     };
-    assert.throws(
+    await assert.rejects(
       () => execute(manifest, {}),
       /browser mode is parsed but not yet executable/
     );

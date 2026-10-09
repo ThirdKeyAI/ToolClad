@@ -34,11 +34,11 @@ program
   .command("run <manifest>")
   .description("Execute a tool using its manifest")
   .option("--arg <args...>", "Arguments as key=value pairs")
-  .action((manifestPath, opts) => {
+  .action(async (manifestPath, opts) => {
     try {
       const manifest = loadManifest(manifestPath);
       const args = parseArgs(opts.arg);
-      const result = execute(manifest, args);
+      const result = await execute(manifest, args);
       console.log(JSON.stringify(result, null, 2));
     } catch (err) {
       console.error(`Error: ${err.message}`);
@@ -64,11 +64,11 @@ program
   .command("test <manifest>")
   .description("Dry run: validate args and show constructed command")
   .option("--arg <args...>", "Arguments as key=value pairs")
-  .action((manifestPath, opts) => {
+  .action(async (manifestPath, opts) => {
     try {
       const manifest = loadManifest(manifestPath);
       const args = parseArgs(opts.arg);
-      const result = execute(manifest, args, { dryRun: true });
+      const result = await execute(manifest, args, { dryRun: true });
       console.log();
       console.log(`  Manifest:  ${manifestPath}`);
       console.log(`  Tool:      ${manifest.tool.name}`);
@@ -82,7 +82,7 @@ program
           `  Cedar:     ${manifest.tool.cedar.resource} / ${manifest.tool.cedar.action}`
         );
       }
-      console.log(`  Timeout:   ${manifest.tool.timeout_seconds || 30}s`);
+      console.log(`  Timeout:   ${manifest.tool.timeout_seconds || 60}s`);
       console.log();
       console.log("  [dry run -- command not executed]");
       console.log();
@@ -111,4 +111,4 @@ function formatArgs(args) {
     .join(", ");
 }
 
-program.parse();
+await program.parseAsync();

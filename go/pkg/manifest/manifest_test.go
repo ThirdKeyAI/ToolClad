@@ -1364,3 +1364,71 @@ format = "json"
 		t.Fatalf("flagged nested arg should load: %v", err)
 	}
 }
+
+// W6/W8 load-time spawn checks: interpreter denylist, argv[0] vs
+// tool.binary, and a positive timeout.
+func TestSpawnPolicyAtLoad(t *testing.T) {
+	const out = "\n[output]\nformat = \"text\"\n"
+	cases := []struct {
+		name string
+		body string
+		want string // empty: must load
+	}{
+		{"bash without opt-in",
+			"[tool]\nname = \"t\"\nbinary = \"bash\"\n\n[command]\nexec = [\"bash\", \"-c\", \"true\"]\n" + out,
+			"command argv[0] 'bash' is an interpreter; set allow_interpreter = true to permit it"},
+		{"bash with opt-in",
+			"[tool]\nname = \"t\"\nbinary = \"bash\"\nallow_interpreter = true\n\n[command]\nexec = [\"bash\", \"-c\", \"true\"]\n" + out,
+			""},
+		{"interpreter by path in template",
+			"[tool]\nname = \"t\"\n\n[command]\ntemplate = \"/usr/bin/python3 -V\"\n" + out,
+			"command argv[0] '/usr/bin/python3' is an interpreter; set allow_interpreter = true to permit it"},
+		{"interpreter as executor",
+			"[tool]\nname = \"t\"\n\n[command]\nexecutor = \"/usr/bin/env\"\n" + out,
+			"command argv[0] '/usr/bin/env' is an interpreter; set allow_interpreter = true to permit it"},
+		{"basename mismatch",
+			"[tool]\nname = \"t\"\nbinary = \"echo\"\n\n[command]\nexec = [\"cat\", \"/etc/passwd\"]\n" + out,
+			"command argv[0] 'cat' does not match tool.binary 'echo'"},
+		{"basename match by path",
+			"[tool]\nname = \"t\"\nbinary = \"/usr/bin/echo\"\n\n[command]\nexec = [\"echo\", \"hi\"]\n" + out,
+			""},
+		{"empty binary skips match",
+			"[tool]\nname = \"t\"\n\n[command]\nexec = [\"cat\"]\n" + out,
+			""},
+		{"executor skips match",
+			"[tool]\nname = \"t\"\nbinary = \"msfconsole\"\n\n[command]\nexecutor = \"scripts/wrapper.sh\"\n" + out,
+			""},
+		{"callback skips checks",
+			"[tool]\nname = \"t\"\nbinary = \"echo\"\ndispatch = \"callback\"\n\n[command]\nexec = [\"bash\"]\n",
+			""},
+		{"mcp-only skips match",
+			"[tool]\nname = \"t\"\nbinary = \"echo\"\n\n[mcp]\nserver = \"s\"\ntool = \"x\"\n" + out,
+			""},
+		{"zero timeout",
+			"[tool]\nname = \"t\"\nbinary = \"echo\"\ntimeout_seconds = 0\n\n[command]\nexec = [\"echo\", \"hi\"]\n" + out,
+			"timeout_seconds must be greater than zero"},
+		{"negative timeout",
+			"[tool]\nname = \"t\"\nbinary = \"echo\"\ntimeout_seconds = -1\n\n[command]\nexec = [\"echo\", \"hi\"]\n" + out,
+			"timeout_seconds must be greater than zero"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m, err := LoadManifest(writeTmp(t, c.body))
+			if c.want == "" {
+				if err != nil {
+					t.Fatalf("must load: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want %q, got %v (%+v)", c.want, err, m)
+			}
+		})
+	}
+
+	// An absent timeout still defaults to 60.
+	m, err := LoadManifest(writeTmp(t, "[tool]\nname = \"t\"\n\n[command]\nexec = [\"echo\"]\n"+out))
+	if err != nil || m.Tool.TimeoutSeconds != 60 {
+		t.Fatalf("default timeout: %v, %v", m, err)
+	}
+}

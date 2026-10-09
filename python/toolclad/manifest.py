@@ -965,6 +965,10 @@ def _validate_manifest(manifest: Manifest) -> None:
             f"{', '.join(_MODES)}"
         )
 
+    timeout = manifest.tool.timeout_seconds
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError("timeout_seconds must be greater than zero")
+
     is_callback = manifest.tool.dispatch == "callback"
     if not is_callback:
         cmd = manifest.command

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import TOML from "@iarna/toml";
-import { compileCommand, lintNetworkEgress } from "./executor.js";
+import { compileCommand, lintNetworkEgress, timeoutSeconds } from "./executor.js";
 import { validateDefaultValue } from "./validator.js";
 import { MANIFEST_DIR, SCOPE_CHECK_TYPES } from "./scope.js";
 
@@ -218,6 +218,9 @@ export function loadManifestWithOptions(path, options = {}) {
       `Invalid manifest: invalid tool.mode '${tool.mode}', must be one of ${TOOL_MODES.join(", ")}`
     );
   }
+
+  // timeout_seconds defaults to 60; zero or negative is a load error.
+  timeoutSeconds(manifest);
 
   // Keys registered ahead of the waves that enforce them: accept them, check
   // their shape, and give them inert defaults.

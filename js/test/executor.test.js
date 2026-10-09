@@ -50,6 +50,7 @@ describe("buildCommand - basic interpolation", () => {
         target: { position: 1, required: true, type: "scope_target", description: "t" },
         rate: { position: 2, required: false, type: "integer", default: 100, description: "r" },
       },
+      tool: { binary: "scan" },
       command: { template: "scan --rate {rate} {target}" },
     });
     const result = buildCommand(manifest, { target: "10.0.1.1" });
@@ -63,6 +64,7 @@ describe("buildCommand - command.defaults", () => {
       args: {
         target: { position: 1, required: true, type: "scope_target", description: "t", block_internal: true },
       },
+      tool: { binary: "nmap" },
       command: {
         template: "nmap --max-rate {max_rate} {target}",
         defaults: { max_rate: 1000 },
@@ -86,6 +88,7 @@ describe("buildCommand - mappings", () => {
           description: "s",
         },
       },
+      tool: { binary: "nmap" },
       command: {
         template: "nmap {_scan_type_flags} {target}",
         mappings: {
@@ -137,6 +140,7 @@ describe("buildCommand - validation rejects bad args", () => {
           description: "m",
         },
       },
+      tool: { binary: "tool" },
       command: { template: "tool --mode {mode}" },
     });
     assert.throws(

@@ -49,7 +49,8 @@ def _simple_manifest(
         for k, v in conditionals.items():
             cmd_conditionals[k] = ConditionalDef(name=k, when=v["when"], template=v["template"])
     return Manifest(
-        tool=ToolMeta(name="test_tool", version="1.0.0", binary="echo"),
+        # tool.binary must match argv[0] (W6), so derive it from the template.
+        tool=ToolMeta(name="test_tool", version="1.0.0", binary=template.split()[0]),
         args=args,
         command=CommandDef(
             template=template,

@@ -555,6 +555,53 @@ fn command_basename(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Basenames refused as `argv[0]` unless `[tool] allow_interpreter = true`:
+/// an interpreter turns an argument into code.
+const INTERPRETERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "ash", "busybox", "env", "eval",
+    "xargs", "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "lua", "php",
+    "awk",
+];
+
+/// Load-time checks on the command's `argv[0]` (the compiled `exec` form, so
+/// a `template` is covered too): it may not be an interpreter without
+/// `allow_interpreter`, and when `tool.binary` is declared their basenames
+/// must agree, so the binary a reviewer reads is the binary that runs.
+/// Manifests without a command (`[http]`, `[mcp]`, `[session]`,
+/// `[browser]`-only) have nothing to check.
+fn check_argv0(manifest: &Manifest) -> Result<(), ToolCladError> {
+    // The executor escape hatch is exempt from the basename rule (it is a
+    // wrapper by definition) but not from the interpreter denylist:
+    // `executor = "/bin/sh"` turns argument values into shell input.
+    if let Some(ref exe) = manifest.command.executor {
+        if !manifest.tool.allow_interpreter
+            && INTERPRETERS.contains(&command_basename(exe).as_str())
+        {
+            return Err(ToolCladError::ManifestError(format!(
+                "command argv[0] '{exe}' is an interpreter; set allow_interpreter = true to permit it"
+            )));
+        }
+        return Ok(());
+    }
+    let Some(argv0) = manifest.command.exec.as_ref().and_then(|e| e.first()) else {
+        return Ok(());
+    };
+    let base = argv0.rsplit('/').next().unwrap_or(argv0);
+    if !manifest.tool.allow_interpreter && INTERPRETERS.contains(&command_basename(argv0).as_str())
+    {
+        return Err(ToolCladError::ManifestError(format!(
+            "command argv[0] '{argv0}' is an interpreter; set allow_interpreter = true to permit it"
+        )));
+    }
+    let binary = &manifest.tool.binary;
+    if !binary.is_empty() && base != binary.rsplit('/').next().unwrap_or(binary) {
+        return Err(ToolCladError::ManifestError(format!(
+            "command argv[0] '{argv0}' does not match tool.binary '{binary}'"
+        )));
+    }
+    Ok(())
+}
+
 /// True if the manifest's command dispatches one of the known egress binaries
 /// (checked across `tool.binary`, `command.exec[0]`, and `command.template`).
 ///
@@ -688,7 +735,19 @@ pub fn validate_manifest_with_custom_types(
         }
     }
 
+    // A zero timeout used to mean "no deadline"; it is refused so every
+    // spawned tool has one.
+    if manifest.tool.timeout_seconds == 0 {
+        return Err(ToolCladError::ManifestError(
+            "timeout_seconds must be greater than zero".to_string(),
+        ));
+    }
+
     let is_callback = manifest.tool.dispatch == "callback";
+
+    if !is_callback {
+        check_argv0(manifest)?;
+    }
 
     // exec dispatch requires a backend and an [output] block.
     if !is_callback {
@@ -2954,5 +3013,136 @@ format = "text"
         ] {
             parse_manifest(&default_manifest(arg)).unwrap_or_else(|e| panic!("{arg}: {e}"));
         }
+    }
+
+    // ---- W6 / W8: argv[0] checks and timeout at load ---------------------
+
+    fn argv0_manifest(binary: &str, exec: &str, tool_extra: &str) -> String {
+        format!(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"{binary}\"\ndescription = \"x\"\n{tool_extra}\n\n\
+             [command]\nexec = {exec}\n\n[output]\nformat = \"text\"\n"
+        )
+    }
+
+    #[test]
+    fn interpreter_argv0_needs_allow_interpreter() {
+        for interp in ["bash", "/bin/sh", "python3", "env", "awk", "/usr/bin/perl"] {
+            let exec = format!("[\"{interp}\", \"-c\", \"true\"]");
+            let err = parse_manifest(&argv0_manifest(interp, &exec, ""))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "command argv[0] '{interp}' is an interpreter; set allow_interpreter = true to permit it"
+                )),
+                "{interp}: {err}"
+            );
+            parse_manifest(&argv0_manifest(interp, &exec, "allow_interpreter = true"))
+                .unwrap_or_else(|e| panic!("{interp}: {e}"));
+        }
+        // A template is compiled to exec first, so it is covered too.
+        let err = parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"sh\"\ndescription = \"x\"\n\n\
+             [command]\ntemplate = \"sh -c true\"\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is an interpreter"), "{err}");
+
+        // The executor hatch gets the denylist too, but not the basename rule.
+        let hatch = "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"wrapper\"\ndescription = \"x\"\n\n[command]\nexecutor = \"/bin/sh\"\n\n[output]\nformat = \"text\"\n";
+        let err = parse_manifest(hatch).unwrap_err().to_string();
+        assert!(err.contains("'/bin/sh' is an interpreter"), "{err}");
+        let ok = hatch.replace("/bin/sh", "scripts/wrapper.sh");
+        assert!(parse_manifest(&ok).is_ok());
+    }
+
+    #[test]
+    fn argv0_basename_must_match_binary() {
+        let err = parse_manifest(&argv0_manifest("echo", "[\"cat\", \"/etc/passwd\"]", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("command argv[0] 'cat' does not match tool.binary 'echo'"),
+            "{err}"
+        );
+        // Basenames are compared, so a path on either side is fine.
+        parse_manifest(&argv0_manifest("/usr/bin/echo", "[\"echo\", \"hi\"]", "")).unwrap();
+        parse_manifest(&argv0_manifest("echo", "[\"/bin/echo\", \"hi\"]", "")).unwrap();
+        // An empty binary skips the check.
+        parse_manifest(&argv0_manifest("", "[\"cat\", \"x\"]", "")).unwrap();
+        // A placeholder as argv[0] never matches a declared binary.
+        let err = parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\n\
+             [args.b]\nposition = 1\ntype = \"string\"\ndescription = \"b\"\n\n\
+             [command]\nexec = [\"{b}\"]\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match tool.binary"), "{err}");
+    }
+
+    #[test]
+    fn argv0_checks_skip_callback_and_commandless_manifests() {
+        parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\
+             dispatch = \"callback\"\n\n[command]\nexec = [\"bash\", \"-c\", \"x\"]\n",
+        )
+        .unwrap();
+        parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"curl\"\ndescription = \"x\"\n\n\
+             [http]\nmethod = \"GET\"\nurl = \"https://api.example.com/x\"\n\n[output]\nformat = \"json\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn zero_timeout_is_refused_at_load() {
+        let err = parse_manifest(&argv0_manifest(
+            "echo",
+            "[\"echo\", \"hi\"]",
+            "timeout_seconds = 0",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("timeout_seconds must be greater than zero"),
+            "{err}"
+        );
+        let m = parse_manifest(&argv0_manifest("echo", "[\"echo\", \"hi\"]", "")).unwrap();
+        assert_eq!(m.tool.timeout_seconds, 60);
+    }
+
+    #[test]
+    fn spawn_path_manifest_vectors() {
+        // The `tests/injection_vectors.json` manifest vectors this wave covers.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/injection_vectors.json"
+        );
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not found");
+            return;
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut seen = 0;
+        for v in doc["manifest_vectors"].as_array().unwrap() {
+            let id = v["id"].as_str().unwrap();
+            if ![
+                "zero-timeout",
+                "shell-as-binary",
+                "binary-basename-mismatch",
+                "minimal-valid-exec",
+                "minimal-valid-template",
+            ]
+            .contains(&id)
+            {
+                continue;
+            }
+            seen += 1;
+            let ok = parse_manifest(v["manifest"].as_str().unwrap()).is_ok();
+            assert_eq!(ok, v["expect"] == "accept", "vector {id}");
+        }
+        assert_eq!(seen, 5);
     }
 }

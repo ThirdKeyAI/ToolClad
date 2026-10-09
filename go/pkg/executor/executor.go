@@ -4,8 +4,11 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +21,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/BurntSushi/toml"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 	"github.com/thirdkeyai/toolclad/pkg/validator"
@@ -38,9 +43,18 @@ type EvidenceEnvelope struct {
 	Error      string         `json:"error,omitempty"`
 }
 
-// newScanID returns a scan identifier for one invocation.
+// newScanID returns a scan identifier for one invocation:
+// <unix_seconds>-<32 hex chars>, the random part being 128 bits from
+// crypto/rand so an id (and the evidence paths derived from it) cannot be
+// predicted.
 func newScanID(start time.Time) string {
-	return fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail on supported platforms; refuse to fall
+		// back to a predictable id if it ever does.
+		panic(fmt.Sprintf("crypto/rand: %v", err))
+	}
+	return fmt.Sprintf("%d-%s", start.Unix(), hex.EncodeToString(b[:]))
 }
 
 // evidenceDir returns the evidence root: TOOLCLAD_EVIDENCE_DIR or
@@ -51,6 +65,133 @@ func evidenceDir() string {
 	}
 	return filepath.Join(os.TempDir(), "toolclad-evidence")
 }
+
+// outputDir returns the per-invocation output directory: [tool.evidence]
+// output_dir formatted with {evidence_dir} and {scan_id} when set, else
+// <evidence_dir>/<scan_id>-<tool_name>.
+func outputDir(m *manifest.Manifest, evDir, scanID string) string {
+	if m.Tool.Evidence != nil && m.Tool.Evidence.OutputDir != "" {
+		r := strings.NewReplacer("{evidence_dir}", evDir, "{scan_id}", scanID)
+		return r.Replace(m.Tool.Evidence.OutputDir)
+	}
+	return filepath.Join(evDir, scanID+"-"+m.Tool.Name)
+}
+
+// outputFile returns <output dir>/scan.<ext>, ext following output.format.
+func outputFile(m *manifest.Manifest, outDir string) string {
+	ext := "txt"
+	if m.Output != nil {
+		switch m.Output.Format {
+		case "xml", "json", "csv", "jsonl":
+			ext = m.Output.Format
+		}
+	}
+	return filepath.Join(outDir, "scan."+ext)
+}
+
+// ensurePrivateDir creates dir (and parents) and sets it to mode 0700. A
+// symlink in its place is refused so a pre-planted link in a shared temp
+// directory cannot redirect evidence.
+func ensurePrivateDir(dir string) error {
+	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to use evidence directory '%s': it is a symlink", dir)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating evidence directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("securing evidence directory: %w", err)
+	}
+	return nil
+}
+
+// writeEvidenceFile creates path and writes data to it. The file is opened
+// with O_CREAT|O_EXCL|O_NOFOLLOW and mode 0600, so an existing file or a
+// pre-planted symlink at path makes the write fail instead of being
+// followed or overwritten.
+func writeEvidenceFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// fixedPath is the PATH every child receives and the only PATH argv[0] is
+// resolved against. The runtime's own PATH is never inherited: an inherited
+// PATH is how a renamed binary earlier in the search order wins.
+const fixedPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// passthroughEnv are the only parent variables copied to a child, and only
+// when set.
+var passthroughEnv = []string{"HOME", "LANG", "LC_ALL", "TZ", "TERM"}
+
+// childEnv builds the child environment from the allowlist: the fixed PATH
+// plus HOME, LANG, LC_ALL, TZ and TERM when set, plus extra. Nothing else
+// from the runtime's environment reaches the child; in particular the
+// runtime's secrets (TOOLCLAD_SECRET_*) are filtered out even if a future
+// edit puts one into extra. The result is never nil: a nil cmd.Env would
+// inherit the whole parent environment.
+func childEnv(extra []string) []string {
+	env := []string{"PATH=" + fixedPath}
+	for _, k := range passthroughEnv {
+		if v, ok := os.LookupEnv(k); ok {
+			env = append(env, k+"="+v)
+		}
+	}
+	for _, kv := range extra {
+		if strings.HasPrefix(kv, "TOOLCLAD_SECRET_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
+}
+
+// resolveArgv0 returns the absolute path the runtime will execute. A name
+// without a path separator is looked up in fixedPath only; a name with one
+// is used as given, made absolute against the runtime's working directory
+// (the child runs in a scratch directory, where a relative path would
+// otherwise resolve differently).
+func resolveArgv0(name string) (string, error) {
+	if strings.ContainsRune(name, '/') {
+		return filepath.Abs(name)
+	}
+	for _, dir := range filepath.SplitList(fixedPath) {
+		p := filepath.Join(dir, name)
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("cannot resolve command '%s' in PATH %s", name, fixedPath)
+}
+
+// defaultKillGrace is the SIGTERM-to-SIGKILL interval when
+// TOOLCLAD_KILL_GRACE_MS is unset or invalid.
+const defaultKillGrace = 2000 * time.Millisecond
+
+// killGrace returns TOOLCLAD_KILL_GRACE_MS as a duration. Anything other
+// than a non-negative integer yields the 2000 ms default.
+func killGrace() time.Duration {
+	v := os.Getenv("TOOLCLAD_KILL_GRACE_MS")
+	if v == "" {
+		return defaultKillGrace
+	}
+	ms, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || ms < 0 {
+		return defaultKillGrace
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// minWaitDelay bounds how long Run waits for the output pipes after the
+// child exits or is signaled, even with a zero grace period: a WaitDelay of
+// zero would mean "wait for the pipes forever".
+const minWaitDelay = 100 * time.Millisecond
 
 // resolveVars validates arguments and resolves every template variable into
 // the two variable classes of the command model:
@@ -107,7 +248,7 @@ func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (m
 	evDir := evidenceDir()
 	vars["_scan_id"] = scanID
 	vars["_evidence_dir"] = evDir
-	vars["_output_file"] = filepath.Join(evDir, scanID+"-output")
+	vars["_output_file"] = outputFile(m, outputDir(m, evDir, scanID))
 
 	trusted := make(map[string][]string)
 	for argName, mapping := range m.Command.Mappings {
@@ -418,9 +559,7 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 
 	start := time.Now()
 	scanID := newScanID(start)
-
-	cmdArgs, vars, err := build(m, args, scanID)
-	if err != nil {
+	errEnvelope := func(err error) (*EvidenceEnvelope, error) {
 		return &EvidenceEnvelope{
 			Status:    "error",
 			ScanID:    scanID,
@@ -430,25 +569,104 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 			Error:     err.Error(),
 		}, err
 	}
+
+	cmdArgs, vars, err := build(m, args, scanID)
+	if err != nil {
+		return errEnvelope(err)
+	}
+	// build compiled the manifest, which ran the load-time spawn checks for
+	// a manifest constructed in memory; a loaded one ran them at load.
 	cmdStr := FormatArgv(cmdArgs)
 
-	timeout := time.Duration(m.Tool.TimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	timeoutSecs := m.Tool.TimeoutSeconds
+	if timeoutSecs == 0 {
+		// Only a manifest built in memory can get here with zero; a loaded
+		// one either had the key absent (defaulted to 60) or was refused.
+		timeoutSecs = 60
+	}
+
+	binPath, err := resolveArgv0(cmdArgs[0])
+	if err != nil {
+		return errEnvelope(err)
+	}
+
+	// Evidence root, output directory and per-invocation scratch directory,
+	// all mode 0700, created before the spawn so a tool that writes to
+	// {_output_file} finds its directory.
+	evDir := evidenceDir()
+	outDir := outputDir(m, evDir, scanID)
+	workDir := filepath.Join(evDir, scanID+"-work")
+	for _, d := range []string{evDir, outDir, workDir} {
+		if err := ensurePrivateDir(d); err != nil {
+			return errEnvelope(err)
+		}
+	}
+	// The scratch directory is removed only when empty: anything a tool
+	// wrote there is evidence. os.Remove refuses a non-empty directory.
+	defer os.Remove(workDir)
+
+	var extraEnv []string
+	if m.Command.Executor != "" {
+		// The executor escape hatch receives the validated arguments and
+		// the invocation metadata as environment variables.
+		names := make([]string, 0, len(m.Args))
+		for name := range m.Args {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			extraEnv = append(extraEnv, "TOOLCLAD_ARG_"+strings.ToUpper(name)+"="+vars[name])
+		}
+		extraEnv = append(extraEnv,
+			"TOOLCLAD_SCAN_ID="+scanID,
+			"TOOLCLAD_TOOL_NAME="+m.Tool.Name,
+			"TOOLCLAD_EVIDENCE_DIR="+evDir,
+			"TOOLCLAD_OUTPUT_DIR="+outDir,
+		)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-
-	// Set process group so we can kill the entire group on timeout.
+	cmd := exec.CommandContext(ctx, binPath, cmdArgs[1:]...)
+	cmd.Args[0] = cmdArgs[0]
+	// Never nil: a nil Env would inherit the runtime's whole environment.
+	cmd.Env = childEnv(extraEnv)
+	// A nil Stdin connects the child to /dev/null, so a tool can neither
+	// read the operator's terminal nor consume a pipe the runtime owns.
+	cmd.Stdin = nil
+	cmd.Dir = workDir
+	// New process group so the whole group can be signaled on timeout.
+	// umask and resource limits (RLIMIT_CORE, RLIMIT_NPROC, ...) cannot be
+	// set for the child portably from Go: os/exec has no pre-exec hook, and
+	// changing them in the runtime would affect every goroutine. They are
+	// deliberately not applied here rather than faked.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// If using a custom executor, pass validated args as env vars.
-	if m.Command.Executor != "" {
-		for name := range m.Args {
-			envKey := "TOOLCLAD_ARG_" + strings.ToUpper(name)
-			cmd.Env = append(cmd.Env, envKey+"="+vars[name])
+	// Kill sequence on deadline: SIGTERM to the process group, then SIGKILL
+	// to the group after the grace period. WaitDelay bounds how long Run
+	// waits for the output pipes independently of the process, so a
+	// descendant that keeps stdout open cannot hang Run; after it elapses
+	// Go closes the pipes and kills the direct child.
+	//
+	// A child that calls setsid() leaves the group and escapes this in
+	// every language, so this is cleanup rather than containment;
+	// escape-proof cleanup needs a cgroup, which is out of scope.
+	grace := killGrace()
+	// Set only by Cancel, which runs before Run returns.
+	var killTimer *time.Timer
+	cmd.Cancel = func() error {
+		pid := cmd.Process.Pid
+		killTimer = time.AfterFunc(grace, func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
 		}
-		cmd.Env = append(cmd.Env, "TOOLCLAD_SCAN_ID="+scanID)
+		return nil
 	}
+	cmd.WaitDelay = max(grace, minWaitDelay)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -456,10 +674,15 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 
 	execErr := cmd.Run()
 	duration := time.Since(start)
+	timedOut := ctx.Err() != nil && execErr != nil
 
-	// On context deadline exceeded, kill the entire process group.
-	if ctx.Err() != nil && cmd.Process != nil {
+	// Take the rest of the group: on a timeout, and when the direct child
+	// exited but a descendant kept the output pipes open past WaitDelay.
+	if cmd.Process != nil && (timedOut || errors.Is(execErr, exec.ErrWaitDelay)) {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	if killTimer != nil {
+		killTimer.Stop()
 	}
 
 	stdoutBytes := stdoutBuf.Bytes()
@@ -481,6 +704,23 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 		Timestamp:  start.UTC().Format(time.RFC3339),
 	}
 
+	if timedOut {
+		err := fmt.Errorf("tool timed out after %d seconds", timeoutSecs)
+		envelope.Status = "timeout"
+		envelope.ExitCode = -1
+		envelope.Error = err.Error()
+		envelope.Results = map[string]any{"raw_output": string(stdoutBytes)}
+		return envelope, err
+	}
+	if errors.Is(execErr, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+		// The tool itself exited; only a leftover descendant held the
+		// pipes, and it has been killed. Judge the run by the exit status.
+		execErr = nil
+		if !cmd.ProcessState.Success() {
+			execErr = &exec.ExitError{ProcessState: cmd.ProcessState}
+		}
+	}
+
 	if execErr != nil {
 		envelope.Status = "error"
 		envelope.Error = execErr.Error()
@@ -495,6 +735,18 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	// Compute hash of output.
 	hash := sha256.Sum256(stdoutBytes)
 	envelope.OutputHash = fmt.Sprintf("sha256:%x", hash)
+
+	// [tool.evidence] capture = true keeps stdout at {_output_file}, unless
+	// the tool wrote that file itself. The write never follows a symlink
+	// and never overwrites an existing file.
+	if m.Tool.Evidence != nil && m.Tool.Evidence.Capture {
+		if err := captureOutput(outputFile(m, outDir), stdoutBytes); err != nil {
+			envelope.Status = "error"
+			envelope.Error = err.Error()
+			envelope.Results = map[string]any{"raw_output": string(stdoutBytes)}
+			return envelope, err
+		}
+	}
 
 	// Parse output based on format. Callback-only manifests have no [output];
 	// for the execute path we always have one (validated at load).
@@ -512,6 +764,22 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	}
 
 	return envelope, nil
+}
+
+// captureOutput writes captured stdout to path. When a regular file is
+// already there the tool produced it, and it is kept as is; a symlink (or
+// anything else) is refused.
+func captureOutput(path string, data []byte) error {
+	err := writeEvidenceFile(path, data)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrExist) {
+		if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode().IsRegular() {
+			return nil
+		}
+	}
+	return fmt.Errorf("refusing to write evidence file '%s': %w", path, err)
 }
 
 // parseOutput converts raw command output based on the declared format.
@@ -771,26 +1039,97 @@ func parseXmlOutput(data []byte) map[string]any {
 // secretPattern matches {_secret:name} placeholders in templates.
 var secretPattern = regexp.MustCompile(`\{_secret:(\w+)\}`)
 
-// injectTemplateVars replaces {_secret:name} with TOOLCLAD_SECRET_<NAME> env vars.
-func injectTemplateVars(template string) (string, error) {
-	var missingErr error
+// secretSource resolves {_secret:name} values for one call. The file named
+// by TOOLCLAD_SECRETS_FILE is read at most once per source, on first use.
+type secretSource struct {
+	loaded bool
+	file   map[string]string
+	err    error
+}
+
+// loadSecretsFile reads TOOLCLAD_SECRETS_FILE: a TOML file of top-level
+// name = "value" pairs. It is refused when group or others can read it,
+// which is what makes it better than an environment variable. An unset
+// variable yields no file secrets.
+func loadSecretsFile() (map[string]string, error) {
+	path := os.Getenv("TOOLCLAD_SECRETS_FILE")
+	if path == "" {
+		return nil, nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("TOOLCLAD_SECRETS_FILE '%s': %w", path, err)
+	}
+	if mode := fi.Mode().Perm(); mode&0o077 != 0 {
+		return nil, fmt.Errorf(
+			"TOOLCLAD_SECRETS_FILE '%s' is readable by group or others (mode %04o); chmod 600 it", path, mode)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("TOOLCLAD_SECRETS_FILE '%s': %w", path, err)
+	}
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("TOOLCLAD_SECRETS_FILE '%s': %w", path, err)
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		sv, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("TOOLCLAD_SECRETS_FILE '%s': value of '%s' must be a string", path, k)
+		}
+		out[k] = sv
+	}
+	return out, nil
+}
+
+// lookup returns the secret for name: the secrets file wins over
+// TOOLCLAD_SECRET_<NAME>. An empty value counts as missing.
+func (s *secretSource) lookup(name string) (string, error) {
+	if !s.loaded {
+		s.file, s.err = loadSecretsFile()
+		s.loaded = true
+	}
+	if s.err != nil {
+		return "", s.err
+	}
+	if v := s.file[name]; v != "" {
+		return v, nil
+	}
+	envKey := "TOOLCLAD_SECRET_" + strings.ToUpper(name)
+	if v := os.Getenv(envKey); v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("missing environment variable: %s (and no '%s' in TOOLCLAD_SECRETS_FILE)", envKey, name)
+}
+
+// expand replaces each {_secret:name} in template with its value.
+func (s *secretSource) expand(template string) (string, error) {
+	var firstErr error
 	result := secretPattern.ReplaceAllStringFunc(template, func(match string) string {
 		sub := secretPattern.FindStringSubmatch(match)
 		if len(sub) < 2 {
 			return match
 		}
-		envKey := "TOOLCLAD_SECRET_" + strings.ToUpper(sub[1])
-		val := os.Getenv(envKey)
-		if val == "" {
-			missingErr = fmt.Errorf("missing environment variable: %s", envKey)
+		val, err := s.lookup(sub[1])
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			return match
 		}
 		return val
 	})
-	if missingErr != nil {
-		return "", missingErr
+	if firstErr != nil {
+		return "", firstErr
 	}
 	return result, nil
+}
+
+// injectTemplateVars replaces {_secret:name} with its value from
+// TOOLCLAD_SECRETS_FILE or TOOLCLAD_SECRET_<NAME>.
+func injectTemplateVars(template string) (string, error) {
+	return (&secretSource{}).expand(template)
 }
 
 // interpolateString replaces {key} placeholders with values from the context map.
@@ -809,8 +1148,8 @@ func interpolateString(template string, ctx map[string]string) string {
 // in place, no secret expansion happens any more. The url validator's
 // metacharacter blocklist also rejects braces, but the ordering here does
 // not rely on that check being the only defense.
-func expandHTTPTemplate(template string, cleaned map[string]string) (string, error) {
-	withSecrets, err := injectTemplateVars(template)
+func expandHTTPTemplate(secrets *secretSource, template string, cleaned map[string]string) (string, error) {
+	withSecrets, err := secrets.expand(template)
 	if err != nil {
 		return "", err
 	}
@@ -821,14 +1160,16 @@ func expandHTTPTemplate(template string, cleaned map[string]string) (string, err
 // already-validated arguments without sending it. The URL, every header
 // value and the body template each go through expandHTTPTemplate.
 func buildHTTPRequest(m *manifest.Manifest, cleaned map[string]string) (*http.Request, error) {
-	url, err := expandHTTPTemplate(m.Http.URL, cleaned)
+	// One source per request: the secrets file is read at most once.
+	secrets := &secretSource{}
+	url, err := expandHTTPTemplate(secrets, m.Http.URL, cleaned)
 	if err != nil {
 		return nil, err
 	}
 
 	headers := make(map[string]string)
 	for k, v := range m.Http.Headers {
-		hv, err := expandHTTPTemplate(v, cleaned)
+		hv, err := expandHTTPTemplate(secrets, v, cleaned)
 		if err != nil {
 			return nil, err
 		}
@@ -841,7 +1182,7 @@ func buildHTTPRequest(m *manifest.Manifest, cleaned map[string]string) (*http.Re
 	}
 	var bodyReader io.Reader
 	if m.Http.BodyTemplate != "" && method != "GET" && method != "HEAD" {
-		body, err := expandHTTPTemplate(m.Http.BodyTemplate, cleaned)
+		body, err := expandHTTPTemplate(secrets, m.Http.BodyTemplate, cleaned)
 		if err != nil {
 			return nil, err
 		}
@@ -877,7 +1218,7 @@ func ExecuteHTTP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelop
 	}
 
 	start := time.Now()
-	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+	scanID := newScanID(start)
 
 	// Validate args
 	cleaned := make(map[string]string)
@@ -988,7 +1329,7 @@ func ExecuteMCP(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope
 	}
 
 	start := time.Now()
-	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+	scanID := newScanID(start)
 
 	// Validate args
 	cleaned := make(map[string]string)

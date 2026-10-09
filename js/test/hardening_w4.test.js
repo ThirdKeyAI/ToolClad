@@ -82,7 +82,7 @@ describe("W4 D1 - internal-name denylist is unconditional", () => {
     "vault.private",
   ];
 
-  it("refuses each name as a scope_target without block_internal", () => {
+  it("refuses each name as a scope_target without block_internal", async () => {
     for (const v of names) {
       assert.throws(() => validateArg({ type: "scope_target" }, v), INTERNAL, v);
       assert.throws(() => validateArg({ type: "scope_target", block_internal: false }, v), INTERNAL, v);
@@ -90,14 +90,14 @@ describe("W4 D1 - internal-name denylist is unconditional", () => {
     }
   });
 
-  it("refuses each name as a url host without block_internal", () => {
+  it("refuses each name as a url host without block_internal", async () => {
     for (const v of names) {
       assert.throws(() => validateArg({ type: "url" }, `http://${v}/`), INTERNAL, v);
       assert.throws(() => validateArg({ type: "url" }, `https://${v}:8443/path?q=1`), INTERNAL, v);
     }
   });
 
-  it("compares case-insensitively and ignores one trailing dot", () => {
+  it("compares case-insensitively and ignores one trailing dot", async () => {
     const reason = "resolves to an internal name — always blocked";
     assert.equal(internalNameReason("LOCALHOST"), reason);
     assert.equal(internalNameReason("Api.LocalHost."), reason);
@@ -107,7 +107,7 @@ describe("W4 D1 - internal-name denylist is unconditional", () => {
     assert.throws(() => validateArg({ type: "url" }, "http://Printer.LOCAL/"), INTERNAL);
   });
 
-  it("matches whole labels only", () => {
+  it("matches whole labels only", async () => {
     assert.equal(internalNameReason("example.com"), null);
     assert.equal(internalNameReason("localhost.example.com"), null);
     assert.equal(internalNameReason("mylocal.example"), null);
@@ -117,7 +117,7 @@ describe("W4 D1 - internal-name denylist is unconditional", () => {
     assert.equal(validateArg({ type: "url" }, "https://corp.example.com/"), "https://corp.example.com/");
   });
 
-  it("the tables match the normative list", () => {
+  it("the tables match the normative list", async () => {
     assert.deepEqual([...INTERNAL_NAMES], ["localhost", "metadata.google.internal"]);
     assert.deepEqual(
       [...INTERNAL_NAME_SUFFIXES],
@@ -129,7 +129,7 @@ describe("W4 D1 - internal-name denylist is unconditional", () => {
 // --- D2 embedded IP literal -------------------------------------------------
 
 describe("W4 D2 - IP literal embedded in a hostname", () => {
-  it("169.254.169.254.nip.io is refused without block_internal", () => {
+  it("169.254.169.254.nip.io is refused without block_internal", async () => {
     assert.throws(() => validateArg({ type: "scope_target" }, "169.254.169.254.nip.io"), ALWAYS_V4);
     assert.throws(() => validateArg({ type: "scope_target" }, "169-254-169-254.nip.io"), ALWAYS_V4);
     assert.throws(
@@ -139,7 +139,7 @@ describe("W4 D2 - IP literal embedded in a hostname", () => {
     assert.throws(() => validateArg({ type: "url" }, "http://169-254-169-254.sslip.io:80/"), ALWAYS_V4);
   });
 
-  it("127.0.0.1.nip.io and 10-0-0-1.nip.io are refused with block_internal", () => {
+  it("127.0.0.1.nip.io and 10-0-0-1.nip.io are refused with block_internal", async () => {
     const def = { type: "scope_target", block_internal: true };
     assert.throws(() => validateArg(def, "127.0.0.1.nip.io"), LOOPBACK);
     assert.throws(() => validateArg(def, "10-0-0-1.nip.io"), PRIVATE);
@@ -148,14 +148,14 @@ describe("W4 D2 - IP literal embedded in a hostname", () => {
     assert.throws(() => validateArg({ type: "url", block_internal: true }, "https://10-0-0-1.nip.io/"), PRIVATE);
   });
 
-  it("the embedded policy is opt-in like the literal policy", () => {
+  it("the embedded policy is opt-in like the literal policy", async () => {
     // 127/8 and 10/8 are block_internal rows: without the flag the name is an
     // ordinary hostname and no resolution is attempted.
     assert.equal(validateArg({ type: "scope_target" }, "127.0.0.1.nip.io"), "127.0.0.1.nip.io");
     assert.equal(validateArg({ type: "scope_target" }, "10-0-0-1.nip.io"), "10-0-0-1.nip.io");
   });
 
-  it("a public embedded address is not refused for its shape", () => {
+  it("a public embedded address is not refused for its shape", async () => {
     assert.equal(validateArg({ type: "scope_target" }, "93-184-216-34.example.com"), "93-184-216-34.example.com");
     assert.equal(validateArg({ type: "scope_target" }, "93.184.216.34.example.com"), "93.184.216.34.example.com");
     assert.equal(validateArg({ type: "url" }, "https://93-184-216-34.example.com/"), "https://93-184-216-34.example.com/");
@@ -168,7 +168,7 @@ describe("W4 D2 - IP literal embedded in a hostname", () => {
     );
   });
 
-  it("embeddedIpv4Literal recognizes exactly the two shapes", () => {
+  it("embeddedIpv4Literal recognizes exactly the two shapes", async () => {
     assert.deepEqual(embeddedIpv4Literal("127.0.0.1.nip.io"), { family: 4, addr: 0x7f000001 });
     assert.deepEqual(embeddedIpv4Literal("10-0-0-1.nip.io"), { family: 4, addr: 0x0a000001 });
     assert.deepEqual(embeddedIpv4Literal("10-0-0-1"), { family: 4, addr: 0x0a000001 });
@@ -190,7 +190,7 @@ describe("W4 D2 - IP literal embedded in a hostname", () => {
 // --- D3 CIDR overlap ----------------------------------------------------------
 
 describe("W4 D3 - CIDR overlap, not base address", () => {
-  it("8.0.0.0/5 is refused with block_internal: its base is public but it contains 10.0.0.0/8", () => {
+  it("8.0.0.0/5 is refused with block_internal: its base is public but it contains 10.0.0.0/8", async () => {
     assert.throws(() => validateArg({ type: "scope_target", block_internal: true }, "8.0.0.0/5"), PRIVATE);
     assert.throws(() => validateArg({ type: "cidr", block_internal: true }, "8.0.0.0/5"), PRIVATE);
     // Opt-in: 8.0.0.0/5 contains no always-blocked range.
@@ -198,7 +198,7 @@ describe("W4 D3 - CIDR overlap, not base address", () => {
     assert.equal(validateArg({ type: "cidr" }, "8.0.0.0/5"), "8.0.0.0/5");
   });
 
-  it("10.0.0.0/24 is refused and 93.184.216.0/24 is accepted", () => {
+  it("10.0.0.0/24 is refused and 93.184.216.0/24 is accepted", async () => {
     for (const type of ["scope_target", "cidr"]) {
       const def = { type, block_internal: true };
       assert.throws(() => validateArg(def, "10.0.0.0/24"), PRIVATE, type);
@@ -209,7 +209,7 @@ describe("W4 D3 - CIDR overlap, not base address", () => {
     }
   });
 
-  it("IPv6: 2001:db8::/32 is refused and 2606:4700::/32 is accepted", () => {
+  it("IPv6: 2001:db8::/32 is refused and 2606:4700::/32 is accepted", async () => {
     for (const type of ["scope_target", "cidr"]) {
       const def = { type, block_internal: true };
       assert.throws(() => validateArg(def, "2001:db8::/32"), BLOCKED_BY_POLICY, type);
@@ -225,7 +225,7 @@ describe("W4 D3 - CIDR overlap, not base address", () => {
     }
   });
 
-  it("a range containing link-local is always blocked, with or without block_internal", () => {
+  it("a range containing link-local is always blocked, with or without block_internal", async () => {
     for (const blockInternal of [false, true]) {
       for (const type of ["scope_target", "cidr"]) {
         const def = { type, block_internal: blockInternal };
@@ -241,7 +241,7 @@ describe("W4 D3 - CIDR overlap, not base address", () => {
     }
   });
 
-  it("IPv4-mapped IPv6 ranges are projected onto the IPv4 rows", () => {
+  it("IPv4-mapped IPv6 ranges are projected onto the IPv4 rows", async () => {
     const def = { type: "cidr", block_internal: true };
     assert.throws(() => validateArg(def, "::ffff:127.0.0.0/104"), LOOPBACK);
     assert.throws(() => validateArg(def, "::ffff:10.0.0.0/104"), PRIVATE);
@@ -260,7 +260,7 @@ describe("W4 D3 - CIDR overlap, not base address", () => {
     assert.equal(toIpv4MappedPrefix(parseCidr("::fffe:0:0/96")), null);
   });
 
-  it("prefixesOverlap: boundaries on the 32-bit and eight-group representations", () => {
+  it("prefixesOverlap: boundaries on the 32-bit and eight-group representations", async () => {
     const o = (a, b) => prefixesOverlap(parseCidr(a), parseCidr(b));
     assert.equal(o("8.0.0.0/5", "10.0.0.0/8"), true);
     assert.equal(o("10.0.0.0/8", "8.0.0.0/5"), true);
@@ -296,7 +296,7 @@ describe("W4 D3 - CIDR overlap, not base address", () => {
 // --- D4 DNS resolution ----------------------------------------------------------
 
 describe("W4 D4 - DNS resolution under block_internal (fail closed)", () => {
-  it("sync: a hostname under block_internal is refused without a lookup", () => {
+  it("sync: a hostname under block_internal is refused without a lookup", async () => {
     assert.throws(() => validateArg({ type: "scope_target", block_internal: true }, "example.com"), SYNC_UNRESOLVED);
     assert.throws(() => validateArgMode({ type: "scope_target", block_internal: true }, "example.com", true), SYNC_UNRESOLVED);
     assert.throws(() => validateArg({ type: "url", block_internal: true }, "https://example.com/"), SYNC_UNRESOLVED);
@@ -310,7 +310,7 @@ describe("W4 D4 - DNS resolution under block_internal (fail closed)", () => {
     );
   });
 
-  it("sync: the same name is accepted when block_internal is false (no resolution is attempted)", () => {
+  it("sync: the same name is accepted when block_internal is false (no resolution is attempted)", async () => {
     assert.equal(validateArg({ type: "scope_target" }, "no-such-host.invalid"), "no-such-host.invalid");
     assert.equal(validateArg({ type: "scope_target", block_internal: false }, "no-such-host.invalid"), "no-such-host.invalid");
     assert.equal(validateArg({ type: "url" }, "https://no-such-host.invalid/"), "https://no-such-host.invalid/");
@@ -378,7 +378,7 @@ describe("W4 D4 - DNS resolution under block_internal (fail closed)", () => {
     );
   });
 
-  it("the build path is synchronous: a hostname under block_internal is refused, a literal builds", () => {
+  it("the build path is synchronous: a hostname under block_internal is refused, a literal builds", async () => {
     const m = oneshot(
       { binary: "echo" },
       { target: { type: "scope_target", required: true, block_internal: true } },
@@ -394,14 +394,14 @@ describe("W4 D4 - DNS resolution under block_internal (fail closed)", () => {
 // --- D5 egress lint ---------------------------------------------------------
 
 describe("W4 D5 - egress lint as a manifest property (TC-15)", () => {
-  it("the egress binary list is exactly the Rust list", () => {
+  it("the egress binary list is exactly the Rust list", async () => {
     assert.deepEqual(
       [...EGRESS_BINARIES],
       ["curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh", "ping", "fping", "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto"]
     );
   });
 
-  it("a curl manifest without block_internal is refused at load; with the flag it loads", () => {
+  it("a curl manifest without block_internal is refused at load; with the flag it loads", async () => {
     const curl = (flag) => `[tool]
 name = "fetch"
 binary = "curl"
@@ -426,7 +426,7 @@ format = "text"
     assert.equal(isEgressManifest(m), true);
   });
 
-  it("an nmap manifest without block_internal is refused at load; with the flag it loads", () => {
+  it("an nmap manifest without block_internal is refused at load; with the flag it loads", async () => {
     const nmap = (flag) => `[tool]
 name = "scan"
 binary = "nmap"
@@ -449,7 +449,7 @@ format = "text"
     assert.equal(m.args.target.block_internal, true);
   });
 
-  it("every network target type is covered; other types are not linted", () => {
+  it("every network target type is covered; other types are not linted", async () => {
     for (const type of ["scope_target", "url", "ip_address", "cidr"]) {
       const m = oneshot({ binary: "wget" }, { target: { type, required: true } }, { exec: ["wget", "{target}"] });
       assert.throws(() => compileCommand(m), LINT_TARGET, type);
@@ -465,7 +465,7 @@ format = "text"
     assert.equal(isEgressManifest(m), true);
   });
 
-  it("network_egress = true makes a manifest egress even when the binary is not listed", () => {
+  it("network_egress = true makes a manifest egress even when the binary is not listed", async () => {
     const m = oneshot(
       { binary: "mytool", network_egress: true },
       { target: { type: "scope_target" } },
@@ -519,16 +519,16 @@ format = "json"
     };
     assert.equal(isEgressManifest(m), true);
     await assert.rejects(executeHttp(m, { target: "https://93.184.216.34/" }, { dryRun: true }), LINT_TARGET);
-    assert.throws(() => execute(m, { target: "https://93.184.216.34/" }, { dryRun: true }), LINT_TARGET);
+    await assert.rejects(() => execute(m, { target: "https://93.184.216.34/" }, { dryRun: true }), LINT_TARGET);
 
     m.args.target.block_internal = true;
     const r = await executeHttp(m, { target: "https://93.184.216.34/" }, { dryRun: true });
     assert.equal(r.status, "dry_run");
     assert.equal(r.http_url, "https://93.184.216.34/");
-    assert.equal(execute(m, { target: "https://93.184.216.34/" }, { dryRun: true }).status, "dry_run");
+    assert.equal((await execute(m, { target: "https://93.184.216.34/" }, { dryRun: true })).status, "dry_run");
   });
 
-  it("a [browser] manifest is an egress manifest", () => {
+  it("a [browser] manifest is an egress manifest", async () => {
     const path = writeTmp(`[tool]
 name = "b"
 description = "d"
@@ -547,7 +547,7 @@ format = "json"
     assert.equal(isEgressManifest({ tool: { name: "b" }, browser: { engine: "cdp" } }), true);
   });
 
-  it("a non-egress binary (whois) does not require the flag", () => {
+  it("a non-egress binary (whois) does not require the flag", async () => {
     const m = oneshot({ binary: "whois" }, { target: { type: "scope_target", required: true } }, { exec: ["whois", "{target}"] });
     compileCommand(m);
     assert.equal(isEgressManifest(m), false);
@@ -572,7 +572,7 @@ format = "text"
     assert.equal(loadManifest(path).args.target.block_internal, false);
   });
 
-  it("the binary is matched by lowercased basename in tool.binary, exec[0] and the template", () => {
+  it("the binary is matched by lowercased basename in tool.binary, exec[0] and the template", async () => {
     assert.equal(isEgressManifest(oneshot({ binary: "/usr/bin/Curl" }, {}, { exec: ["x"] })), true);
     assert.equal(isEgressManifest(oneshot({ binary: "C:\\tools\\NMAP" }, {}, { exec: ["x"] })), true);
     assert.equal(isEgressManifest(oneshot({ binary: "wrapper" }, {}, { exec: ["/opt/bin/nc", "-z"] })), true);
@@ -583,7 +583,7 @@ format = "text"
     assert.equal(isEgressManifest(oneshot({ binary: "nmap.exe" }, {}, { exec: ["nmap.exe"] })), false);
   });
 
-  it("an executor-only manifest is an egress manifest only when the author declares it", () => {
+  it("an executor-only manifest is an egress manifest only when the author declares it", async () => {
     const silent = oneshot({}, { target: { type: "scope_target", required: true } }, { executor: "scripts/run.sh" });
     compileCommand(silent);
     assert.equal(isEgressManifest(silent), false);
@@ -595,13 +595,13 @@ format = "text"
     assert.throws(() => compileCommand(declared), LINT_TARGET);
   });
 
-  it("the lint runs before any argument value is examined", () => {
+  it("the lint runs before any argument value is examined", async () => {
     const m = oneshot({ binary: "curl" }, { target: { type: "url", required: true } }, { exec: ["curl", "{target}"] });
     assert.throws(() => buildCommandArgv(m, {}), LINT_TARGET);
     assert.throws(() => buildCommandArgv(m, { target: "not a url" }), LINT_TARGET);
   });
 
-  it("names the first offending argument in declaration order", () => {
+  it("names the first offending argument in declaration order", async () => {
     const m = oneshot(
       { binary: "curl" },
       {
@@ -617,7 +617,7 @@ format = "text"
     );
   });
 
-  it("a custom type with a network-target base is refused once the custom types are known", () => {
+  it("a custom type with a network-target base is refused once the custom types are known", async () => {
     const types = {
       host: { base: "scope_target" },
       web: { base: "url" },

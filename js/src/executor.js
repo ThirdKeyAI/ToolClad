@@ -1,7 +1,22 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
+import {
+  accessSync,
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import TOML from "@iarna/toml";
 import { validateArgIn } from "./validator.js";
 import { scopeForManifest } from "./scope.js";
 
@@ -126,19 +141,280 @@ export function lintNetworkEgress(manifest, customTypes) {
 }
 
 /**
- * Replace {_secret:name} placeholders with TOOLCLAD_SECRET_<NAME> env vars.
- * @param {string} template - Template string with optional {_secret:name} vars
- * @returns {string} Template with secrets injected from environment
+ * The fixed PATH every child receives and against which a bare `argv[0]` is
+ * resolved. Never inherited: an inherited PATH is how a renamed binary that
+ * appears earlier in the search path wins.
  */
-export function injectTemplateVars(template) {
-  return template.replace(/\{_secret:(\w+)\}/g, (_match, name) => {
+export const FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/** Parent variables copied into the child environment, only when set. */
+const PASSTHROUGH_ENV = ["HOME", "LANG", "LC_ALL", "TZ", "TERM"];
+
+/**
+ * `argv[0]` basenames refused at load unless `[tool] allow_interpreter = true`:
+ * each one turns a validated argument into code.
+ */
+export const INTERPRETER_BINARIES = Object.freeze([
+  "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "ash", "busybox",
+  "env", "eval", "xargs", "python", "python2", "python3", "perl", "ruby",
+  "node", "deno", "bun", "lua", "php", "awk",
+]);
+
+const DEFAULT_TIMEOUT_SECONDS = 60;
+const DEFAULT_KILL_GRACE_MS = 2000;
+const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Build a child environment from the allowlist: the fixed PATH, plus HOME,
+ * LANG, LC_ALL, TZ and TERM when the parent has them, plus `extra`.
+ * `TOOLCLAD_SECRET_*` is filtered out last, so no edit to the allowlist or to
+ * `extra` can hand a secret to a child.
+ *
+ * @param {object} [extra] - Additional variables (executor hatch only)
+ * @returns {object} The complete child environment
+ */
+export function buildChildEnv(extra = {}) {
+  const env = { PATH: FIXED_PATH };
+  for (const name of PASSTHROUGH_ENV) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  Object.assign(env, extra);
+  for (const name of Object.keys(env)) {
+    if (name.startsWith("TOOLCLAD_SECRET_")) delete env[name];
+  }
+  return env;
+}
+
+/**
+ * Read `TOOLCLAD_SECRETS_FILE`: a TOML file of top-level `name = "value"`
+ * pairs. Refused when group or others can read it — that check is what makes
+ * the file better than an environment variable.
+ *
+ * @param {string} path
+ * @returns {object} name -> value
+ */
+function readSecretsFile(path) {
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const mode = fstatSync(fd).mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      throw new Error(
+        `TOOLCLAD_SECRETS_FILE '${path}' is readable by group or others (mode ${mode.toString(8).padStart(4, "0")}); chmod 600 it`
+      );
+    }
+    const parsed = TOML.parse(readFileSync(fd, "utf-8"));
+    const secrets = Object.create(null);
+    for (const [name, value] of Object.entries(parsed)) {
+      if (typeof value === "string") secrets[name] = value;
+    }
+    return secrets;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * A secret resolver for one call. The secrets file, when configured, is read
+ * at most once (lazily, on the first reference) and wins over the matching
+ * `TOOLCLAD_SECRET_<NAME>` environment variable. A missing secret is an error.
+ *
+ * @returns {(name: string) => string}
+ */
+export function makeSecretResolver() {
+  const file = process.env.TOOLCLAD_SECRETS_FILE;
+  let fileSecrets = null;
+  return (name) => {
+    if (file) {
+      if (fileSecrets === null) fileSecrets = readSecretsFile(file);
+      if (Object.hasOwn(fileSecrets, name)) return fileSecrets[name];
+    }
     const envKey = `TOOLCLAD_SECRET_${name.toUpperCase()}`;
     const val = process.env[envKey];
     if (val === undefined) {
-      throw new Error(`Missing environment variable: ${envKey}`);
+      const where = file ? ` and no '${name}' entry in TOOLCLAD_SECRETS_FILE` : "";
+      throw new Error(`Missing environment variable: ${envKey}${where}`);
     }
     return val;
-  });
+  };
+}
+
+/**
+ * Replace {_secret:name} placeholders from TOOLCLAD_SECRETS_FILE or the
+ * TOOLCLAD_SECRET_<NAME> environment variable.
+ * @param {string} template - Template string with optional {_secret:name} vars
+ * @param {(name: string) => string} [resolveSecret] - Resolver shared across one call
+ * @returns {string} Template with secrets injected
+ */
+export function injectTemplateVars(template, resolveSecret = makeSecretResolver()) {
+  return template.replace(/\{_secret:(\w+)\}/g, (_match, name) => resolveSecret(name));
+}
+
+/** The basename of a command path (separators `/` and `\`), case preserved. */
+function rawBasename(command) {
+  const parts = String(command).split(/[/\\]/);
+  return parts[parts.length - 1];
+}
+
+/**
+ * Load-time `argv[0]` checks for the exec/template/executor forms: the
+ * interpreter denylist, and for exec/template a basename match against a
+ * non-empty `tool.binary`. Skipped for callback dispatch.
+ */
+function checkArgv0(manifest) {
+  const tool = manifest.tool || {};
+  const command = manifest.command || {};
+  if (tool.dispatch === "callback") return;
+
+  let argv0;
+  let isExecutor = false;
+  if (typeof command.executor === "string" && command.executor !== "") {
+    argv0 = command.executor;
+    isExecutor = true;
+  } else if (Array.isArray(command.exec) && command.exec.length > 0) {
+    argv0 = command.exec[0];
+  } else {
+    return;
+  }
+
+  const base = rawBasename(argv0);
+  if (INTERPRETER_BINARIES.includes(base) && tool.allow_interpreter !== true) {
+    throw new Error(
+      `command argv[0] '${argv0}' is an interpreter; set allow_interpreter = true to permit it`
+    );
+  }
+  if (!isExecutor && typeof tool.binary === "string" && tool.binary !== "") {
+    if (base !== rawBasename(tool.binary)) {
+      throw new Error(
+        `command argv[0] '${argv0}' does not match tool.binary '${tool.binary}'`
+      );
+    }
+  }
+}
+
+/**
+ * `tool.timeout_seconds`, defaulting to 60; zero or negative is refused.
+ * @param {object} manifest
+ * @returns {number} seconds
+ */
+export function timeoutSeconds(manifest) {
+  const value = (manifest.tool || {}).timeout_seconds;
+  if (value === undefined || value === null) return DEFAULT_TIMEOUT_SECONDS;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error("timeout_seconds must be greater than zero");
+  }
+  return value;
+}
+
+/** `TOOLCLAD_KILL_GRACE_MS` as a non-negative integer; anything else -> 2000. */
+function killGraceMs() {
+  const raw = process.env.TOOLCLAD_KILL_GRACE_MS;
+  if (raw === undefined || !/^\d+$/.test(raw.trim())) return DEFAULT_KILL_GRACE_MS;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) ? n : DEFAULT_KILL_GRACE_MS;
+}
+
+/** `<unix_seconds>-<32 hex chars>`: 128 bits from a CSPRNG. */
+export function newScanId() {
+  return `${Math.floor(Date.now() / 1000)}-${randomBytes(16).toString("hex")}`;
+}
+
+const OUTPUT_EXTENSIONS = new Set(["xml", "json", "csv", "jsonl"]);
+
+/**
+ * The evidence paths for one invocation.
+ *
+ * - evidenceDir: `TOOLCLAD_EVIDENCE_DIR`, else `<tmpdir>/toolclad-evidence`
+ * - outputDir: `[tool.evidence] output_dir` with `{evidence_dir}` and
+ *   `{scan_id}` substituted, else `<evidenceDir>/<scanId>-<tool name>`
+ * - outputFile: `<outputDir>/scan.<ext>` (`ext` from output.format)
+ *
+ * @param {object} manifest
+ * @param {string} scanId
+ * @returns {{ evidenceDir: string, outputDir: string, outputFile: string }}
+ */
+export function evidencePaths(manifest, scanId) {
+  const evidenceDir =
+    process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
+  const configured = manifest.tool?.evidence?.output_dir;
+  const outputDir =
+    typeof configured === "string" && configured !== ""
+      ? configured
+          .replaceAll("{evidence_dir}", evidenceDir)
+          .replaceAll("{scan_id}", scanId)
+      : join(evidenceDir, `${scanId}-${manifest.tool?.name ?? "tool"}`);
+  const format = manifest.output?.format;
+  const ext = OUTPUT_EXTENSIONS.has(format) ? format : "txt";
+  return { evidenceDir, outputDir, outputFile: join(outputDir, `scan.${ext}`) };
+}
+
+/** Refuse a path that exists as a symbolic link. */
+function refuseSymlink(path) {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch (err) {
+    if (err.code === "ENOENT") return;
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to use '${path}': it is a symbolic link`);
+  }
+}
+
+/**
+ * Create a directory (and parents) mode 0700 and force the mode on the leaf,
+ * refusing a symlink at the leaf.
+ */
+export function ensurePrivateDir(path) {
+  refuseSymlink(path);
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  refuseSymlink(path);
+  chmodSync(path, 0o700);
+}
+
+/**
+ * Create a file the runtime writes: refuse a pre-planted symlink, then open
+ * with `wx` (O_CREAT | O_EXCL) and mode 0600, so the write can never be
+ * redirected or land in an existing file.
+ *
+ * @param {string} path
+ * @param {string|Buffer} [data=""]
+ */
+export function createPrivateFile(path, data = "") {
+  refuseSymlink(path);
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    if (data.length > 0) writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Resolve `argv[0]` for spawning: a name without a separator is searched on
+ * FIXED_PATH; a path with a separator is used as given (made absolute
+ * against the runtime's working directory, since the child runs in a
+ * scratch directory).
+ *
+ * @param {string} argv0
+ * @returns {string} Absolute path
+ */
+export function resolveBinary(argv0) {
+  if (argv0.includes("/")) {
+    return isAbsolute(argv0) ? argv0 : resolvePath(argv0);
+  }
+  for (const dir of FIXED_PATH.split(":")) {
+    const candidate = join(dir, argv0);
+    try {
+      if (statSync(candidate).isFile()) {
+        accessSync(candidate, fsConstants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // Not here; keep searching.
+    }
+  }
+  throw new Error(`cannot resolve command '${argv0}' on PATH ${FIXED_PATH}`);
 }
 
 /**
@@ -321,6 +597,7 @@ export function compileCommand(manifest) {
   }
 
   checkPlaceholders(manifest);
+  checkArgv0(manifest);
   lintNetworkEgress(manifest);
   defineHidden(command, "_compiled", true);
   return manifest;
@@ -510,9 +787,11 @@ function substituteTokens(tokens, vars, multi, opts = {}) {
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {{ resolvedArgs: object, vars: object, multi: object, userArgs: Set<string>, execMode: boolean }}
+ * @param {object} [opts]
+ * @param {string} [opts.scanId] - The invocation's scan id (generated when absent)
+ * @returns {{ resolvedArgs: object, vars: object, multi: object, userArgs: Set<string>, execMode: boolean, scanId: string, paths: object }}
  */
-function resolveContext(manifest, args) {
+function resolveContext(manifest, args, opts = {}) {
   compileCommand(manifest);
   const command = manifest.command;
   const execMode = command._execWasDeclared === true;
@@ -535,11 +814,11 @@ function resolveContext(manifest, args) {
     }
   }
 
-  const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
+  const scanId = opts.scanId || newScanId();
+  const paths = evidencePaths(manifest, scanId);
   vars._scan_id = scanId;
-  vars._output_file = `/tmp/toolclad-${scanId}-output`;
-  vars._evidence_dir =
-    process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
+  vars._output_file = paths.outputFile;
+  vars._evidence_dir = paths.evidenceDir;
 
   const multi = Object.create(null);
   if (command.mappings) {
@@ -577,7 +856,7 @@ function resolveContext(manifest, args) {
   }
 
   const userArgs = new Set(Object.keys(argDefs));
-  return { resolvedArgs, vars, multi, userArgs, execMode };
+  return { resolvedArgs, vars, multi, userArgs, execMode, scanId, paths };
 }
 
 /**
@@ -587,9 +866,11 @@ function resolveContext(manifest, args) {
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {{ argv: string[], resolvedArgs: object }}
+ * @param {object} [opts]
+ * @param {string} [opts.scanId] - The invocation's scan id (generated when absent)
+ * @returns {{ argv: string[], resolvedArgs: object, scanId: string, paths: object }}
  */
-export function buildCommandArgv(manifest, args) {
+export function buildCommandArgv(manifest, args, opts = {}) {
   compileCommand(manifest);
   const command = manifest.command;
   const execArray = command.exec;
@@ -597,7 +878,7 @@ export function buildCommandArgv(manifest, args) {
     throw new Error("Manifest has no exec array");
   }
 
-  const ctx = resolveContext(manifest, args);
+  const ctx = resolveContext(manifest, args, opts);
   const argv = substituteTokens(execArray, ctx.vars, ctx.multi, {
     userArgs: ctx.userArgs,
     endOfOptions: command.end_of_options === "--",
@@ -608,7 +889,7 @@ export function buildCommandArgv(manifest, args) {
     throw new Error("exec array produced empty argv");
   }
 
-  return { argv, resolvedArgs: ctx.resolvedArgs };
+  return { argv, resolvedArgs: ctx.resolvedArgs, scanId: ctx.scanId, paths: ctx.paths };
 }
 
 /**
@@ -617,29 +898,36 @@ export function buildCommandArgv(manifest, args) {
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {{ command: string, argv: string[], resolvedArgs: object, isExecutor: boolean }}
+ * @param {object} [opts]
+ * @param {string} [opts.scanId] - The invocation's scan id (generated when absent)
+ * @returns {{ command: string, argv: string[], resolvedArgs: object, isExecutor: boolean, scanId: string, paths: object }}
  */
-export function buildCommand(manifest, args) {
+export function buildCommand(manifest, args, opts = {}) {
   compileCommand(manifest);
   const command = manifest.command;
 
   // Escape hatch: a wrapper script receives validated args via env vars.
   if (command.executor) {
     const resolvedArgs = resolveArgs(manifest, args, false);
+    const scanId = opts.scanId || newScanId();
     return {
       command: command.executor,
       argv: [command.executor],
       resolvedArgs,
       isExecutor: true,
+      scanId,
+      paths: evidencePaths(manifest, scanId),
     };
   }
 
-  const { argv, resolvedArgs } = buildCommandArgv(manifest, args);
+  const { argv, resolvedArgs, scanId, paths } = buildCommandArgv(manifest, args, opts);
   return {
     command: argv.join(" "),
     argv,
     resolvedArgs,
     isExecutor: false,
+    scanId,
+    paths,
   };
 }
 
@@ -675,18 +963,20 @@ function interpolate(template, context) {
  * @returns {{ url: string, headers: object, body: string|undefined }}
  */
 function buildHttpRequest(httpDef, context, bodyContext) {
-  const url = interpolate(injectTemplateVars(httpDef.url), context);
+  // One resolver per request: TOOLCLAD_SECRETS_FILE is read at most once.
+  const secret = makeSecretResolver();
+  const url = interpolate(injectTemplateVars(httpDef.url, secret), context);
 
   const headers = {};
   if (httpDef.headers) {
     for (const [key, val] of Object.entries(httpDef.headers)) {
-      headers[key] = interpolate(injectTemplateVars(String(val)), context);
+      headers[key] = interpolate(injectTemplateVars(String(val), secret), context);
     }
   }
 
   let body = undefined;
   if (httpDef.body_template) {
-    body = interpolate(injectTemplateVars(httpDef.body_template), bodyContext);
+    body = interpolate(injectTemplateVars(httpDef.body_template, secret), bodyContext);
   }
 
   return { url, headers, body };
@@ -722,15 +1012,17 @@ function evaluateSingleCondition(expr, context) {
 
 /**
  * Execute a tool using its manifest and supplied arguments.
- * Validates args, builds argv, spawns process, wraps output in evidence envelope.
+ * Validates args, builds argv, spawns the process, and wraps its output in an
+ * evidence envelope. Asynchronous: the deadline is enforced by a timer and a
+ * process-group kill, which a synchronous spawn cannot do.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
  * @param {object} [options] - Execution options
  * @param {boolean} [options.dryRun=false] - If true, build command but don't execute
- * @returns {object} Evidence envelope with results
+ * @returns {Promise<object>} Evidence envelope with results
  */
-export function execute(manifest, args, options = {}) {
+export async function execute(manifest, args, options = {}) {
   // Gate unimplemented modes
   if (manifest.session) {
     throw new Error(
@@ -743,9 +1035,9 @@ export function execute(manifest, args, options = {}) {
     );
   }
 
-  // Route to HTTP backend (synchronous via curl)
+  // Route to the HTTP backend (fetch).
   if (manifest.http) {
-    return executeHttpSync(manifest, args, options);
+    return executeHttp(manifest, args, options);
   }
 
   // Route to MCP proxy backend
@@ -754,15 +1046,14 @@ export function execute(manifest, args, options = {}) {
   }
 
   compileCommand(manifest);
-  const built = buildCommand(manifest, args);
-  const cmdParts = built.argv;
-  const commandDisplay = built.command;
-  const resolvedArgs = built.resolvedArgs;
-  const isExecutor = built.isExecutor;
+  const timeoutMs = timeoutSeconds(manifest) * 1000;
+  const built = buildCommand(manifest, args, { scanId: newScanId() });
+  const { argv: cmdParts, command: commandDisplay, resolvedArgs, isExecutor, scanId, paths } = built;
 
   if (options.dryRun) {
     return {
       status: "dry_run",
+      scan_id: scanId,
       tool: manifest.tool.name,
       command: commandDisplay,
       argv: cmdParts,
@@ -770,59 +1061,62 @@ export function execute(manifest, args, options = {}) {
     };
   }
 
-  const timeoutMs = (manifest.tool.timeout_seconds || 30) * 1000;
-  const startTime = Date.now();
+  // Evidence root, output directory and per-invocation scratch cwd, all 0700
+  // and created before the spawn. The output file is pre-created 0600 with
+  // O_EXCL so the tool writes into a private file and a planted symlink
+  // cannot redirect it (Node cannot set a umask for the child; this is the
+  // substitute for the output file).
+  ensurePrivateDir(paths.evidenceDir);
+  ensurePrivateDir(paths.outputDir);
+  createPrivateFile(paths.outputFile);
+  const workDir = join(paths.evidenceDir, `${scanId}-work`);
+  ensurePrivateDir(workDir);
 
-  let result;
-
+  let env;
   if (isExecutor) {
-    // Escape hatch: pass validated args as env vars
-    const env = { ...process.env };
+    // Escape hatch: validated args reach the wrapper as environment
+    // variables. buildChildEnv drops TOOLCLAD_SECRET_* regardless.
+    const extra = {};
     for (const [key, val] of Object.entries(resolvedArgs)) {
-      env[`TOOLCLAD_ARG_${key.toUpperCase()}`] = String(val);
+      extra[`TOOLCLAD_ARG_${key.toUpperCase()}`] = String(val);
     }
-    env.TOOLCLAD_SCAN_ID = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
-    env.TOOLCLAD_EVIDENCE_DIR =
-      process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
-
-    result = spawnSync(cmdParts[0], cmdParts.slice(1), {
-      shell: false,
-      timeout: timeoutMs,
-      detached: true,
-      env,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    extra.TOOLCLAD_SCAN_ID = scanId;
+    extra.TOOLCLAD_TOOL_NAME = manifest.tool.name;
+    extra.TOOLCLAD_EVIDENCE_DIR = paths.evidenceDir;
+    extra.TOOLCLAD_OUTPUT_DIR = paths.outputDir;
+    env = buildChildEnv(extra);
   } else {
-    result = spawnSync(cmdParts[0], cmdParts.slice(1), {
-      shell: false,
-      timeout: timeoutMs,
-      detached: true,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    env = buildChildEnv();
   }
 
-  // On timeout, kill the entire process group.
-  if (result.signal === "SIGTERM" && result.pid) {
+  const binary = resolveBinary(cmdParts[0]);
+  const startTime = Date.now();
+  let result;
+  try {
+    result = await runWithDeadline(binary, cmdParts.slice(1), {
+      env,
+      cwd: workDir,
+      timeoutMs,
+      graceMs: killGraceMs(),
+    });
+  } finally {
+    // Remove the scratch directory only when empty: anything the tool wrote
+    // there is evidence.
     try {
-      process.kill(-result.pid, "SIGKILL");
+      rmdirSync(workDir);
     } catch {
-      // Process group may already be gone.
+      // Not empty (or already gone): keep it.
     }
   }
 
   const durationMs = Date.now() - startTime;
-  const stdout = result.stdout || "";
-  const stderr = result.stderr || "";
-  const exitCode = result.status;
-
-  const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
+  const { stdout, stderr, timedOut } = result;
+  const exitCode = timedOut ? -1 : result.exitCode;
   const outputHash = createHash("sha256").update(stdout).digest("hex");
 
   // Build evidence envelope with exit_code and stderr on all paths.
   const envelope = {
-    status: exitCode === 0 ? "success" : "error",
+    status: timedOut ? "timeout" : exitCode === 0 ? "success" : "error",
     scan_id: scanId,
     tool: manifest.tool.name,
     command: commandDisplay,
@@ -833,7 +1127,10 @@ export function execute(manifest, args, options = {}) {
     output_hash: `sha256:${outputHash}`,
   };
 
-  if (exitCode !== 0) {
+  if (timedOut) {
+    envelope.error = `Process timed out after ${timeoutMs / 1000}s`;
+    envelope.results = { raw_output: stdout };
+  } else if (exitCode !== 0) {
     envelope.error = stderr || `Process exited with code ${exitCode}`;
     envelope.results = { raw_output: stdout };
   } else {
@@ -841,6 +1138,109 @@ export function execute(manifest, args, options = {}) {
   }
 
   return envelope;
+}
+
+/**
+ * Removed synchronous entry point. Throws so a caller still using it fails
+ * loudly instead of silently getting the old, unenforceable timeout.
+ */
+export function executeSync() {
+  throw new Error("executeSync was removed: execute() is async; await execute(...)");
+}
+
+/**
+ * Spawn `binary` with `args` in its own process group and enforce a deadline.
+ *
+ * stdin is /dev/null; stdout and stderr are captured up to MAX_CAPTURE_BYTES
+ * each (appending stops at the cap). On the deadline: SIGTERM to the group,
+ * then SIGKILL to the group after `graceMs`; resolves on `close`, keeping
+ * whatever output was captured before the kill.
+ *
+ * Node cannot set a umask or resource limits for a child process portably
+ * (there is no pre-exec hook), so neither is applied here; the Rust and
+ * Python runtimes set them.
+ *
+ * @returns {Promise<{ stdout: string, stderr: string, exitCode: number|null, signal: string|null, timedOut: boolean }>}
+ */
+function runWithDeadline(binary, args, { env, cwd, timeoutMs, graceMs }) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(binary, args, {
+        shell: false,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+        cwd,
+      });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const capture = (stream) => {
+      const chunks = [];
+      let size = 0;
+      stream.on("data", (chunk) => {
+        if (size >= MAX_CAPTURE_BYTES) return;
+        const room = MAX_CAPTURE_BYTES - size;
+        const piece = chunk.length > room ? chunk.subarray(0, room) : chunk;
+        chunks.push(piece);
+        size += piece.length;
+      });
+      return chunks;
+    };
+    const outChunks = capture(child.stdout);
+    const errChunks = capture(child.stderr);
+
+    const killGroup = (signal) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        // The group is already gone.
+      }
+    };
+
+    let timedOut = false;
+    let graceTimer = null;
+    // The kill is cleanup, not containment: a child that calls setsid()
+    // leaves the process group and escapes both signals in every language.
+    // Escape-proof cleanup needs a cgroup, which is out of scope here.
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      killGroup("SIGTERM");
+      graceTimer = setTimeout(() => {
+        killGroup("SIGKILL");
+        // A process outside the group may still hold the pipes open; stop
+        // waiting on them so `close` fires and the call returns.
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, graceMs);
+    }, timeoutMs);
+
+    child.on("error", (err) => {
+      clearTimeout(deadline);
+      if (graceTimer) clearTimeout(graceTimer);
+      reject(err);
+    });
+
+    child.on("close", (code, signal) => {
+      clearTimeout(deadline);
+      if (timedOut && graceTimer) {
+        // The direct child is gone, but group members that ignored SIGTERM
+        // may remain: kill the group now rather than waiting out the grace.
+        clearTimeout(graceTimer);
+        killGroup("SIGKILL");
+      }
+      resolve({
+        stdout: Buffer.concat(outChunks).toString("utf-8"),
+        stderr: Buffer.concat(errChunks).toString("utf-8"),
+        exitCode: code,
+        signal,
+        timedOut,
+      });
+    });
+  });
 }
 
 /**
@@ -1056,7 +1456,7 @@ function parseXmlToJson(xml) {
  * @param {boolean} [options.dryRun=false] - If true, build request but don't execute
  * @returns {object} Evidence envelope with http_status
  */
-function executeHttpSync(manifest, args, options = {}) {
+export function executeHttpSync(manifest, args, options = {}) {
   const httpDef = manifest.http;
   if (!httpDef || !httpDef.url) {
     throw new Error("Manifest missing [http] section or http.url");
@@ -1079,7 +1479,7 @@ function executeHttpSync(manifest, args, options = {}) {
   const { url, headers, body } = buildHttpRequest(httpDef, context, escaped);
 
   const method = (httpDef.method || "GET").toUpperCase();
-  const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
+  const scanId = newScanId();
 
   if (options.dryRun) {
     return {
@@ -1104,7 +1504,7 @@ function executeHttpSync(manifest, args, options = {}) {
   if (body && method !== "GET" && method !== "HEAD") {
     curlArgs.push("-d", body);
   }
-  const timeout = manifest.tool.timeout_seconds || 30;
+  const timeout = timeoutSeconds(manifest);
   curlArgs.push("--max-time", String(timeout));
   curlArgs.push(url);
 
@@ -1169,19 +1569,29 @@ export async function executeHttp(manifest, args, options = {}) {
 
   // See executeHttpSync: in-memory [http] manifests are linted here.
   lintNetworkEgress(manifest);
+  const timeoutMs = timeoutSeconds(manifest) * 1000;
   const resolvedArgs = resolveArgs(manifest, args);
   const context = { ...resolvedArgs };
 
+  // JSON-escape values for safe interpolation into body templates.
+  const escaped = {};
+  for (const [k, v] of Object.entries(context)) {
+    escaped[k] = JSON.stringify(String(v)).slice(1, -1);
+  }
+
   // Secrets are expanded on the template before any argument is
   // interpolated (TC-7); see buildHttpRequest.
-  const { url, headers, body } = buildHttpRequest(httpDef, context, context);
+  const { url, headers, body } = buildHttpRequest(httpDef, context, escaped);
 
   const method = (httpDef.method || "GET").toUpperCase();
+  const scanId = newScanId();
 
   if (options.dryRun) {
     return {
       status: "dry_run",
+      scan_id: scanId,
       tool: manifest.tool.name,
+      command: `${method} ${url}`,
       http_method: method,
       http_url: url,
       http_headers: headers,
@@ -1191,9 +1601,8 @@ export async function executeHttp(manifest, args, options = {}) {
   }
 
   const startTime = Date.now();
-  const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
 
-  const fetchOptions = { method, headers };
+  const fetchOptions = { method, headers, signal: AbortSignal.timeout(timeoutMs) };
   if (body && method !== "GET" && method !== "HEAD") {
     fetchOptions.body = body;
   }
@@ -1256,7 +1665,7 @@ export function executeMcp(manifest, args) {
   }
 
   const startTime = Date.now();
-  const scanId = `${Math.floor(startTime / 1000)}-${randomBytes(2).toString("hex")}`;
+  const scanId = newScanId();
 
   return {
     status: "delegation_preview",

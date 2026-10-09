@@ -49,14 +49,14 @@ const BLOCKED_BY_POLICY = /\(blocked by block_internal policy\)$/;
 // ---------------------------------------------------------------------------
 
 describe("hostpolicy - strict IPv4 parsing", () => {
-  it("parses canonical dotted-quad to a 32-bit integer", () => {
+  it("parses canonical dotted-quad to a 32-bit integer", async () => {
     assert.equal(parseIpv4("1.2.3.4"), 0x01020304);
     assert.equal(parseIpv4("0.0.0.0"), 0);
     assert.equal(parseIpv4("255.255.255.255"), 0xffffffff);
     assert.equal(parseIpv4("127.0.0.1"), 0x7f000001);
   });
 
-  it("rejects every non-canonical encoding a resolver would expand", () => {
+  it("rejects every non-canonical encoding a resolver would expand", async () => {
     for (const v of [
       "01.2.3.4",
       "1.2.3.04",
@@ -77,7 +77,7 @@ describe("hostpolicy - strict IPv4 parsing", () => {
 });
 
 describe("hostpolicy - strict IPv6 parsing", () => {
-  it("parses standard forms to eight 16-bit groups", () => {
+  it("parses standard forms to eight 16-bit groups", async () => {
     assert.deepEqual(parseIpv6("::1"), [0, 0, 0, 0, 0, 0, 0, 1]);
     assert.deepEqual(parseIpv6("::"), [0, 0, 0, 0, 0, 0, 0, 0]);
     assert.deepEqual(parseIpv6("1:2:3:4:5:6:7:8"), [1, 2, 3, 4, 5, 6, 7, 8]);
@@ -90,7 +90,7 @@ describe("hostpolicy - strict IPv6 parsing", () => {
     );
   });
 
-  it("accepts a dotted-quad IPv4 only as the closing groups", () => {
+  it("accepts a dotted-quad IPv4 only as the closing groups", async () => {
     assert.deepEqual(parseIpv6("::ffff:1.2.3.4"), [0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304]);
     assert.deepEqual(parseIpv6("::1.2.3.4"), [0, 0, 0, 0, 0, 0, 0x0102, 0x0304]);
     assert.deepEqual(parseIpv6("1:2:3:4:5:6:1.2.3.4"), [1, 2, 3, 4, 5, 6, 0x0102, 0x0304]);
@@ -100,7 +100,7 @@ describe("hostpolicy - strict IPv6 parsing", () => {
     assert.equal(parseIpv6("1:2:3:4:5:6:7:1.2.3.4"), null);
   });
 
-  it("rejects malformed, bracketed, zoned and loose forms", () => {
+  it("rejects malformed, bracketed, zoned and loose forms", async () => {
     for (const v of [
       "1::2::3",
       "1:::2",
@@ -118,14 +118,14 @@ describe("hostpolicy - strict IPv6 parsing", () => {
     }
   });
 
-  it("parseCanonicalIp tags the family", () => {
+  it("parseCanonicalIp tags the family", async () => {
     assert.deepEqual(parseCanonicalIp("10.0.0.5"), { family: 4, addr: 0x0a000005 });
     assert.deepEqual(parseCanonicalIp("::1"), { family: 6, groups: [0, 0, 0, 0, 0, 0, 0, 1] });
     assert.equal(parseCanonicalIp("cafe"), null);
     assert.equal(parseCanonicalIp("127.1"), null);
   });
 
-  it("unwraps IPv4-mapped IPv6 and nothing else", () => {
+  it("unwraps IPv4-mapped IPv6 and nothing else", async () => {
     assert.deepEqual(toIpv4Mapped(parseCanonicalIp("::ffff:169.254.169.254")), {
       family: 4,
       addr: 0xa9fea9fe,
@@ -136,19 +136,19 @@ describe("hostpolicy - strict IPv6 parsing", () => {
 });
 
 describe("hostpolicy - CIDR parsing and containment", () => {
-  it("parses a canonical base with an in-bounds prefix", () => {
+  it("parses a canonical base with an in-bounds prefix", async () => {
     assert.deepEqual(parseCidr("10.0.0.0/8"), { ip: { family: 4, addr: 0x0a000000 }, prefix: 8 });
     assert.equal(parseCidr("::/0").prefix, 0);
     assert.equal(parseCidr("2001:db8::/32").prefix, 32);
   });
 
-  it("rejects a non-canonical base or an out-of-bounds prefix", () => {
+  it("rejects a non-canonical base or an out-of-bounds prefix", async () => {
     for (const v of ["10.0.0.0/33", "::/129", "0177.0.0.1/8", "10.0.0.0/", "10.0.0.0/x", "10.0.0.0", "127.1/8"]) {
       assert.equal(parseCidr(v), null, v);
     }
   });
 
-  it("tests containment at every prefix boundary", () => {
+  it("tests containment at every prefix boundary", async () => {
     const inRange = (ip, cidr) => ipInRange(parseCanonicalIp(ip), parseCidr(cidr));
     assert.equal(inRange("172.31.255.255", "172.16.0.0/12"), true);
     assert.equal(inRange("172.32.0.0", "172.16.0.0/12"), false);
@@ -177,14 +177,14 @@ describe("hostpolicy - CIDR parsing and containment", () => {
 // ---------------------------------------------------------------------------
 
 describe("hostpolicy - range table", () => {
-  it("always-blocked rows are exactly the link-local ranges", () => {
+  it("always-blocked rows are exactly the link-local ranges", async () => {
     assert.deepEqual(
       ALWAYS_BLOCKED_RANGES.map(([cidr]) => cidr),
       ["169.254.0.0/16", "fe80::/10"]
     );
   });
 
-  it("block_internal rows match the normative table, in order", () => {
+  it("block_internal rows match the normative table, in order", async () => {
     assert.deepEqual(
       BLOCK_INTERNAL_RANGES.map(([cidr]) => cidr),
       [
@@ -209,7 +209,7 @@ describe("hostpolicy - range table", () => {
     );
   });
 
-  it("always-blocked reasons, with and without the v4-mapped wrapper", () => {
+  it("always-blocked reasons, with and without the v4-mapped wrapper", async () => {
     const reason = (ip) => alwaysBlockedIpReason(parseCanonicalIp(ip));
     assert.equal(
       reason("169.254.169.254"),
@@ -225,7 +225,7 @@ describe("hostpolicy - range table", () => {
     assert.equal(reason("93.184.216.34"), null);
   });
 
-  it("block_internal reasons use the shared wording", () => {
+  it("block_internal reasons use the shared wording", async () => {
     const reason = (ip) => nonPublicIpReason(parseCanonicalIp(ip));
     assert.equal(reason("127.0.0.1"), "resolves to a loopback address");
     assert.equal(reason("127.255.255.255"), "resolves to a loopback address");
@@ -258,7 +258,7 @@ describe("hostpolicy - range table", () => {
     assert.equal(reason("::ffff:93.184.216.34"), null);
   });
 
-  it("enforceIpPolicy formats the two message shapes", () => {
+  it("enforceIpPolicy formats the two message shapes", async () => {
     assert.throws(
       () => enforceIpPolicy(parseCanonicalIp("169.254.169.254"), false),
       /^Error: target is a link-local \/ cloud-metadata address \(169\.254\.0\.0\/16\) — always blocked$/
@@ -273,7 +273,7 @@ describe("hostpolicy - range table", () => {
 });
 
 describe("hostpolicy - literal and label helpers", () => {
-  it("looksLikeIpLiteral flags hex, integer, octal and shorthand forms", () => {
+  it("looksLikeIpLiteral flags hex, integer, octal and shorthand forms", async () => {
     for (const v of ["2130706433", "0x7f000001", "0X7F000001", "0177.0.0.1", "127.1", "1.2.3.4.5", "999.999.999.999"]) {
       assert.equal(looksLikeIpLiteral(v), true, v);
     }
@@ -282,7 +282,7 @@ describe("hostpolicy - literal and label helpers", () => {
     }
   });
 
-  it("hasPunycodeLabel is case-insensitive per label", () => {
+  it("hasPunycodeLabel is case-insensitive per label", async () => {
     assert.equal(hasPunycodeLabel("xn--example-9c.com"), true);
     assert.equal(hasPunycodeLabel("sub.XN--example-9c.com"), true);
     assert.equal(hasPunycodeLabel("example.com"), false);
@@ -404,13 +404,13 @@ describe("validateArg - url: shared injection vectors", () => {
 });
 
 describe("validateArg - url: structure", () => {
-  it("requires scheme://", () => {
+  it("requires scheme://", async () => {
     assert.throws(() => validateArg({ type: "url" }, "example.com/path"), /Invalid URL/);
     assert.throws(() => validateArg({ type: "url" }, "mailto:root"), /Invalid URL/);
     assert.throws(() => validateArg({ type: "url" }, "https:/example.com"), /Invalid URL/);
   });
 
-  it("scheme allowlist is case-insensitive and defaults to http/https", () => {
+  it("scheme allowlist is case-insensitive and defaults to http/https", async () => {
     assert.equal(validateArg({ type: "url" }, "HTTPS://example.com/"), "HTTPS://example.com/");
     assert.equal(validateArg({ type: "url", schemes: [] }, "http://example.com/"), "http://example.com/");
     assert.equal(validateArg({ type: "url", schemes: ["HTTPS"] }, "https://example.com/"), "https://example.com/");
@@ -424,7 +424,7 @@ describe("validateArg - url: structure", () => {
     );
   });
 
-  it("denied schemes stay denied even when a manifest lists them", () => {
+  it("denied schemes stay denied even when a manifest lists them", async () => {
     for (const [scheme, value] of [
       ["ftp", "ftp://example.com/pub"],
       ["gopher", "gopher://example.com/"],
@@ -446,7 +446,7 @@ describe("validateArg - url: structure", () => {
     );
   });
 
-  it("rejects userinfo in any position of the authority", () => {
+  it("rejects userinfo in any position of the authority", async () => {
     assert.throws(
       () => validateArg({ type: "url" }, "https://example.com@evil.example/"),
       /URL must not contain userinfo/
@@ -457,13 +457,13 @@ describe("validateArg - url: structure", () => {
     );
   });
 
-  it("rejects an empty host", () => {
+  it("rejects an empty host", async () => {
     for (const v of ["https://", "https:///x", "https://?q=1", "https://:8443/"]) {
       assert.throws(() => validateArg({ type: "url" }, v), /URL host must not be empty/, v);
     }
   });
 
-  it("accepts an explicit port in range and rejects one out of range", () => {
+  it("accepts an explicit port in range and rejects one out of range", async () => {
     assert.equal(validateArg({ type: "url" }, "https://example.com:8443/x"), "https://example.com:8443/x");
     assert.equal(validateArg({ type: "url" }, "https://example.com:65535"), "https://example.com:65535");
     for (const v of [
@@ -478,7 +478,7 @@ describe("validateArg - url: structure", () => {
     }
   });
 
-  it("accepts a host without a path and with a query", () => {
+  it("accepts a host without a path and with a query", async () => {
     assert.equal(validateArg({ type: "url" }, "https://example.com"), "https://example.com");
     assert.equal(validateArg({ type: "url" }, "https://example.com?q=1"), "https://example.com?q=1");
     assert.equal(
@@ -493,7 +493,7 @@ describe("validateArg - url: structure", () => {
     );
   });
 
-  it("rejects non-canonical IP literal hosts instead of resolving them", () => {
+  it("rejects non-canonical IP literal hosts instead of resolving them", async () => {
     for (const v of ["http://0x7f000001/", "http://2130706433/", "http://0177.0.0.1/", "http://127.1/", "http://169.254.169.254.0/"]) {
       assert.throws(
         () => validateArg({ type: "url" }, v),
@@ -503,7 +503,7 @@ describe("validateArg - url: structure", () => {
     }
   });
 
-  it("rejects punycode and malformed hostnames", () => {
+  it("rejects punycode and malformed hostnames", async () => {
     assert.throws(
       () => validateArg({ type: "url" }, "https://xn--example-9c.com/"),
       /URL host must not contain punycode \(xn--\) labels/
@@ -513,14 +513,14 @@ describe("validateArg - url: structure", () => {
     }
   });
 
-  it("returns the value untouched — no WHATWG normalization", () => {
+  it("returns the value untouched — no WHATWG normalization", async () => {
     const v = "HTTPS://Example.COM:8443/Path/../x?Q=1";
     assert.equal(validateArg({ type: "url" }, v), v);
   });
 });
 
 describe("validateArg - url: host policy", () => {
-  it("link-local is blocked with block_internal on and off", () => {
+  it("link-local is blocked with block_internal on and off", async () => {
     for (const blockInternal of [true, false]) {
       assert.throws(
         () => validateArg({ type: "url", block_internal: blockInternal }, "http://169.254.169.254/latest/meta-data/"),
@@ -533,7 +533,7 @@ describe("validateArg - url: host policy", () => {
     }
   });
 
-  it("the IPv4-mapped IMDS spelling is refused on a url in both modes", () => {
+  it("the IPv4-mapped IMDS spelling is refused on a url in both modes", async () => {
     for (const blockInternal of [true, false]) {
       assert.throws(
         () => validateArg({ type: "url", block_internal: blockInternal }, "http://[::ffff:169.254.169.254]/latest/"),
@@ -542,7 +542,7 @@ describe("validateArg - url: host policy", () => {
     }
   });
 
-  it("block_internal rejects loopback and private literals", () => {
+  it("block_internal rejects loopback and private literals", async () => {
     const def = { type: "url", block_internal: true };
     assert.throws(() => validateArg(def, "http://127.0.0.1/"), /target resolves to a loopback address \(blocked by block_internal policy\)/);
     assert.throws(() => validateArg(def, "http://10.0.0.5:8080/admin"), /target resolves to a private address \(blocked by block_internal policy\)/);
@@ -559,12 +559,12 @@ describe("validateArg - url: host policy", () => {
     );
   });
 
-  it("block_internal is opt-in: loopback passes without it", () => {
+  it("block_internal is opt-in: loopback passes without it", async () => {
     assert.equal(validateArg({ type: "url" }, "http://127.0.0.1:8080/"), "http://127.0.0.1:8080/");
     assert.equal(validateArg({ type: "url", block_internal: false }, "http://10.0.0.5/"), "http://10.0.0.5/");
   });
 
-  it("a custom type with base url carries block_internal", () => {
+  it("a custom type with base url carries block_internal", async () => {
     const types = { web: { base: "url" } };
     assert.throws(
       () => validateArgWithCustomTypes({ type: "web", block_internal: true }, "http://127.0.0.1/", types),
@@ -578,12 +578,12 @@ describe("validateArg - url: host policy", () => {
 });
 
 describe("url structural helpers", () => {
-  it("splitUrlScheme lowercases the scheme only", () => {
+  it("splitUrlScheme lowercases the scheme only", async () => {
     assert.deepEqual(splitUrlScheme("HTTPS://Example.com/P"), { scheme: "https", rest: "Example.com/P" });
     assert.throws(() => splitUrlScheme("javascript:alert(1)"), /Invalid URL/);
   });
 
-  it("parseUrlAuthority unwraps a bracketed IPv6 literal and splits the port", () => {
+  it("parseUrlAuthority unwraps a bracketed IPv6 literal and splits the port", async () => {
     assert.deepEqual(parseUrlAuthority("[::1]:8080/"), { host: "::1", port: 8080, bracketed: true });
     assert.deepEqual(parseUrlAuthority("[fe80::1]"), { host: "fe80::1", port: null, bracketed: true });
     assert.deepEqual(parseUrlAuthority("[::ffff:169.254.169.254]/x"), {
@@ -596,7 +596,7 @@ describe("url structural helpers", () => {
     assert.deepEqual(parseUrlAuthority("example.com#a@b"), { host: "example.com", port: null, bracketed: false });
   });
 
-  it("parseUrlAuthority refuses malformed brackets, userinfo and bad ports", () => {
+  it("parseUrlAuthority refuses malformed brackets, userinfo and bad ports", async () => {
     assert.throws(() => parseUrlAuthority("[::1"), /unterminated IPv6 bracket/);
     assert.throws(() => parseUrlAuthority("[cafe]/"), /not a canonical IPv6 literal/);
     assert.throws(() => parseUrlAuthority("[::1]x/"), /Invalid URL authority/);
@@ -608,7 +608,7 @@ describe("url structural helpers", () => {
     assert.throws(() => parseUrlAuthority("/path"), /URL host must not be empty/);
   });
 
-  it("the unwrapped bracket host goes through the same policy", () => {
+  it("the unwrapped bracket host goes through the same policy", async () => {
     const { host } = parseUrlAuthority("[::1]:8080/");
     assert.throws(() => enforceIpPolicy(parseCanonicalIp(host), true), BLOCKED_BY_POLICY);
     const imds = parseUrlAuthority("[::ffff:169.254.169.254]/").host;
@@ -621,7 +621,7 @@ describe("url structural helpers", () => {
 // ---------------------------------------------------------------------------
 
 describe("validateArg - scope_target: strict literals and policy", () => {
-  it("block_internal rejects the non-public literals", () => {
+  it("block_internal rejects the non-public literals", async () => {
     const def = { type: "scope_target", block_internal: true };
     assert.throws(() => validateArg(def, "10.0.0.5"), /target resolves to a private address \(blocked by block_internal policy\)/);
     assert.throws(() => validateArg(def, "192.168.1.1"), /target resolves to a private address \(blocked by block_internal policy\)/);
@@ -633,12 +633,12 @@ describe("validateArg - scope_target: strict literals and policy", () => {
     assert.equal(validateArg(def, "2606:2800:220:1:248:1893:25c8:1946"), "2606:2800:220:1:248:1893:25c8:1946");
   });
 
-  it("block_internal is opt-in for scope_target", () => {
+  it("block_internal is opt-in for scope_target", async () => {
     assert.equal(validateArg({ type: "scope_target" }, "10.0.0.5"), "10.0.0.5");
     assert.equal(validateArg({ type: "scope_target" }, "::1"), "::1");
   });
 
-  it("link-local is always blocked, in both address families and the mapped form", () => {
+  it("link-local is always blocked, in both address families and the mapped form", async () => {
     for (const blockInternal of [true, false]) {
       const def = { type: "scope_target", block_internal: blockInternal };
       assert.throws(() => validateArg(def, "169.254.169.254"), ALWAYS_BLOCKED_V4);
@@ -647,7 +647,7 @@ describe("validateArg - scope_target: strict literals and policy", () => {
     }
   });
 
-  it("rejects non-canonical IP literals instead of passing them as hostnames", () => {
+  it("rejects non-canonical IP literals instead of passing them as hostnames", async () => {
     for (const v of ["999.999.999.999", "0177.0.0.1", "2130706433", "0x7f000001", "127.1", "01.2.3.4", "1.2.3.4.5"]) {
       assert.throws(
         () => validateArg({ type: "scope_target" }, v),
@@ -657,14 +657,14 @@ describe("validateArg - scope_target: strict literals and policy", () => {
     }
   });
 
-  it("a hex-looking word is a hostname, not an IPv6 literal", () => {
+  it("a hex-looking word is a hostname, not an IPv6 literal", async () => {
     assert.equal(validateArg({ type: "scope_target" }, "cafe"), "cafe");
     assert.equal(validateArg({ type: "scope_target" }, "cafe::1"), "cafe::1");
     assert.throws(() => validateArg({ type: "scope_target" }, "cafe:1"), /Invalid scope_target/);
     assert.throws(() => validateArg({ type: "scope_target" }, "1:2:3:4:5:6:7:8:9"), /Invalid scope_target/);
   });
 
-  it("CIDR base addresses are range-checked under policy", () => {
+  it("CIDR base addresses are range-checked under policy", async () => {
     assert.equal(validateArg({ type: "scope_target" }, "10.0.0.0/8"), "10.0.0.0/8");
     assert.throws(() => validateArg({ type: "scope_target", block_internal: true }, "10.0.0.0/8"), BLOCKED_BY_POLICY);
     assert.throws(() => validateArg({ type: "scope_target", block_internal: true }, "fc00::/7"), BLOCKED_BY_POLICY);
@@ -673,14 +673,14 @@ describe("validateArg - scope_target: strict literals and policy", () => {
     assert.equal(validateArg({ type: "scope_target", block_internal: true }, "93.184.216.0/24"), "93.184.216.0/24");
   });
 
-  it("CIDR shapes are parsed strictly", () => {
+  it("CIDR shapes are parsed strictly", async () => {
     for (const v of ["999.0.0.0/8", "10.0.0.0/33", "0177.0.0.1/8", "::/129", "127.1/8"]) {
       assert.throws(() => validateArg({ type: "scope_target" }, v), /Invalid scope_target/, v);
     }
     assert.throws(() => validateArg({ type: "scope_target" }, "example.com/24"), /must not contain '\/'/);
   });
 
-  it("rejects a DNS label over 63 octets and a numeric TLD", () => {
+  it("rejects a DNS label over 63 octets and a numeric TLD", async () => {
     assert.throws(
       () => validateArg({ type: "scope_target" }, `${"a".repeat(64)}.example.com`),
       /DNS label exceeding 63 octets/
@@ -694,7 +694,7 @@ describe("validateArg - scope_target: strict literals and policy", () => {
 });
 
 describe("validateArg - ip_address and cidr: policy", () => {
-  it("ip_address applies the always-blocked and block_internal tables", () => {
+  it("ip_address applies the always-blocked and block_internal tables", async () => {
     assert.throws(() => validateArg({ type: "ip_address" }, "169.254.169.254"), ALWAYS_BLOCKED_V4);
     assert.throws(() => validateArg({ type: "ip_address" }, "::ffff:169.254.169.254"), ALWAYS_BLOCKED_V4);
     assert.throws(() => validateArg({ type: "ip_address", block_internal: true }, "127.0.0.1"), BLOCKED_BY_POLICY);
@@ -703,7 +703,7 @@ describe("validateArg - ip_address and cidr: policy", () => {
     assert.equal(validateArg({ type: "ip_address", block_internal: true }, "93.184.216.34"), "93.184.216.34");
   });
 
-  it("ip_address accepts only canonical literals", () => {
+  it("ip_address accepts only canonical literals", async () => {
     assert.throws(() => validateArg({ type: "ip_address" }, "01.2.3.4"), /Invalid IPv4 address/);
     assert.throws(() => validateArg({ type: "ip_address" }, "0177.0.0.1"), /Invalid IPv4 address/);
     assert.throws(() => validateArg({ type: "ip_address" }, "127.1"), /Invalid IPv4 address/);
@@ -712,7 +712,7 @@ describe("validateArg - ip_address and cidr: policy", () => {
     assert.throws(() => validateArg({ type: "ip_address" }, "fe80::1%eth0"), /Invalid IP address/);
   });
 
-  it("cidr applies the policy to the base address and parses strictly", () => {
+  it("cidr applies the policy to the base address and parses strictly", async () => {
     assert.throws(() => validateArg({ type: "cidr" }, "169.254.0.0/16"), ALWAYS_BLOCKED_V4);
     assert.throws(() => validateArg({ type: "cidr", block_internal: true }, "127.0.0.0/8"), BLOCKED_BY_POLICY);
     assert.throws(() => validateArg({ type: "cidr", block_internal: true }, "::1/128"), BLOCKED_BY_POLICY);
@@ -744,7 +744,7 @@ exec = ["echo", "{target}"]
 format = "text"
 `;
 
-  it("defaults block_internal to false and reads an explicit true", () => {
+  it("defaults block_internal to false and reads an explicit true", async () => {
     const off = loadManifest(writeTmp(`${HEAD}
 [args.target]
 type = "scope_target"
@@ -763,7 +763,7 @@ ${TAIL}`));
     assert.equal(on.args.target.block_internal, true);
   });
 
-  it("rejects a non-boolean block_internal and a non-list schemes", () => {
+  it("rejects a non-boolean block_internal and a non-list schemes", async () => {
     assert.throws(
       () => loadManifest(writeTmp(`${HEAD}
 [args.target]
@@ -786,7 +786,7 @@ ${TAIL}`)),
     );
   });
 
-  it("block_internal from a loaded manifest reaches the validator", () => {
+  it("block_internal from a loaded manifest reaches the validator", async () => {
     const m = loadManifest(writeTmp(`${HEAD}
 [args.target]
 type = "scope_target"
@@ -794,13 +794,13 @@ required = true
 description = "t"
 block_internal = true
 ${TAIL}`));
-    assert.throws(() => execute(m, { target: "10.0.0.5" }, { dryRun: true }), BLOCKED_BY_POLICY);
-    assert.throws(() => execute(m, { target: "169.254.169.254" }, { dryRun: true }), ALWAYS_BLOCKED_V4);
-    const r = execute(m, { target: "93.184.216.34" }, { dryRun: true });
+    await assert.rejects(() => execute(m, { target: "10.0.0.5" }, { dryRun: true }), BLOCKED_BY_POLICY);
+    await assert.rejects(() => execute(m, { target: "169.254.169.254" }, { dryRun: true }), ALWAYS_BLOCKED_V4);
+    const r = await execute(m, { target: "93.184.216.34" }, { dryRun: true });
     assert.deepEqual(r.argv, ["echo", "93.184.216.34"]);
   });
 
-  it("the shipped curl_fetch-style url manifest honors block_internal", () => {
+  it("the shipped curl_fetch-style url manifest honors block_internal", async () => {
     const m = loadManifest(writeTmp(`${HEAD}
 [args.url]
 type = "url"
@@ -815,10 +815,10 @@ exec = ["echo", "{url}"]
 [output]
 format = "text"
 `));
-    assert.throws(() => execute(m, { url: "https://127.0.0.1/" }, { dryRun: true }), BLOCKED_BY_POLICY);
-    assert.throws(() => execute(m, { url: "http://93.184.216.34/" }, { dryRun: true }), /not in allowed schemes: \[https\]/);
-    assert.throws(() => execute(m, { url: "https://169.254.169.254/" }, { dryRun: true }), ALWAYS_BLOCKED_V4);
-    const r = execute(m, { url: "https://93.184.216.34/x" }, { dryRun: true });
+    await assert.rejects(() => execute(m, { url: "https://127.0.0.1/" }, { dryRun: true }), BLOCKED_BY_POLICY);
+    await assert.rejects(() => execute(m, { url: "http://93.184.216.34/" }, { dryRun: true }), /not in allowed schemes: \[https\]/);
+    await assert.rejects(() => execute(m, { url: "https://169.254.169.254/" }, { dryRun: true }), ALWAYS_BLOCKED_V4);
+    const r = await execute(m, { url: "https://93.184.216.34/x" }, { dryRun: true });
     assert.deepEqual(r.argv, ["echo", "https://93.184.216.34/x"]);
   });
 });
@@ -870,8 +870,8 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
     assert.equal(JSON.stringify(r).includes(SECRET), false);
   });
 
-  it("sync path: an argument value never expands a secret", () => {
-    const r = execute(smugglingManifest(echoEverywhere), { target: SMUGGLED }, { dryRun: true });
+  it("sync path: an argument value never expands a secret", async () => {
+    const r = await execute(smugglingManifest(echoEverywhere), { target: SMUGGLED }, { dryRun: true });
     assert.equal(r.status, "dry_run");
     assert.equal(r.command, `POST ${SMUGGLED}`);
     assert.equal(r.http_url, SMUGGLED);
@@ -892,7 +892,7 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
     assert.equal(asyncResult.http_url, expectedUrl);
     assert.equal(asyncResult.http_headers.Authorization, `Bearer ${SECRET}`);
     assert.equal(asyncResult.http_body, `{"q":"plain","k":"${SECRET}"}`);
-    const syncResult = execute(smugglingManifest(http), { target: "plain" }, { dryRun: true });
+    const syncResult = await execute(smugglingManifest(http), { target: "plain" }, { dryRun: true });
     assert.equal(syncResult.http_url, expectedUrl);
     assert.equal(syncResult.http_headers.Authorization, `Bearer ${SECRET}`);
     assert.equal(syncResult.http_body, `{"q":"plain","k":"${SECRET}"}`);
@@ -905,7 +905,7 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
       http: { method: "GET", url: "{target}" },
     };
     await assert.rejects(executeHttp(m, { target: SMUGGLED }, { dryRun: true }), /Injection detected/);
-    assert.throws(() => execute(m, { target: SMUGGLED }, { dryRun: true }), /Injection detected/);
+    await assert.rejects(() => execute(m, { target: SMUGGLED }, { dryRun: true }), /Injection detected/);
   });
 
   it("a secret the manifest references but the environment lacks is still an error", async () => {
@@ -914,7 +914,7 @@ describe("http backend - {_secret:…} ordering (TC-7)", () => {
       executeHttp(m, { target: "plain" }, { dryRun: true }),
       /Missing environment variable: TOOLCLAD_SECRET_MISSING_KEY/
     );
-    assert.throws(
+    await assert.rejects(
       () => execute(m, { target: "plain" }, { dryRun: true }),
       /Missing environment variable: TOOLCLAD_SECRET_MISSING_KEY/
     );

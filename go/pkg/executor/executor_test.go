@@ -767,7 +767,7 @@ func TestInjectedVars(t *testing.T) {
 	if argv[2] != dir {
 		t.Errorf("_evidence_dir = %q, want %q", argv[2], dir)
 	}
-	if want := filepath.Join(dir, argv[1]+"-output"); argv[3] != want {
+	if want := filepath.Join(dir, argv[1]+"-t", "scan.txt"); argv[3] != want {
 		t.Errorf("_output_file = %q, want %q", argv[3], want)
 	}
 

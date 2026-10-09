@@ -103,7 +103,7 @@ function assertCovers(actual, section) {
 // --- W2 unknown keys are refused ----------------------------------------------
 
 describe("W2 unknown keys - refused at load", () => {
-  it("refuses tiemout_seconds in [tool] and names the key", () => {
+  it("refuses tiemout_seconds in [tool] and names the key", async () => {
     const path = writeTmp(`${TOOL_HEAD}tiemout_seconds = 5\n${ARGS}${COMMAND}${OUTPUT}`);
     assert.throws(
       () => loadManifest(path),
@@ -111,7 +111,7 @@ describe("W2 unknown keys - refused at load", () => {
     );
   });
 
-  it("refuses an unknown [args.<n>] key with the concrete path", () => {
+  it("refuses an unknown [args.<n>] key with the concrete path", async () => {
     const path = writeTmp(`${TOOL_HEAD}${ARGS}block_internal_typo = true\n${COMMAND}${OUTPUT}`);
     assert.throws(
       () => loadManifest(path),
@@ -119,7 +119,7 @@ describe("W2 unknown keys - refused at load", () => {
     );
   });
 
-  it("refuses an unknown [command] key", () => {
+  it("refuses an unknown [command] key", async () => {
     const path = writeTmp(`${TOOL_HEAD}${ARGS}${COMMAND}templte = "echo"\n${OUTPUT}`);
     assert.throws(
       () => loadManifest(path),
@@ -127,7 +127,7 @@ describe("W2 unknown keys - refused at load", () => {
     );
   });
 
-  it("refuses an unknown [output] key", () => {
+  it("refuses an unknown [output] key", async () => {
     const path = writeTmp(`${TOOL_HEAD}${ARGS}${COMMAND}${OUTPUT}formt = "json"\n`);
     assert.throws(
       () => loadManifest(path),
@@ -135,7 +135,7 @@ describe("W2 unknown keys - refused at load", () => {
     );
   });
 
-  it("refuses an unknown [http] key", () => {
+  it("refuses an unknown [http] key", async () => {
     const path = writeTmp(`${TOOL_HEAD}${ARGS}
 [http]
 method = "GET"
@@ -148,7 +148,7 @@ ${OUTPUT}`);
     );
   });
 
-  it("refuses an unknown [command.conditionals.<n>] key with the concrete path", () => {
+  it("refuses an unknown [command.conditionals.<n>] key with the concrete path", async () => {
     const path = writeTmp(`${TOOL_HEAD}${ARGS}
 [args.rate]
 position = 2
@@ -170,7 +170,7 @@ ${OUTPUT}`);
     );
   });
 
-  it("refuses an unknown top-level section", () => {
+  it("refuses an unknown top-level section", async () => {
     const path = writeTmp(`${BASE}
 [toool]
 name = "x"
@@ -178,7 +178,7 @@ name = "x"
     assert.throws(() => loadManifest(path), /^Error: unknown key 'toool' in manifest$/);
   });
 
-  it("reports every unknown key in one sorted message", () => {
+  it("reports every unknown key in one sorted message", async () => {
     const path = writeTmp(`${TOOL_HEAD}tiemout_seconds = 5
 ${ARGS}block_internal_typo = true
 
@@ -215,7 +215,7 @@ formt = "json"
     );
   });
 
-  it("runs the key check before structural validation", () => {
+  it("runs the key check before structural validation", async () => {
     // No [command] and no [output], yet the unknown key is what is reported.
     const path = writeTmp(`${TOOL_HEAD}tiemout_seconds = 5\n`);
     assert.throws(
@@ -230,7 +230,7 @@ formt = "json"
 describe("W2 unknown keys - allowUnknownKeys escape hatch", () => {
   const content = `${TOOL_HEAD}tiemout_seconds = 5\n${ARGS}block_internal_typo = true\n${COMMAND}${OUTPUT}`;
 
-  it("loadManifestWithOptions downgrades to warnings and loads", (t) => {
+  it("loadManifestWithOptions downgrades to warnings and loads", async (t) => {
     const warn = silenceWarn(t);
     const path = writeTmp(content);
     const m = loadManifestWithOptions(path, { allowUnknownKeys: true });
@@ -244,18 +244,18 @@ describe("W2 unknown keys - allowUnknownKeys escape hatch", () => {
     );
   });
 
-  it("loadManifestWithOptions defaults to strict", () => {
+  it("loadManifestWithOptions defaults to strict", async () => {
     const path = writeTmp(content);
     assert.throws(() => loadManifestWithOptions(path), /unknown key 'tool\.tiemout_seconds'/);
     assert.throws(() => loadManifestWithOptions(path, {}), /unknown key 'tool\.tiemout_seconds'/);
   });
 
-  it("loadManifest stays strict", () => {
+  it("loadManifest stays strict", async () => {
     const path = writeTmp(content);
     assert.throws(() => loadManifest(path), /unknown key 'tool\.tiemout_seconds'/);
   });
 
-  it("CLI validate fails on an unknown key and --allow-unknown-keys warns instead", () => {
+  it("CLI validate fails on an unknown key and --allow-unknown-keys warns instead", async () => {
     const path = writeTmp(content);
 
     const strict = spawnSync(process.execPath, [CLI, "validate", path], { encoding: "utf-8" });
@@ -277,7 +277,7 @@ describe("W2 unknown keys - allowUnknownKeys escape hatch", () => {
 // --- W2 every known key is accepted -------------------------------------------
 
 describe("W2 allowlist - every normative key loads", () => {
-  it("accepts every [tool]/[tool.*]/[args.*]/[command]/[output] key", () => {
+  it("accepts every [tool]/[tool.*]/[args.*]/[command]/[output] key", async () => {
     const path = writeTmp(`
 [tool]
 name = "full"
@@ -408,7 +408,7 @@ type = "string"
     assert.equal(m.output.schema.properties.raw_output.type, "string");
   });
 
-  it("accepts every [session]/[session.*] key", () => {
+  it("accepts every [session]/[session.*] key", async () => {
     const path = writeTmp(`
 [tool]
 name = "s"
@@ -456,7 +456,7 @@ format = "text"
     assert.equal(m.session.commands.select.args.table.type, "string");
   });
 
-  it("accepts every [browser]/[browser.*] key", () => {
+  it("accepts every [browser]/[browser.*] key", async () => {
     const path = writeTmp(`
 [tool]
 name = "b"
@@ -506,7 +506,7 @@ format = "json"
     assert.equal(m.browser.commands.navigate.args.url.type, "url");
   });
 
-  it("accepts every [http] key, with headers as an open map", () => {
+  it("accepts every [http] key, with headers as an open map", async () => {
     const path = writeTmp(`
 [tool]
 name = "h"
@@ -535,7 +535,7 @@ format = "json"
     assert.equal(m.http.headers["X-Custom"], "{q}");
   });
 
-  it("accepts every [mcp] key, with field_map as an open map", () => {
+  it("accepts every [mcp] key, with field_map as an open map", async () => {
     const path = writeTmp(`
 [tool]
 name = "m"
@@ -557,7 +557,7 @@ target = "host"
     assert.equal(m.mcp.field_map.target, "host");
   });
 
-  it("findUnknownKeys leaves open maps and opaque data alone", () => {
+  it("findUnknownKeys leaves open maps and opaque data alone", async () => {
     const parsed = TOML.parse(`
 [tool]
 name = "t"
@@ -586,7 +586,7 @@ unchecked = true
     assert.deepEqual(findUnknownKeys(parsed), []);
   });
 
-  it("findUnknownKeys flags every unknown key and nothing else", () => {
+  it("findUnknownKeys flags every unknown key and nothing else", async () => {
     const parsed = TOML.parse(`
 [tool]
 name = "t"
@@ -616,12 +616,12 @@ allowed_domain = []
 // --- W2 tool.mode and inert defaults ------------------------------------------
 
 describe("W2 tool.mode", () => {
-  it("derives oneshot when absent and no backend section is present", () => {
+  it("derives oneshot when absent and no backend section is present", async () => {
     const m = loadManifest(writeTmp(BASE));
     assert.equal(m.tool.mode, "oneshot");
   });
 
-  it("derives session and browser from the backend section", () => {
+  it("derives session and browser from the backend section", async () => {
     const s = loadManifest(
       writeTmp(`${TOOL_HEAD}\n[session]\nstartup_command = "cat"\n${OUTPUT}`)
     );
@@ -632,12 +632,12 @@ describe("W2 tool.mode", () => {
     assert.equal(b.tool.mode, "browser");
   });
 
-  it("keeps an explicit mode", () => {
+  it("keeps an explicit mode", async () => {
     const m = loadManifest(writeTmp(`${TOOL_HEAD}mode = "oneshot"\n${ARGS}${COMMAND}${OUTPUT}`));
     assert.equal(m.tool.mode, "oneshot");
   });
 
-  it("refuses an invalid mode value", () => {
+  it("refuses an invalid mode value", async () => {
     const path = writeTmp(`${TOOL_HEAD}mode = "batch"\n${ARGS}${COMMAND}${OUTPUT}`);
     assert.throws(
       () => loadManifest(path),
@@ -647,7 +647,7 @@ describe("W2 tool.mode", () => {
 });
 
 describe("W2 registered keys - inert defaults", () => {
-  it("defaults network_egress, allow_interpreter and output.max_bytes", () => {
+  it("defaults network_egress, allow_interpreter and output.max_bytes", async () => {
     const m = loadManifest(writeTmp(BASE));
     assert.equal(m.tool.network_egress, false);
     assert.equal(m.tool.allow_interpreter, false);
@@ -656,19 +656,19 @@ describe("W2 registered keys - inert defaults", () => {
     assert.equal(m.tool.limits, undefined);
   });
 
-  it("defaults tool.evidence.screenshots when [tool.evidence] is present", () => {
+  it("defaults tool.evidence.screenshots when [tool.evidence] is present", async () => {
     const m = loadManifest(
       writeTmp(`${TOOL_HEAD}\n[tool.evidence]\ncapture = true\n${ARGS}${COMMAND}${OUTPUT}`)
     );
     assert.equal(m.tool.evidence.screenshots, false);
   });
 
-  it("refuses a non-boolean network_egress", () => {
+  it("refuses a non-boolean network_egress", async () => {
     const path = writeTmp(`${TOOL_HEAD}network_egress = "yes"\n${ARGS}${COMMAND}${OUTPUT}`);
     assert.throws(() => loadManifest(path), /tool\.network_egress must be a boolean/);
   });
 
-  it("refuses a non-integer output.max_bytes and tool.limits value", () => {
+  it("refuses a non-integer output.max_bytes and tool.limits value", async () => {
     assert.throws(
       () => loadManifest(writeTmp(`${TOOL_HEAD}${ARGS}${COMMAND}${OUTPUT}max_bytes = "8MB"\n`)),
       /output\.max_bytes must be an integer/
@@ -686,28 +686,28 @@ describe("W2 registered keys - inert defaults", () => {
 // --- Unknown argument names at call time --------------------------------------
 
 describe("unknown argument names at call time", () => {
-  it("dry run refuses an undeclared argument instead of dropping it", () => {
+  it("dry run refuses an undeclared argument instead of dropping it", async () => {
     const m = execManifest(["echo", "{target}"], {
       target: { type: "string", required: true },
     });
-    assert.throws(
+    await assert.rejects(
       () => execute(m, { target: "host", extra_flags: "-iL /etc/passwd" }, { dryRun: true }),
       /^Error: unknown argument 'extra_flags' \(declared arguments: target\)$/
     );
   });
 
-  it("lists the declared arguments sorted", () => {
+  it("lists the declared arguments sorted", async () => {
     const m = execManifest(["echo", "{b}", "{a}"], {
       b: { type: "string", required: true },
       a: { type: "string", required: true },
     });
-    assert.throws(
+    await assert.rejects(
       () => execute(m, { a: "1", b: "2", zzz: "3" }, { dryRun: true }),
       /^Error: unknown argument 'zzz' \(declared arguments: a, b\)$/
     );
   });
 
-  it("applies to the MCP proxy backend", () => {
+  it("applies to the MCP proxy backend", async () => {
     const m = {
       tool: { name: "m", description: "d" },
       args: { target: { type: "string", required: true } },
@@ -719,11 +719,11 @@ describe("unknown argument names at call time", () => {
     );
   });
 
-  it("still runs when every supplied argument is declared", () => {
+  it("still runs when every supplied argument is declared", async () => {
     const m = execManifest(["echo", "{target}"], {
       target: { type: "string", required: true },
     });
-    const r = execute(m, { target: "host" }, { dryRun: true });
+    const r = await execute(m, { target: "host" }, { dryRun: true });
     assert.equal(r.status, "dry_run");
     assert.deepEqual(r.argv, ["echo", "host"]);
   });

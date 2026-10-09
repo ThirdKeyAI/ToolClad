@@ -45,7 +45,8 @@ type EvidenceDef struct {
 
 // ToolLimitsDef holds the optional [tool.limits] resource ceilings for the
 // child process. Nil means "no limit requested" for each field. Registered as
-// known keys; enforcement is not implemented here.
+// known keys. The Go runtime cannot set resource limits on a child process
+// portably (os/exec has no pre-exec hook), so these are not enforced here.
 type ToolLimitsDef struct {
 	Nproc             *int64 `toml:"nproc"`
 	Nofile            *int64 `toml:"nofile"`
@@ -76,8 +77,8 @@ type ToolMeta struct {
 	// for LintEgress regardless of which binary the command names.
 	NetworkEgress bool `toml:"network_egress"`
 	// AllowInterpreter permits argv[0] to be a shell or language
-	// interpreter. Registered as a known key; the denylist is not
-	// implemented here.
+	// interpreter (see InterpreterBasenames). Off by default: a load-time
+	// check refuses an interpreter as argv[0] unless this is set.
 	AllowInterpreter bool           `toml:"allow_interpreter"`
 	Cedar            *CedarDef      `toml:"cedar"`
 	Evidence         *EvidenceDef   `toml:"evidence"`
@@ -617,7 +618,60 @@ func (m *Manifest) EnsureCompiled() error {
 	if err := m.checkArgDefs(); err != nil {
 		return err
 	}
+	if err := m.CheckSpawnPolicy(); err != nil {
+		return err
+	}
 	m.compiled = true
+	return nil
+}
+
+// InterpreterBasenames are the argv[0] basenames refused at load unless
+// [tool] allow_interpreter = true: a shell or language interpreter turns a
+// validated argument into code. The list is shared verbatim across the
+// ToolClad runtimes; extend it in all of them or in none.
+var InterpreterBasenames = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true,
+	"csh": true, "tcsh": true, "fish": true, "ash": true, "busybox": true,
+	"env": true, "eval": true, "xargs": true, "python": true, "python2": true,
+	"python3": true, "perl": true, "ruby": true, "node": true, "deno": true,
+	"bun": true, "lua": true, "php": true, "awk": true,
+}
+
+// CheckSpawnPolicy runs the load-time checks on the command the runtime
+// will spawn:
+//
+//   - timeout_seconds may not be negative (zero is refused at load, where
+//     an explicit value can be told apart from an absent one);
+//   - argv[0] may not be an interpreter unless allow_interpreter is set;
+//   - for the exec/template form with a non-empty tool.binary, the basename
+//     of argv[0] must equal the basename of tool.binary.
+//
+// Callback-dispatch manifests never spawn anything and are skipped, and so
+// are [http]/[mcp]/[session]/[browser] manifests without a [command].
+func (m *Manifest) CheckSpawnPolicy() error {
+	if m.Tool.TimeoutSeconds < 0 {
+		return fmt.Errorf("timeout_seconds must be greater than zero")
+	}
+	if m.Tool.Dispatch == "callback" {
+		return nil
+	}
+	var argv0 string
+	execForm := false
+	switch {
+	case m.Command.Executor != "":
+		argv0 = m.Command.Executor
+	case len(m.Command.Exec) > 0:
+		argv0 = m.Command.Exec[0]
+		execForm = true
+	default:
+		return nil
+	}
+	if !m.Tool.AllowInterpreter && InterpreterBasenames[commandBasename(argv0)] {
+		return fmt.Errorf("command argv[0] '%s' is an interpreter; set allow_interpreter = true to permit it", argv0)
+	}
+	if execForm && m.Tool.Binary != "" && commandBasename(argv0) != commandBasename(m.Tool.Binary) {
+		return fmt.Errorf("command argv[0] '%s' does not match tool.binary '%s'", argv0, m.Tool.Binary)
+	}
 	return nil
 }
 
@@ -1017,6 +1071,13 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 		)
 	}
 
+	// An explicit timeout_seconds must be positive: zero used to disable
+	// the timeout entirely in one runtime. Only an absent key defaults.
+	if tool, ok := raw["tool"].(map[string]any); ok {
+		if _, set := tool["timeout_seconds"]; set && m.Tool.TimeoutSeconds <= 0 {
+			return nil, fmt.Errorf("manifest %s: timeout_seconds must be greater than zero", path)
+		}
+	}
 	// Set default timeout if not specified.
 	if m.Tool.TimeoutSeconds == 0 {
 		m.Tool.TimeoutSeconds = 60
@@ -1091,6 +1152,9 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 	if err := m.checkArgDefs(); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
+	if err := m.CheckSpawnPolicy(); err != nil {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 	return &m, nil
