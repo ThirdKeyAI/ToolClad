@@ -290,6 +290,9 @@ class Manifest:
     session: Optional[SessionDef] = None
     browser: Optional[BrowserDef] = None
     source_path: str = ""
+    # Custom types from the project ``toolclad.toml`` (or the loader's
+    # override). The executor validates custom-typed arguments with them.
+    custom_types: Dict[str, "CustomTypeDef"] = field(default_factory=dict)
 
     @property
     def args_sorted(self) -> List[ArgDef]:
@@ -552,10 +555,82 @@ class CustomTypeDef:
     max_float: Optional[float] = None
 
 
+#: Environment variable naming the project config file explicitly.
+CONFIG_FILE_ENV = "TOOLCLAD_CONFIG_FILE"
+
+#: Keys allowed inside ``[types.<n>]`` of ``toolclad.toml``.
+CUSTOM_TYPE_KEYS: FrozenSet[str] = frozenset({
+    "base", "allowed", "pattern", "min", "max", "min_float", "max_float",
+})
+
+#: Built-in argument types. Kept in sync with the validator's handler table
+#: (the validator imports this module, so the list lives here).
+BUILTIN_TYPES: FrozenSet[str] = frozenset({
+    "string", "integer", "number", "port", "boolean", "enum", "scope_target",
+    "url", "path", "ip_address", "cidr", "msf_options", "credential_file",
+    "duration", "regex_match",
+})
+
+
+def parse_custom_types(data: Mapping[str, Any], source: str = "toolclad.toml") -> Dict[str, CustomTypeDef]:
+    """Build custom type definitions from a parsed ``toolclad.toml`` table.
+
+    Strict: the only top-level key is ``types``, each ``[types.<n>]`` may use
+    only ``CUSTOM_TYPE_KEYS``, and ``base`` must be a built-in type (a custom
+    type cannot be based on another custom type). Raises ``ValueError``.
+    """
+    for key in data:
+        if key != "types":
+            raise ValueError(f"unknown key '{key}' in {source}")
+    raw = data.get("types", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"[types] in {source} must be a table")
+    types: Dict[str, CustomTypeDef] = {}
+    for name, tdef in raw.items():
+        if not isinstance(tdef, dict):
+            raise ValueError(f"[types.{name}] in {source} must be a table")
+        for key in tdef:
+            if key not in CUSTOM_TYPE_KEYS:
+                raise ValueError(f"unknown key 'types.{name}.{key}' in {source}")
+        if name in BUILTIN_TYPES:
+            raise ValueError(f"custom type '{name}' in {source} shadows a built-in type")
+        base = tdef.get("base", "")
+        if base not in BUILTIN_TYPES:
+            raise ValueError(
+                f"custom type '{name}' in {source} has invalid base type '{base}' "
+                "(the base must be a built-in type)"
+            )
+        allowed = tdef.get("allowed", [])
+        if not isinstance(allowed, list) or not all(isinstance(a, str) for a in allowed):
+            raise ValueError(f"custom type '{name}' in {source}: allowed must be a list of strings")
+        pattern = tdef.get("pattern", "")
+        if not isinstance(pattern, str):
+            raise ValueError(f"custom type '{name}' in {source}: pattern must be a string")
+        for key in ("min", "max"):
+            v = tdef.get(key)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+                raise ValueError(f"custom type '{name}' in {source}: {key} must be an integer")
+        for key in ("min_float", "max_float"):
+            v = tdef.get(key)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                raise ValueError(f"custom type '{name}' in {source}: {key} must be a number")
+        types[name] = CustomTypeDef(
+            base=base,
+            allowed=list(allowed),
+            pattern=pattern,
+            min=tdef.get("min"),
+            max=tdef.get("max"),
+            min_float=tdef.get("min_float"),
+            max_float=tdef.get("max_float"),
+        )
+    return types
+
+
 def load_custom_types(path: str) -> Dict[str, CustomTypeDef]:
     """Load custom type definitions from a toolclad.toml file.
 
-    Returns a dict mapping type name to CustomTypeDef.
+    Returns a dict mapping type name to CustomTypeDef; an absent file yields
+    no types. The file is checked strictly (see :func:`parse_custom_types`).
     """
     file_path = Path(path)
     if not file_path.exists():
@@ -563,19 +638,45 @@ def load_custom_types(path: str) -> Dict[str, CustomTypeDef]:
 
     with open(file_path, "rb") as f:
         data = tomllib.load(f)
+    return parse_custom_types(data, str(file_path))
 
-    types = {}
-    for name, tdef in data.get("types", {}).items():
-        types[name] = CustomTypeDef(
-            base=tdef.get("base", ""),
-            allowed=tdef.get("allowed", []),
-            pattern=tdef.get("pattern", ""),
-            min=tdef.get("min"),
-            max=tdef.get("max"),
-            min_float=tdef.get("min_float"),
-            max_float=tdef.get("max_float"),
-        )
-    return types
+
+def discover_custom_types(
+    manifest_dir: Optional[Any] = None,
+) -> Dict[str, CustomTypeDef]:
+    """Find and load the project ``toolclad.toml`` for a manifest directory.
+
+    ``TOOLCLAD_CONFIG_FILE`` wins when set (an unreadable file is an error);
+    otherwise ``toolclad.toml`` is searched upward from ``manifest_dir``
+    (``None``: the cwd) to the filesystem root. Absent means no custom types.
+    """
+    import os
+
+    env = os.environ.get(CONFIG_FILE_ENV)
+    if env:
+        try:
+            with open(env, "rb") as f:
+                data = tomllib.load(f)
+        except OSError as exc:
+            raise ValueError(f"{CONFIG_FILE_ENV}={env} could not be read: {exc}") from None
+        return parse_custom_types(data, env)
+    start = Path(manifest_dir) if manifest_dir else Path.cwd()
+    start = start.resolve()
+    for directory in (start, *start.parents):
+        candidate = directory / "toolclad.toml"
+        if candidate.is_file():
+            return load_custom_types(str(candidate))
+    return {}
+
+
+def _check_arg_types(
+    manifest: "Manifest", custom_types: Mapping[str, CustomTypeDef]
+) -> None:
+    """Every argument type (``[args.*]`` and the session/browser command
+    arguments) must be built-in or a known custom type."""
+    for arg in _iter_args(manifest):
+        if arg.type not in BUILTIN_TYPES and arg.type not in custom_types:
+            raise ValueError(f"unknown type '{arg.type}' for argument '{arg.name}'")
 
 
 # ---------------------------------------------------------------------------
@@ -693,8 +794,8 @@ def validate_manifest_with_custom_types(
     """Re-run the egress lint on a loaded manifest with the custom types of
     a ``toolclad.toml`` in hand, so an argument that routes a network target
     through a custom type is refused at load rather than at call time.
-    ``load_manifest`` cannot do this itself because the CLI does not load
-    ``toolclad.toml`` yet. Raises ``ValueError`` with the same wording as
+    The loaders already do this with the discovered types; this entry point
+    serves embedders holding a manifest built some other way. Raises ``ValueError`` with the same wording as
     the load-time lint."""
     _lint_egress(manifest, custom_types)
 
@@ -831,9 +932,13 @@ class LoadOptions:
     flag: an unknown manifest key is reported as a warning on stderr instead of
     failing the load. It is the only relaxation the loader offers;
     :func:`load_manifest` is always strict.
+
+    ``custom_types`` overrides discovery of ``toolclad.toml`` for embedders
+    that already hold the custom types (``None``: discover).
     """
 
     allow_unknown_keys: bool = False
+    custom_types: Optional[Mapping[str, "CustomTypeDef"]] = None
 
 
 def load_manifest(path: str) -> Manifest:
@@ -885,6 +990,36 @@ def load_manifest_with_options(
     with open(file_path, "rb") as f:
         data = tomllib.load(f)
 
+    custom_types = options.custom_types
+    if custom_types is None:
+        custom_types = discover_custom_types(file_path.resolve().parent)
+    return _build_manifest(
+        data, options, custom_types, str(file_path.resolve()), label=path
+    )
+
+
+def load_manifest_from_str(
+    source: str, options: Optional[LoadOptions] = None
+) -> Manifest:
+    """Parse a manifest from TOML source text (strict by default).
+
+    There is no file, so ``toolclad.toml`` is not discovered: custom types
+    come only from ``options.custom_types``. Raises as :func:`load_manifest`.
+    """
+    options = options or LoadOptions()
+    data = tomllib.loads(source)
+    custom_types = options.custom_types if options.custom_types is not None else {}
+    return _build_manifest(data, options, custom_types, "", label="<string>")
+
+
+def _build_manifest(
+    data: Dict[str, Any],
+    options: LoadOptions,
+    custom_types: Mapping[str, CustomTypeDef],
+    source_path: str,
+    label: str,
+) -> Manifest:
+    """Parse and validate a decoded manifest table."""
     unknown = find_unknown_keys(data)
     if unknown:
         messages = [f"unknown key '{key}' in manifest" for key in unknown]
@@ -894,9 +1029,9 @@ def load_manifest_with_options(
             sys.stderr.write(f"warning: {message}\n")
 
     if "tool" not in data:
-        raise ValueError(f"Manifest {path} is missing required [tool] section")
+        raise ValueError(f"Manifest {label} is missing required [tool] section")
 
-    manifest = Manifest(source_path=str(file_path.resolve()))
+    manifest = Manifest(source_path=source_path, custom_types=dict(custom_types))
 
     manifest.tool = _parse_tool(data["tool"])
 
@@ -925,6 +1060,7 @@ def load_manifest_with_options(
     if "mode" not in data["tool"]:
         manifest.tool.mode = _derive_mode(manifest)
 
+    _check_arg_types(manifest, manifest.custom_types)
     _validate_manifest(manifest)
     _compile_command(manifest)
     return manifest
@@ -994,9 +1130,8 @@ def _validate_manifest(manifest: Manifest) -> None:
             )
 
     # Egress safety: refuse a network target that is not default-deny on a
-    # manifest that reaches the network. Custom types are not known at load;
-    # validate_manifest_with_custom_types repeats the lint with them.
-    _lint_egress(manifest)
+    # manifest that reaches the network, including through a custom type.
+    _lint_egress(manifest, manifest.custom_types)
     _check_scope_check_types(manifest)
     _check_arg_defaults(manifest)
     _check_output(manifest)
@@ -1059,15 +1194,15 @@ def _check_arg_defaults(manifest: Manifest) -> None:
     a default that fails its own type is a load error naming the argument
     instead of a confusing refusal (or an unvalidated substitution) at call
     time. The scope step is deferred to the call, where the scope file is
-    known. A custom-typed argument is skipped (custom types are not known at
-    load)."""
-    from toolclad.validator import SUPPORTED_TYPES, ValidationError, _run_validation
+    known. A custom-typed argument is validated through its custom type."""
+    from toolclad.validator import ValidationError, _resolve_custom, _run_validation
 
     for arg in _iter_args(manifest):
-        if arg.default is None or arg.type not in SUPPORTED_TYPES:
+        if arg.default is None:
             continue
         try:
-            _run_validation(arg, _default_text(arg.default), False, check_scope=False)
+            resolved = _resolve_custom(arg, manifest.custom_types)
+            _run_validation(resolved, _default_text(arg.default), False, check_scope=False)
         except ValidationError as exc:
             raise ValueError(
                 f"argument '{arg.name}': default {arg.default!r} is invalid: {exc}"

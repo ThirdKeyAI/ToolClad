@@ -19,6 +19,9 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import TOML from "@iarna/toml";
 import { validateArgIn } from "./validator.js";
 import { scopeForManifest } from "./scope.js";
+
+/** Same symbol manifest.js uses for the manifest's custom type map. */
+const CUSTOM_TYPES = Symbol.for("toolclad.customTypes");
 import { validateJsonSchema } from "./schema.js";
 import { parseCanonicalIp, enforceIpPolicy, internalNameReason, embeddedIpv4Literal } from "./hostpolicy.js";
 
@@ -731,6 +734,7 @@ function resolveArgs(manifest, args, execMode = false) {
   // validator refuses fail-closed.
   const needsScope = Object.values(argDefs).some((def) => def && def.scope_check === true);
   const scope = needsScope ? scopeForManifest(manifest) : null;
+  const customTypes = manifest[CUSTOM_TYPES] || {};
 
   // A supplied name that [args] does not declare is refused rather than
   // silently dropped, so a caller learns when its argument never reached the
@@ -757,7 +761,7 @@ function resolveArgs(manifest, args, execMode = false) {
       if (value === undefined) continue;
     }
 
-    resolved[name] = validateArgIn(def, value, { execMode, scope });
+    resolved[name] = validateArgIn(def, value, { execMode, scope, customTypes });
   }
 
   return resolved;

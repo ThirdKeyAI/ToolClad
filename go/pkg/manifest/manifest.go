@@ -299,6 +299,12 @@ type Manifest struct {
 	// when any argument needs it; an embedder may set it directly. Nil
 	// with scope_check set is a fail-closed refusal at validation.
 	Scope *scope.ScopeDef `toml:"-"`
+	// CustomTypes are the custom argument types from the project
+	// toolclad.toml, discovered at load (see DiscoverCustomTypes) or
+	// supplied through LoadOptions.CustomTypes. Every argument type is a
+	// built-in or a key of this map; the validated-argument path resolves
+	// custom types through it.
+	CustomTypes map[string]*CustomTypeDef `toml:"-"`
 
 	compiled      bool
 	scopeResolved bool
@@ -376,8 +382,8 @@ func (m *Manifest) checkArgDefs() error {
 		if t == "" {
 			t = "string"
 		}
-		// A custom type is checked by its base type once custom types are
-		// loaded (validator.ValidateManifestWithCustomTypes).
+		// A custom type is checked by its base type.
+		t = m.BaseType(t)
 		if def.ScopeCheck && builtinTypes[t] && !scopeCheckTypes[t] {
 			return fmt.Errorf("argument '%s': scope_check is not supported for type '%s'", name, t)
 		}
@@ -391,10 +397,10 @@ func (m *Manifest) checkArgDefs() error {
 			continue
 		}
 		val := fmt.Sprintf("%v", def.Default)
-		if val == "" && (def.Type == "string" || def.Type == "") {
+		if base := m.BaseType(def.Type); val == "" && (base == "string" || base == "") {
 			continue // an empty string default is always acceptable
 		}
-		if err := DefaultValidator(def, val, m.Scope); err != nil {
+		if err := DefaultValidator(def, val, m.CustomTypes, m.Scope); err != nil {
 			return fmt.Errorf("argument '%s': invalid default %q: %w", name, val, err)
 		}
 	}
@@ -403,10 +409,10 @@ func (m *Manifest) checkArgDefs() error {
 
 // DefaultValidator validates a declared per-argument default at load. The
 // validator package registers its strict entry point here on import (this
-// package cannot import it without a cycle). Arguments of a type it does not
-// know (custom types) must be accepted; they are checked once custom types
-// are available. Nil disables the check.
-var DefaultValidator func(def *ArgDef, value string, s *scope.ScopeDef) error
+// package cannot import it without a cycle). customTypes resolves an
+// argument of a custom type to its base type and merged constraints. Nil
+// disables the check.
+var DefaultValidator func(def *ArgDef, value string, customTypes map[string]*CustomTypeDef, s *scope.ScopeDef) error
 
 // ArgsSorted returns the argument definitions sorted by position.
 func (m *Manifest) ArgsSorted() []*ArgDef {
@@ -609,7 +615,10 @@ func (m *Manifest) EnsureCompiled() error {
 	if err := m.compileCommand(false); err != nil {
 		return err
 	}
-	if err := m.LintEgress(nil); err != nil {
+	if err := m.checkArgTypes(); err != nil {
+		return err
+	}
+	if err := m.LintEgress(m.CustomTypes); err != nil {
 		return err
 	}
 	if err := m.EnsureScope(); err != nil {
@@ -1014,6 +1023,12 @@ type LoadOptions struct {
 	// exists for the CLI's `validate --allow-unknown-keys`; library callers
 	// should load strictly.
 	AllowUnknownKeys bool
+
+	// CustomTypes, when non-nil, is used as the manifest's custom type
+	// table instead of discovering toolclad.toml (an empty map means "no
+	// custom types, do not discover"). For embedders that already hold
+	// the types.
+	CustomTypes map[string]*CustomTypeDef
 }
 
 // LoadManifest parses a .clad.toml file and returns a Manifest. Loading is
@@ -1023,10 +1038,37 @@ func LoadManifest(path string) (*Manifest, error) {
 }
 
 // LoadManifestWithOptions parses a .clad.toml file with explicit LoadOptions.
+// It is the single entry point for discovery, load and type checking: the
+// project toolclad.toml is discovered upward from the manifest's directory
+// (or taken from opts.CustomTypes), every argument type is checked against
+// the built-in and custom types, and the egress lint sees the custom types.
 func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
+	}
+	return parseManifest(data, path, opts)
+}
+
+// LoadManifestFromString parses manifest source held in memory, strictly.
+// Custom types are discovered upward from the working directory, as the
+// scope file is for an in-memory manifest.
+func LoadManifestFromString(src string) (*Manifest, error) {
+	return LoadManifestFromStringWithOptions(src, LoadOptions{})
+}
+
+// LoadManifestFromStringWithOptions is LoadManifestFromString with explicit
+// LoadOptions.
+func LoadManifestFromStringWithOptions(src string, opts LoadOptions) (*Manifest, error) {
+	return parseManifest([]byte(src), "", opts)
+}
+
+// parseManifest is the shared loader. path is the source file ("" for an
+// in-memory manifest); it labels errors and anchors discovery.
+func parseManifest(data []byte, path string, opts LoadOptions) (*Manifest, error) {
+	label := path
+	if label == "" {
+		label = "<string>"
 	}
 
 	var m Manifest
@@ -1047,7 +1089,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 			msgs[i] = fmt.Sprintf("unknown key '%s' in manifest", k)
 		}
 		if !opts.AllowUnknownKeys {
-			return nil, fmt.Errorf("manifest %s: %s", path, strings.Join(msgs, "; "))
+			return nil, fmt.Errorf("manifest %s: %s", label, strings.Join(msgs, "; "))
 		}
 		for _, msg := range msgs {
 			fmt.Fprintf(WarningOutput, "warning: %s\n", msg)
@@ -1055,7 +1097,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	}
 
 	if m.Tool.Name == "" {
-		return nil, fmt.Errorf("manifest %s: missing required tool.name", path)
+		return nil, fmt.Errorf("manifest %s: missing required tool.name", label)
 	}
 
 	// tool.mode is advisory: validate it when set, derive it when absent.
@@ -1073,7 +1115,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	default:
 		return nil, fmt.Errorf(
 			"manifest %s: invalid tool.mode '%s', must be one of %s",
-			path, m.Tool.Mode, strings.Join(ToolModes, ", "),
+			label, m.Tool.Mode, strings.Join(ToolModes, ", "),
 		)
 	}
 
@@ -1081,7 +1123,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	// the timeout entirely in one runtime. Only an absent key defaults.
 	if tool, ok := raw["tool"].(map[string]any); ok {
 		if _, set := tool["timeout_seconds"]; set && m.Tool.TimeoutSeconds <= 0 {
-			return nil, fmt.Errorf("manifest %s: timeout_seconds must be greater than zero", path)
+			return nil, fmt.Errorf("manifest %s: timeout_seconds must be greater than zero", label)
 		}
 	}
 	// Set default timeout if not specified.
@@ -1101,7 +1143,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 	if m.Tool.Dispatch != "exec" && m.Tool.Dispatch != "callback" {
 		return nil, fmt.Errorf(
 			"manifest %s: invalid dispatch '%s', must be 'exec' or 'callback'",
-			path, m.Tool.Dispatch,
+			label, m.Tool.Dispatch,
 		)
 	}
 
@@ -1116,7 +1158,7 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 
 	// Compile [command] into canonical exec form and check placeholders.
 	if err := m.compileCommand(true); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 	m.compiled = true
 
@@ -1134,40 +1176,59 @@ func LoadManifestWithOptions(path string, opts LoadOptions) (*Manifest, error) {
 				"manifest %s: must define at least one execution backend: "+
 					"[command] exec/executor, [http], [mcp], [session], or [browser] "+
 					"(or set tool.dispatch = \"callback\" for validator-only manifests)",
-				path,
+				label,
 			)
 		}
 		if m.Output == nil {
 			return nil, fmt.Errorf(
 				"manifest %s: missing [output] block "+
 					"(or set tool.dispatch = \"callback\" for validator-only manifests)",
-				path,
+				label,
 			)
 		}
 	}
 
-	// Egress safety lint (built-in types; the CLI re-runs it with custom
-	// types through validator.ValidateManifestWithCustomTypes once it loads
-	// toolclad.toml).
-	if err := m.LintEgress(nil); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	// Custom types: the caller's table, else the discovered toolclad.toml.
+	if opts.CustomTypes != nil {
+		m.CustomTypes = opts.CustomTypes
+	} else {
+		dir := ""
+		if path != "" {
+			dir = filepath.Dir(path)
+		}
+		ct, err := DiscoverCustomTypes(dir)
+		if err != nil {
+			return nil, fmt.Errorf("manifest %s: %w", label, err)
+		}
+		m.CustomTypes = ct
+	}
+	// Every argument type, including session/browser command arguments,
+	// must be a built-in or a custom type.
+	if err := m.checkArgTypes(); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
+	}
+
+	// Egress safety lint, with the custom types visible: a custom type
+	// whose base is a network target is refused in an egress manifest.
+	if err := m.LintEgress(m.CustomTypes); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 
 	m.SourcePath = path
 	if err := m.EnsureScope(); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 	if err := m.checkArgDefs(); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 	if err := m.CheckSpawnPolicy(); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 	if err := m.CheckOutput(); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 	if err := m.CheckHTTP(); err != nil {
-		return nil, fmt.Errorf("manifest %s: %w", path, err)
+		return nil, fmt.Errorf("manifest %s: %w", label, err)
 	}
 	return &m, nil
 }

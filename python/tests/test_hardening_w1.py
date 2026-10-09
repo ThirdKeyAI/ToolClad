@@ -24,7 +24,6 @@ from toolclad.executor import (
 from toolclad.manifest import (
     ArgDef,
     CommandDef,
-    ConditionalDef,
     CustomTypeDef,
     Manifest,
     OutputDef,

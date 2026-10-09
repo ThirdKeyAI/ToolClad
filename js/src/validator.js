@@ -122,8 +122,17 @@ function checkValueHygiene(str, argDef, type, execMode) {
   }
 }
 
+const SCALAR_VALUE_TYPES = new Set(["string", "number", "boolean", "bigint"]);
+
 function runValidation(handler, type, argDef, value, opts) {
   const { execMode = false } = opts;
+  // Only scalars are argument values. An array or object would otherwise be
+  // stringified by the handlers ("a,b", "[object Object]") or, for a
+  // prototype-less object, crash the conversion with a TypeError.
+  if (!SCALAR_VALUE_TYPES.has(typeof value)) {
+    const kind = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    throw new Error(`value must be a string, number or boolean (got ${kind})`);
+  }
   const str = String(value);
   // Rule 1: NUL is rejected for every type, enum and numerics included.
   if (str.includes("\0")) {
@@ -299,10 +308,13 @@ function normalizeOptions(options) {
  * @param {object|null} [options.scope] - Scope definition (loadScopeFile,
  *   discoverScope or makeScope) for arguments with `scope_check = true`;
  *   absent is the fail-closed refusal
+ * @param {object} [options.customTypes] - Custom type map (loadCustomTypes)
+ *   consulted when `argDef.type` is not built in
  * @returns {*} The validated and possibly coerced value
  */
 export function validateArgIn(argDef, value, options) {
-  return settleSync(validateArgCore(argDef, value, normalizeOptions(options)));
+  const opts = normalizeOptions(options);
+  return settleSync(validateArgWithCustomTypesCore(argDef, value, opts.customTypes, opts));
 }
 
 /**
@@ -313,7 +325,8 @@ export function validateArgIn(argDef, value, options) {
  * @returns {Promise<*>}
  */
 export async function validateArgInAsync(argDef, value, options) {
-  return settleAsync(validateArgCore(argDef, value, normalizeOptions(options)));
+  const opts = normalizeOptions(options);
+  return settleAsync(validateArgWithCustomTypesCore(argDef, value, opts.customTypes, opts));
 }
 
 /**

@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from toolclad.manifest import LimitsDef, Manifest, _command_basename, _default_text
 from toolclad.schema import schema_error
 from toolclad.scope import manifest_scope
-from toolclad.validator import ValidationError, validate_arg_in
+from toolclad.validator import ValidationError, validate_arg_with_custom_types_mode
 
 # Variables the executor injects into every command context.
 INJECTED_VARS: Tuple[str, ...] = ("_scan_id", "_output_file", "_evidence_dir")
@@ -718,14 +718,17 @@ def _validate_call_args(
     """
     _check_declared_args(manifest, args)
     scope = manifest_scope(manifest)
+    custom = manifest.custom_types
     values: Dict[str, str] = {}
     absent: Set[str] = set()
     for arg_name, arg_def in manifest.args.items():
         if arg_name in args:
-            values[arg_name] = validate_arg_in(arg_def, args[arg_name], exec_mode, scope)
+            values[arg_name] = validate_arg_with_custom_types_mode(
+                arg_def, args[arg_name], custom, exec_mode, scope
+            )
         elif arg_def.default is not None:
-            values[arg_name] = validate_arg_in(
-                arg_def, _default_text(arg_def.default), exec_mode, scope
+            values[arg_name] = validate_arg_with_custom_types_mode(
+                arg_def, _default_text(arg_def.default), custom, exec_mode, scope
             )
         elif arg_def.required:
             raise ValidationError(f"Missing required argument: '{arg_name}'")

@@ -1,7 +1,11 @@
 export {
   loadManifest,
   loadManifestWithOptions,
+  loadManifestFromString,
   loadCustomTypes,
+  discoverCustomTypes,
+  BUILTIN_TYPES,
+  CUSTOM_TYPES,
   validateManifestWithCustomTypes,
   findUnknownKeys,
   MANIFEST_KEYS,

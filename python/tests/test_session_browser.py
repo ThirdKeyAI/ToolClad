@@ -6,15 +6,9 @@ import textwrap
 import tempfile
 import os
 
-import pytest
 
 from toolclad.manifest import (
     load_manifest,
-    SessionDef,
-    SessionCommandDef,
-    BrowserDef,
-    BrowserCommandDef,
-    BrowserScopeDef,
 )
 
 

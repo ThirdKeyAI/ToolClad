@@ -525,28 +525,47 @@ _CUSTOM_MSG = (
 )
 
 
+def _load_opaque(tmp_path, text: str, type_name: str) -> Manifest:
+    """Load with ``type_name`` declared as an opaque string custom type, so the
+    lint can be exercised separately against other custom definitions."""
+    from toolclad.manifest import LoadOptions, load_manifest_with_options
+
+    p = tmp_path / "t.clad.toml"
+    p.write_text(text)
+    return load_manifest_with_options(
+        str(p), LoadOptions(custom_types={type_name: CustomTypeDef(base="string")})
+    )
+
+
 class TestCustomTypeNetworkTargets:
+    def test_load_refuses_custom_network_type_from_discovered_config(self, tmp_path):
+        # The loader discovers toolclad.toml and runs the lint with its types.
+        (tmp_path / "toolclad.toml").write_text('[types.host]\nbase = "scope_target"\n')
+        with pytest.raises(ValueError) as exc:
+            _load(tmp_path, _doc("nmap", "host"))
+        assert str(exc.value) == _CUSTOM_MSG
+
     def test_manifest_lint_refuses_custom_network_type_on_egress_manifest(self, tmp_path):
-        # Without the custom types the type is opaque and the manifest loads.
-        m = _load(tmp_path, _doc("nmap", "host"))
+        # With an opaque definition of the type the manifest loads.
+        m = _load_opaque(tmp_path, _doc("nmap", "host"), "host")
         with pytest.raises(ValueError) as exc:
             validate_manifest_with_custom_types(m, {"host": CustomTypeDef(base="scope_target")})
         assert str(exc.value) == _CUSTOM_MSG
 
     @pytest.mark.parametrize("base", ["url", "ip_address", "cidr"])
     def test_every_network_base_is_refused(self, tmp_path, base):
-        m = _load(tmp_path, _doc("curl", "host"))
+        m = _load_opaque(tmp_path, _doc("curl", "host"), "host")
         with pytest.raises(ValueError, match=f"use the built-in {base} type"):
             validate_manifest_with_custom_types(m, {"host": CustomTypeDef(base=base)})
 
     def test_manifest_lint_passes_other_custom_types(self, tmp_path):
-        m = _load(tmp_path, _doc("nmap", "ident", _FLAG))
+        m = _load_opaque(tmp_path, _doc("nmap", "ident", _FLAG), "ident")
         validate_manifest_with_custom_types(m, {"ident": CustomTypeDef(base="string", pattern="[a-z]+")})
         # An unknown custom type is not this lint's concern.
         validate_manifest_with_custom_types(m, {})
 
     def test_manifest_lint_is_gated_on_egress(self, tmp_path):
-        m = _load(tmp_path, _doc("whois", "host"))
+        m = _load_opaque(tmp_path, _doc("whois", "host"), "host")
         validate_manifest_with_custom_types(m, {"host": CustomTypeDef(base="scope_target")})
 
     def test_manifest_lint_still_requires_the_flag_on_built_in_types(self, tmp_path):

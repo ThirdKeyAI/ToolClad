@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from toolclad.hostpolicy import (
     enforce_cidr_policy,
@@ -704,42 +704,46 @@ def validate_arg_with_custom_types_mode(
     definition cannot carry ``block_internal``, so the author's flag would
     be silently dropped. Network targets use the built-in types.
     """
-    if arg_def.type in custom_types:
-        custom = custom_types[arg_def.type]
-        if custom.base not in _TYPE_HANDLERS:
-            raise ValidationError(f"Custom type '{arg_def.type}' has invalid base type '{custom.base}'")
-        if custom.base in NETWORK_TARGET_TYPES:
-            raise ValidationError(
-                f"argument '{arg_def.name}' uses custom type '{arg_def.type}' as a "
-                f"network target; custom types cannot carry block_internal — use "
-                f"the built-in {custom.base} type"
-            )
+    return _run_validation(_resolve_custom(arg_def, custom_types), str(value), exec_mode, scope)
 
-        # Create synthetic ArgDef with custom type constraints merged
-        synthetic = ArgDef(
-            name=arg_def.name,
-            position=arg_def.position,
-            required=arg_def.required,
-            type=custom.base,
-            description=arg_def.description,
-            default=arg_def.default,
-            allowed=custom.allowed or arg_def.allowed,
-            pattern=custom.pattern or arg_def.pattern,
-            min=custom.min if custom.min is not None else arg_def.min,
-            max=custom.max if custom.max is not None else arg_def.max,
-            min_float=custom.min_float if custom.min_float is not None else arg_def.min_float,
-            max_float=custom.max_float if custom.max_float is not None else arg_def.max_float,
-            clamp=arg_def.clamp,
-            sanitize=arg_def.sanitize,
-            schemes=arg_def.schemes,
-            scope_check=arg_def.scope_check,
-            allow_leading_dash=arg_def.allow_leading_dash,
-            allow_whitespace=arg_def.allow_whitespace,
+
+def _resolve_custom(
+    arg_def: ArgDef, custom_types: Optional[Mapping[str, "CustomTypeDef"]]
+) -> ArgDef:
+    """The definition a value is validated against: ``arg_def`` itself for a
+    built-in type, else a synthetic definition on the custom type's base with
+    the custom constraints merged in (custom values win)."""
+    if not custom_types or arg_def.type not in custom_types:
+        return arg_def
+    custom = custom_types[arg_def.type]
+    if custom.base not in _TYPE_HANDLERS:
+        raise ValidationError(f"Custom type '{arg_def.type}' has invalid base type '{custom.base}'")
+    if custom.base in NETWORK_TARGET_TYPES:
+        raise ValidationError(
+            f"argument '{arg_def.name}' uses custom type '{arg_def.type}' as a "
+            f"network target; custom types cannot carry block_internal — use "
+            f"the built-in {custom.base} type"
         )
-        return _run_validation(synthetic, str(value), exec_mode, scope)
-
-    # Not a custom type, use standard validation
-    return validate_arg_in(arg_def, value, exec_mode, scope)
+    return ArgDef(
+        name=arg_def.name,
+        position=arg_def.position,
+        required=arg_def.required,
+        type=custom.base,
+        description=arg_def.description,
+        default=arg_def.default,
+        allowed=custom.allowed or arg_def.allowed,
+        pattern=custom.pattern or arg_def.pattern,
+        min=custom.min if custom.min is not None else arg_def.min,
+        max=custom.max if custom.max is not None else arg_def.max,
+        min_float=custom.min_float if custom.min_float is not None else arg_def.min_float,
+        max_float=custom.max_float if custom.max_float is not None else arg_def.max_float,
+        clamp=arg_def.clamp,
+        sanitize=arg_def.sanitize,
+        schemes=arg_def.schemes,
+        scope_check=arg_def.scope_check,
+        allow_leading_dash=arg_def.allow_leading_dash,
+        allow_whitespace=arg_def.allow_whitespace,
+    )
 
 
 def validate_arg_with_custom_types(

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadManifest, validateManifestWithCustomTypes } from "../src/manifest.js";
+import { loadManifest, loadManifestWithOptions, validateManifestWithCustomTypes } from "../src/manifest.js";
 import {
   validateArg,
   validateArgMode,
@@ -670,7 +670,9 @@ exec = ["wget", "{target}"]
 [output]
 format = "text"
 `);
-    const loaded = loadManifest(path);
-    assert.throws(() => validateManifestWithCustomTypes(loaded, types), /uses custom type 'web' as a network target/);
+    // A loaded manifest gets the same check at load, given the type map.
+    assert.throws(() => loadManifestWithOptions(path, { customTypes: types }), /uses custom type 'web' as a network target/);
+    // Without it, the unknown type itself is refused at load.
+    assert.throws(() => loadManifest(path), /unknown type 'web' for argument 'target'/);
   });
 });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadManifest, validateManifestWithCustomTypes } from "../src/manifest.js";
+import { loadManifest, loadManifestWithOptions } from "../src/manifest.js";
 import { validateArg } from "../src/validator.js";
 
 // Validator strictness shared with the other runtimes. No network tool is
@@ -134,9 +134,11 @@ format = "text"
   });
 
   it("checks custom-type defaults once the custom types are known", () => {
-    const m = loadManifest(manifest(`type = "level"\ndefault = "9"`));
     assert.throws(
-      () => validateManifestWithCustomTypes(m, { level: { base: "integer", min: 1, max: 5 } }),
+      () =>
+        loadManifestWithOptions(manifest(`type = "level"\ndefault = "9"`), {
+          customTypes: { level: { base: "integer", min: 1, max: 5 } },
+        }),
       /args\.a\.default is invalid/
     );
   });

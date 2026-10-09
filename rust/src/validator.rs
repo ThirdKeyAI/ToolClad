@@ -918,41 +918,50 @@ pub fn validate_arg_with_custom_types_in(
     exec_mode: bool,
     scope: Option<&ScopeDef>,
 ) -> Result<String, ToolCladError> {
-    // Check if the type is a custom type
-    if let Some(custom) = custom_types.get(&def.type_name) {
-        // Verify the base type is valid
-        if !SUPPORTED_TYPES.contains(&custom.base.as_str()) {
-            return Err(ToolCladError::ManifestError(format!(
-                "custom type '{}' has invalid base type '{}'",
-                def.type_name, custom.base
-            )));
-        }
-        // Create a synthetic ArgDef with the custom type's constraints merged
-        let mut synthetic = def.clone();
-        synthetic.type_name = custom.base.clone();
-        if let Some(ref allowed) = custom.allowed {
-            synthetic.allowed = Some(allowed.clone());
-        }
-        if let Some(ref pattern) = custom.pattern {
-            synthetic.pattern = Some(pattern.clone());
-        }
-        if let Some(min) = custom.min {
-            synthetic.min = Some(min);
-        }
-        if let Some(max) = custom.max {
-            synthetic.max = Some(max);
-        }
-        if let Some(min_f) = custom.min_float {
-            synthetic.min_float = Some(min_f);
-        }
-        if let Some(max_f) = custom.max_float {
-            synthetic.max_float = Some(max_f);
-        }
-        return validate_arg_in(name, &synthetic, value, exec_mode, scope);
+    match resolve_custom_type(def, custom_types) {
+        Some(Ok(synthetic)) => validate_arg_in(name, &synthetic, value, exec_mode, scope),
+        Some(Err(e)) => Err(e),
+        None => validate_arg_in(name, def, value, exec_mode, scope),
     }
+}
 
-    // Not a custom type, use standard validation
-    validate_arg_in(name, def, value, exec_mode, scope)
+/// The argument definition a custom type stands for: `def` with its type
+/// replaced by the custom type's base and the custom type's constraints
+/// (`allowed`, `pattern`, `min`, `max`, `min_float`, `max_float`) merged over
+/// it. `None` when `def.type_name` is not a custom type; an error when the
+/// custom type's base is not a built-in type.
+pub fn resolve_custom_type(
+    def: &ArgDef,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+) -> Option<Result<ArgDef, ToolCladError>> {
+    let custom = custom_types.get(&def.type_name)?;
+    if !SUPPORTED_TYPES.contains(&custom.base.as_str()) {
+        return Some(Err(ToolCladError::ManifestError(format!(
+            "custom type '{}' has invalid base type '{}'",
+            def.type_name, custom.base
+        ))));
+    }
+    let mut synthetic = def.clone();
+    synthetic.type_name = custom.base.clone();
+    if let Some(ref allowed) = custom.allowed {
+        synthetic.allowed = Some(allowed.clone());
+    }
+    if let Some(ref pattern) = custom.pattern {
+        synthetic.pattern = Some(pattern.clone());
+    }
+    if let Some(min) = custom.min {
+        synthetic.min = Some(min);
+    }
+    if let Some(max) = custom.max {
+        synthetic.max = Some(max);
+    }
+    if let Some(min_f) = custom.min_float {
+        synthetic.min_float = Some(min_f);
+    }
+    if let Some(max_f) = custom.max_float {
+        synthetic.max_float = Some(max_f);
+    }
+    Some(Ok(synthetic))
 }
 
 #[cfg(test)]
@@ -2515,5 +2524,190 @@ mod tests {
         def.allowed = Some(vec!["ping".to_string()]);
         assert!(validate_arg("e", &def, " ping").is_err());
         assert!(validate_arg("i", &make_arg("ip_address"), "10.0.0.1 ").is_err());
+    }
+
+    // ---- property test: the fuzz property over deterministic inputs ----
+
+    /// Characters the generator draws from, weighted toward the ones the
+    /// hygiene rules exist for.
+    const FUZZ_ALPHABET: &[char] = &[
+        'a',
+        'Z',
+        '0',
+        '9',
+        '.',
+        '/',
+        ':',
+        '-',
+        '+',
+        '_',
+        '@',
+        '*',
+        '?',
+        '[',
+        ']',
+        '(',
+        ')',
+        '%',
+        '=',
+        ',',
+        ';',
+        '|',
+        '&',
+        '$',
+        '`',
+        '<',
+        '>',
+        '{',
+        '}',
+        '!',
+        '#',
+        '~',
+        ' ',
+        '\t',
+        '\n',
+        '\r',
+        '\0',
+        '\x0b',
+        '\x0c',
+        '\x1b',
+        '\x7f',
+        '\u{85}',
+        '\u{9f}',
+        '\u{a0}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{3000}',
+        '\u{200b}',
+        '\u{feff}',
+        '\'',
+        '"',
+        '\\',
+        'h',
+        't',
+        'p',
+        's',
+        'x',
+        '1',
+        '2',
+        'm',
+        '\u{e9}',
+        '\u{1f600}',
+    ];
+
+    const FUZZ_PREFIXES: &[&str] = &[
+        "",
+        "",
+        "",
+        "http://",
+        "https://",
+        "10.0.0.",
+        "example.com",
+        "-",
+        "+",
+        "../",
+        "1h",
+        "1.2.3.4/",
+        "::1",
+        "0x7f.1",
+        "RHOSTS ",
+    ];
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn value(&mut self) -> String {
+            let mut s = FUZZ_PREFIXES[self.below(FUZZ_PREFIXES.len())].to_string();
+            for _ in 0..self.below(24) {
+                s.push(FUZZ_ALPHABET[self.below(FUZZ_ALPHABET.len())]);
+            }
+            s
+        }
+    }
+
+    /// The fuzz property for one accepted value: a string-derived type never
+    /// returns whitespace, a quote, a backslash, a control character, or a
+    /// leading `-`/`+` without the matching opt-in (`msf_options` may keep
+    /// its ASCII space separator).
+    fn assert_hygienic(type_name: &str, input: &str, out: &str) {
+        let space_ok = type_name == "msf_options";
+        assert!(
+            !out.chars()
+                .any(|c| c.is_whitespace() && !(space_ok && c == ' ')),
+            "{type_name}: {input:?} -> {out:?} contains whitespace"
+        );
+        assert!(
+            !out.contains(['\'', '"', '\\']),
+            "{type_name}: {input:?} -> {out:?} contains a quote or backslash"
+        );
+        assert!(
+            !out.chars().any(is_control_char),
+            "{type_name}: {input:?} -> {out:?} contains a control character"
+        );
+        assert!(
+            !out.starts_with(['-', '+']),
+            "{type_name}: {input:?} -> {out:?} starts with '-' or '+'"
+        );
+    }
+
+    #[test]
+    fn test_validator_property_over_pseudo_random_inputs() {
+        let defs: Vec<ArgDef> = [
+            "string",
+            "path",
+            "regex_match",
+            "url",
+            "scope_target",
+            "duration",
+            "msf_options",
+            "integer",
+            "number",
+            "port",
+            "boolean",
+            "ip_address",
+            "cidr",
+        ]
+        .iter()
+        .map(|t| {
+            let mut d = make_arg(t);
+            if *t == "regex_match" {
+                d.pattern = Some(".*".to_string());
+            }
+            d
+        })
+        .collect();
+        let mut enum_def = make_arg("enum");
+        enum_def.allowed = Some(vec!["a".into(), "b".into()]);
+
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        let mut accepted = 0usize;
+        for _ in 0..4000 {
+            let value = rng.value();
+            for def in defs.iter().chain(std::iter::once(&enum_def)) {
+                for exec_mode in [false, true] {
+                    if let Ok(out) = validate_arg_mode("v", def, &value, exec_mode) {
+                        accepted += 1;
+                        if STRING_DERIVED_TYPES.contains(&def.type_name.as_str()) {
+                            assert_hygienic(&def.type_name, &value, &out);
+                        }
+                    }
+                }
+            }
+        }
+        // The generator must reach the accepting paths, not only refusals.
+        assert!(accepted > 100, "only {accepted} values accepted");
     }
 }

@@ -40,26 +40,12 @@ func validateCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifestWithOptions(path, manifest.LoadOptions{
+			m, err := loadManifest(path, manifest.LoadOptions{
 				AllowUnknownKeys: allowUnknownKeys,
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s  ERROR: %v\n", path, err)
 				return err
-			}
-
-			// Validate that all arg types are known.
-			supported := validator.SupportedTypes()
-			supportedSet := make(map[string]bool)
-			for _, t := range supported {
-				supportedSet[t] = true
-			}
-
-			for name, arg := range m.Args {
-				if !supportedSet[arg.Type] {
-					fmt.Fprintf(os.Stderr, "%s  ERROR: arg %q has unknown type %q\n", path, name, arg.Type)
-					return fmt.Errorf("unknown type %q for arg %q", arg.Type, name)
-				}
 			}
 
 			// LoadManifest has already compiled [command] into its canonical
@@ -96,7 +82,7 @@ func runCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{})
 			if err != nil {
 				return err
 			}
@@ -142,7 +128,7 @@ func schemaCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{})
 			if err != nil {
 				return err
 			}
@@ -163,7 +149,7 @@ func testCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{})
 			if err != nil {
 				return err
 			}
@@ -199,7 +185,7 @@ func testCmd() *cobra.Command {
 
 				// allow_whitespace is honored only when the manifest
 				// declared exec = [...] itself.
-				validated, vErr := validator.ValidateArgIn(argDef, val, m.Command.ExecWasDeclared, m.Scope)
+				validated, vErr := validator.ValidateArgWithCustomTypesIn(argDef, val, m.CustomTypes, m.Command.ExecWasDeclared, m.Scope)
 				status := "OK"
 				if vErr != nil {
 					status = fmt.Sprintf("FAIL: %v", vErr)
@@ -249,6 +235,22 @@ func testCmd() *cobra.Command {
 
 	cmd.Flags().StringArrayVar(&argFlags, "arg", nil, "Tool argument in key=value format (repeatable)")
 	return cmd
+}
+
+// loadManifest is the one load path every subcommand uses: the library's
+// LoadManifestWithOptions discovers toolclad.toml upward from the manifest
+// (or TOOLCLAD_CONFIG_FILE) and type-checks every argument against the
+// built-in and custom types; ValidateManifestWithCustomTypes then re-checks
+// custom-type defaults and the egress lint with the custom types in hand.
+func loadManifest(path string, opts manifest.LoadOptions) (*manifest.Manifest, error) {
+	m, err := manifest.LoadManifestWithOptions(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := validator.ValidateManifestWithCustomTypes(m, m.CustomTypes); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
+	return m, nil
 }
 
 // parseArgFlags parses --arg key=value flags into a map.

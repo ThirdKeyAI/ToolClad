@@ -16,7 +16,6 @@ from toolclad.manifest import (
     ArgDef,
     CommandDef,
     ConditionalDef,
-    EvidenceDef,
     HttpDef,
     McpProxyDef,
     Manifest,

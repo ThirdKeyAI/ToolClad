@@ -86,8 +86,13 @@ fn main() {
 }
 
 fn cmd_validate(path: &str, allow_unknown_keys: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest =
-        toolclad::load_manifest_with(path, toolclad::LoadOptions { allow_unknown_keys })?;
+    let manifest = toolclad::load_manifest_with(
+        path,
+        toolclad::LoadOptions {
+            allow_unknown_keys,
+            ..Default::default()
+        },
+    )?;
     println!("Manifest:     {path}");
     println!("Tool:         {}", manifest.tool.name);
     println!("Version:      {}", manifest.tool.version);

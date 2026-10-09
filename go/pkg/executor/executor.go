@@ -295,7 +295,8 @@ func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (m
 // validateArgs is the one argument-validation routine every backend
 // calls: it refuses undeclared names, loads the manifest's scope, refuses a
 // missing required argument, applies declared defaults and validates every
-// supplied or defaulted value through validator.ValidateArgIn. The result
+// supplied or defaulted value through validator.ValidateArgWithCustomTypesIn
+// with the manifest's custom types. The result
 // holds exactly those values; an unset optional without a default is
 // absent. execMode is true only for a manifest that declared exec itself.
 func validateArgs(m *manifest.Manifest, args map[string]string, execMode bool) (map[string]string, error) {
@@ -323,7 +324,7 @@ func validateArgs(m *manifest.Manifest, args map[string]string, execMode bool) (
 			}
 			val = fmt.Sprintf("%v", argDef.Default)
 		}
-		validated, err := validator.ValidateArgIn(argDef, val, execMode, m.Scope)
+		validated, err := validator.ValidateArgWithCustomTypesIn(argDef, val, m.CustomTypes, execMode, m.Scope)
 		if err != nil {
 			return nil, fmt.Errorf("argument %q: %w", name, err)
 		}
@@ -1579,6 +1580,7 @@ func executeMCP(m *manifest.Manifest, args map[string]string, gate Gate) (*Evide
 		Status:    "delegation_preview",
 		ScanID:    scanID,
 		Tool:      m.Tool.Name,
+		Command:   "mcp://" + m.Mcp.Server + "/" + m.Mcp.Tool,
 		Timestamp: start.UTC().Format(time.RFC3339),
 		Results: map[string]any{
 			"mcp_server":  m.Mcp.Server,
@@ -1594,8 +1596,9 @@ func GenerateMCPSchema(m *manifest.Manifest) map[string]any {
 	var required []string
 
 	for _, arg := range m.ArgsSorted() {
-		prop := mcpTypeConstraints(arg.Type)
-		if arg.Type == "number" {
+		// A custom type is described by its base type.
+		prop := mcpTypeConstraints(m.BaseType(arg.Type))
+		if m.BaseType(arg.Type) == "number" {
 			if arg.MinFloat != nil {
 				prop["minimum"] = *arg.MinFloat
 			}

@@ -1,9 +1,13 @@
 """ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes."""
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from toolclad.manifest import (
     MANIFEST_KEYS,
+    CustomTypeDef,
+    discover_custom_types,
+    load_custom_types,
+    load_manifest_from_str,
     LoadOptions,
     Manifest,
     HttpDef,
@@ -53,6 +57,10 @@ from toolclad.executor import (
 
 __all__ = [
     "MANIFEST_KEYS",
+    "CustomTypeDef",
+    "discover_custom_types",
+    "load_custom_types",
+    "load_manifest_from_str",
     "LoadOptions",
     "Manifest",
     "HttpDef",

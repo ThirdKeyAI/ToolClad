@@ -122,14 +122,33 @@ use std::path::Path;
 use types::{CustomTypeDef, Manifest, ToolCladError, MODES};
 
 /// Loader options. The default is strict; see [`load_manifest_with`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadOptions {
     /// Downgrade unknown manifest keys from a load error to a warning on
     /// stderr (`warning: unknown key '<section>.<key>' in manifest`) and drop
     /// them. An authoring aid for `toolclad validate --allow-unknown-keys`;
     /// the plain loaders never set it.
     pub allow_unknown_keys: bool,
+    /// Custom types to use instead of discovering `toolclad.toml` (for an
+    /// embedder that already has them). Each is checked as a discovered one
+    /// would be. `None` (the default) runs discovery; see
+    /// [`discover_custom_types`].
+    pub custom_types: Option<HashMap<String, CustomTypeDef>>,
 }
+
+/// Environment variable naming the project `toolclad.toml` explicitly.
+pub const CONFIG_FILE_ENV: &str = "TOOLCLAD_CONFIG_FILE";
+
+/// Keys a `[types.<name>]` table in `toolclad.toml` accepts.
+const CUSTOM_TYPE_KEYS: &[&str] = &[
+    "base",
+    "allowed",
+    "pattern",
+    "min",
+    "max",
+    "min_float",
+    "max_float",
+];
 
 /// Load and parse a `.clad.toml` manifest from the given path.
 ///
@@ -201,8 +220,19 @@ fn parse_manifest_impl(
         return Err(ToolCladError::ManifestError(unknown_keys_message(&unknown)));
     };
 
+    let custom_types = match options.custom_types {
+        Some(types) => {
+            for (name, def) in &types {
+                check_custom_type(name, def)?;
+            }
+            types
+        }
+        None => discover_custom_types(source_dir)?,
+    };
+
     compile_command(&mut manifest)?;
-    validate_manifest(&manifest)?;
+    validate_manifest_with_custom_types(&manifest, &custom_types)?;
+    manifest.custom_types = custom_types;
 
     // Load the scope once, here, when any argument asks for it. No file is
     // not an error at load: every `scope_check` argument then fails closed.
@@ -781,18 +811,12 @@ fn check_http(manifest: &Manifest) -> Result<(), ToolCladError> {
     Ok(())
 }
 
-/// Validate internal consistency of a parsed manifest with no custom types in
-/// scope: every argument type must be built in.
-fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
-    validate_manifest_with_custom_types(manifest, &HashMap::new())
-}
-
 /// Validate internal consistency of a parsed manifest with the custom types
 /// of a `toolclad.toml` in scope (see [`load_custom_types`]). A custom type
 /// name is accepted wherever a built-in type is, with its base type checked;
 /// the egress lint then also refuses a custom type over a network-target base
-/// in an egress manifest. The loaders call the no-custom-types form; a runtime
-/// that loads custom types calls this after parsing.
+/// in an egress manifest. The loaders call this with the discovered custom
+/// types.
 pub fn validate_manifest_with_custom_types(
     manifest: &Manifest,
     custom_types: &HashMap<String, CustomTypeDef>,
@@ -859,7 +883,7 @@ pub fn validate_manifest_with_custom_types(
 
     // Validate argument types and constraints. A custom type stands in for
     // its base type.
-    for (name, def) in &manifest.args {
+    for (name, def) in all_arg_defs(manifest) {
         let custom = custom_types.get(&def.type_name);
         let base = custom.map_or(def.type_name.as_str(), |c| c.base.as_str());
         if !validator::SUPPORTED_TYPES.contains(&base) {
@@ -965,43 +989,122 @@ pub fn validate_manifest_with_custom_types(
     Ok(())
 }
 
-/// Load custom type definitions from a toolclad.toml file.
+/// Load custom type definitions from a `toolclad.toml` file.
+///
+/// Strict: the only top-level key is `types`, each `[types.<name>]` accepts
+/// only `base allowed pattern min max min_float max_float`, `base` must be a
+/// built-in type, a custom type may not reuse a built-in type name, and a
+/// `pattern` must compile.
 pub fn load_custom_types<P: AsRef<Path>>(
     path: P,
 ) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
-    let content = std::fs::read_to_string(path.as_ref())
-        .map_err(|e| ToolCladError::ManifestError(format!("failed to read toolclad.toml: {e}")))?;
-    let config: toml::Value = toml::from_str(&content).map_err(|e| {
-        ToolCladError::ManifestError(format!("TOML parse error in toolclad.toml: {e}"))
+    let path = path.as_ref();
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        ToolCladError::ManifestError(format!("failed to read '{}': {e}", path.display()))
     })?;
+    parse_custom_types(&content)
+}
+
+/// [`load_custom_types`] from a TOML string.
+pub fn parse_custom_types(content: &str) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    let err = |m: String| ToolCladError::ManifestError(format!("toolclad.toml: {m}"));
+    let config: toml::Table =
+        toml::from_str(content).map_err(|e| err(format!("TOML parse error: {e}")))?;
 
     let mut types = HashMap::new();
-    if let Some(types_table) = config.get("types").and_then(|t| t.as_table()) {
-        for (name, def) in types_table {
-            let base = def.get("base").and_then(|b| b.as_str()).ok_or_else(|| {
-                ToolCladError::ManifestError(format!("custom type '{name}' missing 'base' field"))
-            })?;
-
-            let custom = CustomTypeDef {
-                base: base.to_string(),
-                allowed: def.get("allowed").and_then(|a| a.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                }),
-                pattern: def
-                    .get("pattern")
-                    .and_then(|p| p.as_str())
-                    .map(String::from),
-                min: def.get("min").and_then(|m| m.as_integer()),
-                max: def.get("max").and_then(|m| m.as_integer()),
-                min_float: def.get("min_float").and_then(|m| m.as_float()),
-                max_float: def.get("max_float").and_then(|m| m.as_float()),
+    for (key, value) in config {
+        if key != "types" {
+            return Err(err(format!("unknown key '{key}'")));
+        }
+        let toml::Value::Table(table) = value else {
+            return Err(err("'types' must be a table".to_string()));
+        };
+        for (name, def) in table {
+            let toml::Value::Table(fields) = def else {
+                return Err(err(format!("'types.{name}' must be a table")));
             };
-            types.insert(name.clone(), custom);
+            if let Some(bad) = fields
+                .keys()
+                .find(|k| !CUSTOM_TYPE_KEYS.contains(&k.as_str()))
+            {
+                return Err(err(format!("unknown key 'types.{name}.{bad}'")));
+            }
+            if !fields.contains_key("base") {
+                return Err(err(format!("custom type '{name}' missing 'base' field")));
+            }
+            let custom: CustomTypeDef = toml::Value::Table(fields)
+                .try_into()
+                .map_err(|e| err(format!("custom type '{name}': {e}")))?;
+            check_custom_type(&name, &custom)?;
+            types.insert(name, custom);
         }
     }
     Ok(types)
+}
+
+/// Check one custom type: a built-in base, no shadowing of a built-in type
+/// name, and a pattern that compiles once anchored.
+fn check_custom_type(name: &str, def: &CustomTypeDef) -> Result<(), ToolCladError> {
+    if validator::SUPPORTED_TYPES.contains(&name) {
+        return Err(ToolCladError::ManifestError(format!(
+            "custom type '{name}' shadows a built-in type"
+        )));
+    }
+    if !validator::SUPPORTED_TYPES.contains(&def.base.as_str()) {
+        return Err(ToolCladError::ManifestError(format!(
+            "custom type '{name}' has invalid base type '{}' (the base must be a built-in type)",
+            def.base
+        )));
+    }
+    if let Some(ref pat) = def.pattern {
+        regex::Regex::new(&validator::anchor_pattern(pat)).map_err(|e| {
+            ToolCladError::ManifestError(format!(
+                "custom type '{name}' has an invalid pattern: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Locate and load the project `toolclad.toml` for a manifest in
+/// `manifest_dir` (`None` for a manifest parsed from a string: the search
+/// starts at the cwd).
+///
+/// `TOOLCLAD_CONFIG_FILE`, when set and non-empty, names the file (unreadable
+/// is an error). Otherwise `toolclad.toml` is searched upward from the
+/// manifest's directory to the filesystem root. No file means no custom
+/// types.
+pub fn discover_custom_types(
+    manifest_dir: Option<&Path>,
+) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    let env = std::env::var_os(CONFIG_FILE_ENV);
+    discover_custom_types_with(env.as_deref(), manifest_dir)
+}
+
+/// [`discover_custom_types`] with the `TOOLCLAD_CONFIG_FILE` value passed
+/// explicitly (an empty value counts as unset).
+pub fn discover_custom_types_with(
+    env_file: Option<&std::ffi::OsStr>,
+    manifest_dir: Option<&Path>,
+) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    if let Some(file) = env_file.filter(|f| !f.is_empty()) {
+        return load_custom_types(Path::new(file));
+    }
+    let cwd = std::env::current_dir().map_err(|e| {
+        ToolCladError::ManifestError(format!("cannot determine current directory: {e}"))
+    })?;
+    let start = match manifest_dir {
+        Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+        Some(dir) => cwd.join(dir),
+        None => cwd,
+    };
+    for dir in start.ancestors() {
+        let candidate = dir.join("toolclad.toml");
+        if candidate.is_file() {
+            return load_custom_types(&candidate);
+        }
+    }
+    Ok(HashMap::new())
 }
 
 /// Generate an MCP-compatible JSON schema from a manifest.
@@ -1014,6 +1117,10 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
     args.sort_by_key(|(_, def)| def.position);
 
     for (name, def) in &args {
+        // A custom type is described by its base type and merged constraints.
+        let resolved =
+            validator::resolve_custom_type(def, &manifest.custom_types).and_then(Result::ok);
+        let def = resolved.as_ref().unwrap_or(def);
         let mut prop = serde_json::Map::new();
 
         // Map ToolClad types to JSON Schema types with constraints.
@@ -2501,6 +2608,7 @@ format = "text"
 
         let lenient = LoadOptions {
             allow_unknown_keys: true,
+            ..Default::default()
         };
         let m = parse_manifest_with(&text, lenient).unwrap();
         // The unknown keys were dropped, not applied under another name.
@@ -3333,5 +3441,275 @@ format = "text"
         .unwrap_err()
         .to_string();
         assert!(err.contains("not a valid token"), "{err}");
+    }
+
+    // ---- toolclad.toml discovery and load-time type checks (TC-23) ----
+
+    fn examples_dir() -> Option<std::path::PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        if dir.is_dir() {
+            Some(dir)
+        } else {
+            eprintln!("skipping: examples directory {} is absent", dir.display());
+            None
+        }
+    }
+
+    fn dry(m: &Manifest, pairs: &[(&str, &str)]) -> Result<executor::DryRunResult, ToolCladError> {
+        let args: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        executor::dry_run(m, &args)
+    }
+
+    #[test]
+    fn test_shipped_examples_load_and_dry_run() {
+        let Some(dir) = examples_dir() else { return };
+        for name in [
+            "curl_fetch",
+            "dig_lookup",
+            "nikto_scan",
+            "nmap_scan",
+            "whois_lookup",
+        ] {
+            let path = dir.join(format!("{name}.clad.toml"));
+            load_manifest(&path).unwrap_or_else(|e| panic!("{name} should load: {e}"));
+        }
+
+        // nikto: custom types from the project toolclad.toml resolve.
+        let nikto = load_manifest(dir.join("nikto_scan.clad.toml")).unwrap();
+        assert_eq!(nikto.custom_types["port_range"].base, "string");
+        let out = dry(
+            &nikto,
+            &[
+                ("target", "93.184.216.34"),
+                ("port", "8080-8090"),
+                ("protocol", "https"),
+                ("max_rate", "250"),
+            ],
+        )
+        .unwrap();
+        let argv: Vec<&str> = out.command.split(' ').collect();
+        for token in [
+            "-h",
+            "https://93.184.216.34:8080-8090",
+            "-Plugins",
+            "@@ALL",
+            "-maxrate",
+            "250",
+        ] {
+            assert!(argv.contains(&token), "missing {token} in {argv:?}");
+        }
+        // The custom port_range pattern is anchored.
+        assert!(dry(&nikto, &[("target", "93.184.216.34"), ("port", "80;id")]).is_err());
+        assert!(dry(&nikto, &[("target", "93.184.216.34"), ("port", "8080x")]).is_err());
+        // The custom scan_rate bounds apply.
+        assert!(dry(&nikto, &[("target", "93.184.216.34"), ("max_rate", "0")]).is_err());
+
+        // curl: the scope is in reach from examples/.
+        let curl = load_manifest(dir.join("curl_fetch.clad.toml")).unwrap();
+        let err = dry(&curl, &[("url", "https://93.184.216.34/")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scope"), "{err}");
+        match dry(&curl, &[("url", "https://example.com/")]) {
+            Ok(out) => assert!(
+                out.command.ends_with("https://example.com/"),
+                "{}",
+                out.command
+            ),
+            Err(e) if e.to_string().contains("could not resolve host") => {
+                eprintln!("skipping the example.com assertion: DNS is unavailable ({e})");
+            }
+            Err(e) => panic!("https://example.com/ should be accepted: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_types_file_is_strict() {
+        let ok = "[types.level]\nbase = \"enum\"\nallowed = [\"a\", \"b\"]\n";
+        assert_eq!(parse_custom_types(ok).unwrap()["level"].base, "enum");
+        for (src, want) in [
+            ("[other]\nx = 1\n", "unknown key 'other'"),
+            (
+                "[types.t]\nbase = \"string\"\nblock_internal = true\n",
+                "unknown key 'types.t.block_internal'",
+            ),
+            ("[types.t]\npattern = \"a\"\n", "missing 'base'"),
+            ("[types.t]\nbase = \"level\"\n", "invalid base type 'level'"),
+            (
+                "[types.url]\nbase = \"string\"\n",
+                "shadows a built-in type",
+            ),
+            (
+                "[types.t]\nbase = \"string\"\npattern = \"(\"\n",
+                "invalid pattern",
+            ),
+            (
+                "[types.t]\nbase = \"integer\"\nmin = \"1\"\n",
+                "custom type 't'",
+            ),
+            ("types = 1\n", "'types' must be a table"),
+        ] {
+            let err = parse_custom_types(src).unwrap_err().to_string();
+            assert!(err.contains(want), "{src:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_custom_types_discovery() {
+        let root = std::env::temp_dir().join(format!("toolclad-ct-{}", std::process::id()));
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("toolclad.toml"),
+            "[types.rate]\nbase = \"integer\"\nmin = 1\nmax = 5\n",
+        )
+        .unwrap();
+        let found = discover_custom_types_with(None, Some(&nested)).unwrap();
+        assert_eq!(found["rate"].max, Some(5));
+        // The env file wins; an unreadable one is an error.
+        let missing = root.join("missing.toml");
+        let err = discover_custom_types_with(Some(missing.as_os_str()), Some(&nested))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to read"), "{err}");
+
+        // A manifest file picks the types up on load and validates with them.
+        let manifest = nested.join("t.clad.toml");
+        std::fs::write(
+            &manifest,
+            "[tool]\nname = \"t\"\nversion = \"1\"\nbinary = \"echo\"\ndescription = \"d\"\n\n\
+             [args.n]\nposition = 1\nrequired = true\ntype = \"rate\"\n\n\
+             [command]\nexec = [\"echo\", \"{n}\"]\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let m = load_manifest(&manifest).unwrap();
+        assert_eq!(dry(&m, &[("n", "3")]).unwrap().command, "echo 3");
+        assert!(dry(&m, &[("n", "9")]).is_err());
+        let schema = generate_mcp_schema(&m);
+        assert_eq!(schema["inputSchema"]["properties"]["n"]["type"], "integer");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const RATE_MANIFEST: &str = "[tool]\nname = \"t\"\nversion = \"1\"\nbinary = \"echo\"\n\
+        description = \"d\"\n\n[args.n]\nposition = 1\nrequired = true\ntype = \"rate\"\n\n\
+        [command]\nexec = [\"echo\", \"{n}\"]\n\n[output]\nformat = \"text\"\n";
+
+    #[test]
+    fn test_load_options_custom_types_override() {
+        let types = parse_custom_types("[types.rate]\nbase = \"integer\"\nmax = 5\n").unwrap();
+        let opts = LoadOptions {
+            custom_types: Some(types),
+            ..Default::default()
+        };
+        let m = parse_manifest_with(RATE_MANIFEST, opts).unwrap();
+        assert_eq!(dry(&m, &[("n", "5")]).unwrap().command, "echo 5");
+        assert!(dry(&m, &[("n", "6")]).is_err());
+        assert!(executor::execute(&m, &[("n".to_string(), "6".to_string())].into()).is_err());
+
+        // An empty override means no custom types at all.
+        let opts = LoadOptions {
+            custom_types: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let err = parse_manifest_with(RATE_MANIFEST, opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown type 'rate' for argument 'n'"),
+            "{err}"
+        );
+
+        // An override is checked like a discovered file.
+        let mut bad = HashMap::new();
+        bad.insert(
+            "rate".to_string(),
+            CustomTypeDef {
+                base: "rate".to_string(),
+                allowed: None,
+                pattern: None,
+                min: None,
+                max: None,
+                min_float: None,
+                max_float: None,
+            },
+        );
+        let opts = LoadOptions {
+            custom_types: Some(bad),
+            ..Default::default()
+        };
+        assert!(parse_manifest_with(RATE_MANIFEST, opts).is_err());
+    }
+
+    #[test]
+    fn test_session_and_browser_arg_types_checked_at_load() {
+        let session =
+            "[tool]\nname = \"s\"\nversion = \"1\"\nbinary = \"psql\"\ndescription = \"d\"\n\n\
+            [session]\nstartup_command = \"psql\"\nready_pattern = \"=> $\"\n\n\
+            [session.commands.q]\npattern = \"^select\"\ndescription = \"q\"\n\n\
+            [session.commands.q.args.x]\ntype = \"nope\"\n\n[output]\nformat = \"text\"\n";
+        let err = parse_manifest(session).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown type 'nope' for argument 'session.commands.q.args.x'"),
+            "{err}"
+        );
+    }
+
+    // ---- the shared negative suite (tests/injection_vectors.json) ----
+
+    #[test]
+    fn test_shared_injection_vectors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/injection_vectors.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} is absent", path.display());
+            return;
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut executed = 0usize;
+        let mut failures = Vec::new();
+
+        for v in doc["arg_vectors"].as_array().unwrap() {
+            let (id, note, expect) = (&v["id"], &v["note"], v["expect"].as_str().unwrap());
+            let def: types::ArgDef = serde_json::from_value(v["arg"].clone())
+                .unwrap_or_else(|e| panic!("vector {id}: bad arg definition: {e}"));
+            let value = v["value"].as_str().unwrap();
+            let verdict = validator::validate_arg("arg", &def, value);
+            let ok = match expect {
+                "reject" => verdict.is_err(),
+                "accept" => verdict.is_ok(),
+                other => panic!("vector {id}: unknown expect '{other}'"),
+            };
+            if !ok {
+                failures.push(format!(
+                    "arg vector {id} expected {expect}, got {verdict:?} ({note})"
+                ));
+            }
+            executed += 1;
+        }
+
+        for v in doc["manifest_vectors"].as_array().unwrap() {
+            let (id, note, expect) = (&v["id"], &v["note"], v["expect"].as_str().unwrap());
+            let verdict = parse_manifest(v["manifest"].as_str().unwrap());
+            let ok = match expect {
+                "reject" => verdict.is_err(),
+                "accept" => verdict.is_ok(),
+                other => panic!("vector {id}: unknown expect '{other}'"),
+            };
+            if !ok {
+                let got = verdict
+                    .map(|_| "accepted".to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                failures.push(format!(
+                    "manifest vector {id} expected {expect}, got {got} ({note})"
+                ));
+            }
+            executed += 1;
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(executed > 0, "no vectors executed");
+        println!("injection vectors executed: {executed}");
     }
 }

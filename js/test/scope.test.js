@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { loadManifest, validateManifestWithCustomTypes } from "../src/manifest.js";
+import { loadManifest, loadManifestWithOptions } from "../src/manifest.js";
 import { validateArg, validateArgIn, validateArgInAsync } from "../src/validator.js";
 import { execute, executeMcp } from "../src/executor.js";
 import {
@@ -370,9 +370,8 @@ describe("scope_check at manifest load", () => {
   it("is refused on a custom type with an unsupported base", async () => {
     const path = join(tmpDir(), "t.clad.toml");
     writeFileSync(path, manifestToml("ticket"));
-    const manifest = loadManifest(path);
     assert.throws(
-      () => validateManifestWithCustomTypes(manifest, { ticket: { base: "string" } }),
+      () => loadManifestWithOptions(path, { customTypes: { ticket: { base: "string" } } }),
       /scope_check is not supported for type 'ticket'/
     );
   });

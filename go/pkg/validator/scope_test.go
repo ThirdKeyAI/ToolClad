@@ -279,6 +279,7 @@ func TestScopeCheckUnsupportedTypeIsLoadError(t *testing.T) {
 
 func TestDefaultsValidatedAtLoad(t *testing.T) {
 	t.Setenv(scope.EnvVar, "")
+	t.Setenv(manifest.ConfigEnvVar, "")
 	bad := map[string]string{
 		"port zero":         "type = \"port\"\ndefault = 0\n",
 		"integer below min": "type = \"integer\"\nmin = 1\ndefault = 0\n",
@@ -301,7 +302,6 @@ func TestDefaultsValidatedAtLoad(t *testing.T) {
 		"enum":                      "type = \"enum\"\nallowed = [\"a\"]\ndefault = \"a\"\n",
 		"number":                    "type = \"number\"\ndefault = 0.5\n",
 		"boolean":                   "type = \"boolean\"\ndefault = true\n",
-		"custom type deferred":      "type = \"my_custom\"\ndefault = \"x y\"\n",
 	}
 	for name, spec := range good {
 		p := writeManifest(t, t.TempDir(), "[args.target]\nposition = 1\n"+spec)
@@ -309,14 +309,23 @@ func TestDefaultsValidatedAtLoad(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	// A custom-typed default is checked once custom types are known.
-	m, err := manifest.LoadManifest(writeManifest(t, t.TempDir(), "[args.target]\nposition = 1\ntype = \"rate\"\ndefault = 0\n"))
+	// An unknown type is a load error; a custom-typed default is checked
+	// at load against the custom type.
+	unknown := writeManifest(t, t.TempDir(), "[args.target]\nposition = 1\ntype = \"rate\"\ndefault = 0\n")
+	if _, err := manifest.LoadManifest(unknown); err == nil || !strings.Contains(err.Error(), "unknown type 'rate' for argument 'target'") {
+		t.Errorf("unknown type: got %v", err)
+	}
+	cts := map[string]*manifest.CustomTypeDef{"rate": {Base: "integer", Min: intPtr(1)}}
+	if _, err := manifest.LoadManifestWithOptions(unknown, manifest.LoadOptions{CustomTypes: cts}); err == nil || !strings.Contains(err.Error(), "argument 'target': invalid default") {
+		t.Errorf("custom-typed default: got %v", err)
+	}
+	ok := writeManifest(t, t.TempDir(), "[args.target]\nposition = 1\ntype = \"rate\"\ndefault = 3\n")
+	m, err := manifest.LoadManifestWithOptions(ok, manifest.LoadOptions{CustomTypes: cts})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cts := map[string]*manifest.CustomTypeDef{"rate": {Base: "integer", Min: intPtr(1)}}
-	if err := ValidateManifestWithCustomTypes(m, cts); err == nil || !strings.Contains(err.Error(), "invalid default") {
-		t.Errorf("custom-typed default: got %v", err)
+	if err := ValidateManifestWithCustomTypes(m, map[string]*manifest.CustomTypeDef{"rate": {Base: "integer", Min: intPtr(5)}}); err == nil || !strings.Contains(err.Error(), "invalid default") {
+		t.Errorf("custom-typed default re-check: got %v", err)
 	}
 }
 

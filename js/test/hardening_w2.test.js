@@ -334,7 +334,7 @@ clamp = true
 [args.ratio]
 position = 3
 required = false
-type = "float"
+type = "number"
 description = "ratio"
 default = 0.5
 min_float = 0.0

@@ -5,19 +5,14 @@ from __future__ import annotations
 import json
 import shlex
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import click
 
 from toolclad.executor import PolicyDenied, build_command_argv, default_gate, execute
-from toolclad.manifest import (
-    LoadOptions,
-    Manifest,
-    load_manifest,
-    load_manifest_with_options,
-)
+from toolclad.manifest import LoadOptions, load_manifest_with_options
 from toolclad.scope import manifest_scope
-from toolclad.validator import ValidationError, validate_arg_in
+from toolclad.validator import ValidationError, validate_arg_with_custom_types_mode
 
 
 def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
@@ -64,6 +59,8 @@ def validate(manifest_path: str, allow_unknown_keys: bool) -> None:
         sys.exit(1)
 
     click.echo(f"Manifest:     {manifest.source_path}")
+    if manifest.custom_types:
+        click.echo(f"Custom types: {', '.join(sorted(manifest.custom_types))}")
     click.echo(f"Tool:         {manifest.tool.name} v{manifest.tool.version}")
     click.echo(f"Binary:       {manifest.tool.binary}")
     click.echo(f"Description:  {manifest.tool.description}")
@@ -101,7 +98,7 @@ def validate(manifest_path: str, allow_unknown_keys: bool) -> None:
 def run(manifest_path: str, arg_pairs: Tuple[str, ...], approve: bool) -> None:
     """Execute a tool through its .clad.toml manifest."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(manifest_path)
         args = _parse_args(arg_pairs)
         envelope = execute(manifest, args, approve=approve)
     except (ValueError, FileNotFoundError, ValidationError, PolicyDenied) as e:
@@ -146,7 +143,7 @@ def _mcp_type_and_constraints(arg) -> Tuple[str, dict]:
 def schema(manifest_path: str) -> None:
     """Output MCP JSON schema for a manifest."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(manifest_path)
     except (ValueError, FileNotFoundError) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
@@ -213,7 +210,7 @@ def schema(manifest_path: str) -> None:
 def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
     """Dry-run a tool invocation: validate args and show the constructed command."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(manifest_path)
         args = _parse_args(arg_pairs)
 
         # Validate each arg individually for nice reporting. allow_whitespace
@@ -222,11 +219,13 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
         scope = manifest_scope(manifest)
 
         click.echo(f"  Manifest:  {manifest.source_path}")
-        click.echo(f"  Arguments:")
+        click.echo("  Arguments:")
         for arg_name, arg_def in manifest.args.items():
             if arg_name in args:
                 try:
-                    cleaned = validate_arg_in(arg_def, args[arg_name], exec_mode, scope)
+                    cleaned = validate_arg_with_custom_types_mode(
+                        arg_def, args[arg_name], manifest.custom_types, exec_mode, scope
+                    )
                     click.echo(f"    {arg_name}={cleaned} ({arg_def.type}: OK)")
                 except ValidationError as ve:
                     click.echo(f"    {arg_name}={args[arg_name]} ({arg_def.type}: FAIL - {ve})")

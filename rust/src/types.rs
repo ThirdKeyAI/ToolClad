@@ -34,6 +34,11 @@ pub struct Manifest {
     /// surface.
     #[serde(skip)]
     pub scope: Option<crate::scope::ScopeDef>,
+    /// Custom argument types from the project `toolclad.toml`, discovered
+    /// (or supplied through `LoadOptions::custom_types`) at load and used by
+    /// every validation path. Not part of the TOML surface.
+    #[serde(skip)]
+    pub custom_types: HashMap<String, CustomTypeDef>,
 }
 
 /// Accepted values for `tool.mode`.
@@ -69,7 +74,7 @@ pub struct ToolMeta {
     #[serde(default)]
     pub human_approval: bool,
     /// Dispatch mode. `"exec"` (default) runs an execution backend; `"callback"`
-    /// declares the manifest as validator-only — no [output] or backend
+    /// declares the manifest as validator-only — no `[output]` or backend
     /// required. Useful for in-process embeddings where ToolClad is the typed
     /// argument fence and dispatch happens elsewhere.
     #[serde(default = "default_dispatch")]
@@ -85,7 +90,7 @@ pub struct ToolMeta {
     #[serde(default)]
     pub network_egress: bool,
     /// Permit an interpreter (`sh`, `python`, `env`, ...) as the command's
-    /// argv[0]. Off by default: an interpreter turns an argument into code.
+    /// `argv[0]`. Off by default: an interpreter turns an argument into code.
     #[serde(default)]
     pub allow_interpreter: bool,
     pub cedar: Option<CedarMeta>,
@@ -551,8 +556,9 @@ impl std::fmt::Display for ToolCladError {
 
 impl std::error::Error for ToolCladError {}
 
-/// Custom type definition from toolclad.toml
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Custom type definition from toolclad.toml (`[types.<name>]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomTypeDef {
     pub base: String,
     #[serde(default)]

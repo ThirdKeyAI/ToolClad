@@ -1432,3 +1432,118 @@ func TestSpawnPolicyAtLoad(t *testing.T) {
 		t.Fatalf("default timeout: %v, %v", m, err)
 	}
 }
+
+// customTypeManifest declares one argument of type typ.
+func customTypeManifest(typ string) string {
+	return "[tool]\nname = \"ct\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"d\"\n\n" +
+		"[args.v]\nposition = 1\nrequired = true\ntype = \"" + typ + "\"\n\n" +
+		"[command]\nexec = [\"echo\", \"{v}\"]\n\n[output]\nformat = \"text\"\n"
+}
+
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCustomTypesDiscoveredUpward(t *testing.T) {
+	t.Setenv(ConfigEnvVar, "")
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "toolclad.toml"), "[types.rate]\nbase = \"integer\"\nmin = 1\nmax = 10\n")
+	mp := filepath.Join(root, "a", "b", "tool.clad.toml")
+	writeFile(t, mp, customTypeManifest("rate"))
+	m, err := LoadManifest(mp)
+	if err != nil {
+		t.Fatalf("custom type from an ancestor toolclad.toml: %v", err)
+	}
+	if ct := m.CustomTypes["rate"]; ct == nil || ct.Base != "integer" {
+		t.Fatalf("custom types not attached: %+v", m.CustomTypes)
+	}
+
+	// An unknown type is refused at load with the shared message.
+	writeFile(t, mp, customTypeManifest("nope"))
+	if _, err := LoadManifest(mp); err == nil || !strings.Contains(err.Error(), "unknown type 'nope' for argument 'v'") {
+		t.Errorf("unknown type: got %v", err)
+	}
+
+	// An explicit table overrides discovery.
+	writeFile(t, mp, customTypeManifest("rate"))
+	if _, err := LoadManifestWithOptions(mp, LoadOptions{CustomTypes: map[string]*CustomTypeDef{}}); err == nil {
+		t.Error("empty CustomTypes must disable discovery")
+	}
+}
+
+func TestCustomTypesEnvVar(t *testing.T) {
+	dir := t.TempDir()
+	mp := filepath.Join(dir, "tool.clad.toml")
+	writeFile(t, mp, customTypeManifest("rate"))
+	t.Setenv(ConfigEnvVar, filepath.Join(dir, "missing.toml"))
+	if _, err := LoadManifest(mp); err == nil || !strings.Contains(err.Error(), ConfigEnvVar) {
+		t.Errorf("unreadable %s must be an error, got %v", ConfigEnvVar, err)
+	}
+	cfg := filepath.Join(dir, "elsewhere.toml")
+	writeFile(t, cfg, "[types.rate]\nbase = \"integer\"\n")
+	t.Setenv(ConfigEnvVar, cfg)
+	if _, err := LoadManifest(mp); err != nil {
+		t.Errorf("%s: %v", ConfigEnvVar, err)
+	}
+}
+
+func TestCustomTypesFileRules(t *testing.T) {
+	bad := map[string]string{
+		"unknown top-level key": "[types.rate]\nbase = \"integer\"\n[other]\nx = 1\n",
+		"unknown type key":      "[types.rate]\nbase = \"integer\"\nmaximum = 3\n",
+		"non-table type":        "[types]\nrate = \"integer\"\n",
+		"custom base":           "[types.a]\nbase = \"integer\"\n[types.b]\nbase = \"a\"\n",
+		"missing base":          "[types.rate]\nmin = 1\n",
+	}
+	for name, src := range bad {
+		if _, err := ParseCustomTypes([]byte(src), "toolclad.toml"); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	good := "[types.port_range]\nbase = \"string\"\npattern = \"^[0-9]+$\"\n" +
+		"[types.r]\nbase = \"number\"\nmin_float = 0.5\nmax_float = 2.0\n" +
+		"[types.e]\nbase = \"enum\"\nallowed = [\"a\"]\n[types.i]\nbase = \"integer\"\nmin = 1\nmax = 2\n"
+	if _, err := ParseCustomTypes([]byte(good), "toolclad.toml"); err != nil {
+		t.Errorf("every allowed key: %v", err)
+	}
+}
+
+func TestSessionCommandArgTypesCheckedAtLoad(t *testing.T) {
+	src := `
+[tool]
+name = "s"
+version = "1.0.0"
+description = "d"
+
+[session]
+startup_command = "msfconsole -q"
+ready_pattern = "^msf> $"
+
+[session.commands.run]
+pattern = "^run$"
+description = "run"
+
+[session.commands.run.args.x]
+type = "bogus"
+
+[output]
+format = "text"
+`
+	_, err := LoadManifestFromStringWithOptions(src, LoadOptions{CustomTypes: map[string]*CustomTypeDef{}})
+	if err == nil || !strings.Contains(err.Error(), "unknown type 'bogus' for argument 'session.commands.run.args.x'") {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestCustomTypeMayNotShadowBuiltin(t *testing.T) {
+	_, err := ParseCustomTypes([]byte("[types.url]\nbase = \"string\"\n"), "toolclad.toml")
+	if err == nil || !strings.Contains(err.Error(), "shadows a built-in type") {
+		t.Fatalf("expected shadowing refusal, got %v", err)
+	}
+}

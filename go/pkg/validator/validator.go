@@ -17,20 +17,16 @@ import (
 )
 
 // init registers the strict entry point as the manifest loader's validator
-// for per-argument defaults, so a default that fails its own type is a load
-// error rather than a confusing refusal at run time. Types this package does
-// not know (custom types) are left for ValidateManifestWithCustomTypes.
+// for per-argument defaults, so a default that fails its own type (built-in
+// or custom) is a load error rather than a confusing refusal at run time.
 func init() {
 	manifest.HostPolicy = CheckLiteralHost
-	manifest.DefaultValidator = func(def *manifest.ArgDef, value string, s *scope.ScopeDef) error {
+	manifest.DefaultValidator = func(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, s *scope.ScopeDef) error {
 		d := *def
 		if d.Type == "" {
 			d.Type = "string"
 		}
-		if _, ok := typeHandlers[d.Type]; !ok {
-			return nil
-		}
-		_, err := ValidateArgIn(&d, value, false, s)
+		_, err := ValidateArgWithCustomTypesIn(&d, value, customTypes, false, s)
 		return err
 	}
 }

@@ -1,6 +1,6 @@
 use crate::scope::ScopeDef;
 use crate::types::{ConditionalDef, EvidenceEnvelope, Manifest, ToolCladError, ToolLimits};
-use crate::validator::validate_arg_in;
+use crate::validator::validate_arg_with_custom_types_in;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -374,7 +374,7 @@ fn execute_http(
         (200..300).contains(&status_code)
     };
 
-    let status_str = if is_success {
+    let mut status_str = if is_success {
         "success".to_string()
     } else if (400..500).contains(&status_code) {
         format!("client_error (HTTP {})", status_code)
@@ -384,11 +384,25 @@ fn execute_http(
         format!("error (HTTP {})", status_code)
     };
 
-    let results = serde_json::json!({
-        "raw_output": resp_body,
-        "http_status": status_code,
-        "http_method": method_upper,
-    });
+    // A successful body goes through the same parse and fail-closed schema
+    // check as oneshot output; a truncated body is partial, so it fails to
+    // parse (or is checked as truncated text) rather than passing silently.
+    // An error response is returned raw.
+    let mut results = if is_success {
+        let (override_status, results) = checked_results(manifest, &resp_body);
+        if let Some(st) = override_status {
+            status_str = st.to_string();
+        }
+        results
+    } else {
+        serde_json::json!({ "raw_output": resp_body })
+    };
+    if let Some(obj) = results.as_object_mut() {
+        obj.entry("http_status")
+            .or_insert_with(|| serde_json::json!(status_code));
+        obj.entry("http_method")
+            .or_insert_with(|| serde_json::json!(method_upper));
+    }
 
     Ok(EvidenceEnvelope {
         status: status_str,
@@ -432,7 +446,7 @@ fn execute_mcp_proxy(
         status: "delegation_preview".to_string(),
         scan_id,
         tool: manifest.tool.name.clone(),
-        command: format!("mcp://{}:{}", mcp.server, mcp.tool),
+        command: format!("mcp://{}/{}", mcp.server, mcp.tool),
         duration_ms: 0,
         timestamp,
         output_file: None,
@@ -1312,11 +1326,25 @@ fn validate_call_args(
     let mut validated = HashMap::new();
     for (name, def) in &manifest.args {
         if let Some(val) = args.get(name) {
-            let clean = validate_arg_in(name, def, val, exec_mode, scope)?;
+            let clean = validate_arg_with_custom_types_in(
+                name,
+                def,
+                val,
+                &manifest.custom_types,
+                exec_mode,
+                scope,
+            )?;
             validated.insert(name.clone(), clean);
         } else if let Some(ref default_val) = def.default {
             let dv = toml_value_to_string(default_val);
-            let clean = validate_arg_in(name, def, &dv, exec_mode, scope)?;
+            let clean = validate_arg_with_custom_types_in(
+                name,
+                def,
+                &dv,
+                &manifest.custom_types,
+                exec_mode,
+                scope,
+            )?;
             validated.insert(name.clone(), clean);
         } else if def.required {
             return Err(ToolCladError::ValidationError(format!(
@@ -1964,7 +1992,14 @@ pub fn dry_run(
 
     for (name, def) in &manifest.args {
         if let Some(val) = args.get(name) {
-            match validate_arg_in(name, def, val, exec_mode, scope) {
+            match validate_arg_with_custom_types_in(
+                name,
+                def,
+                val,
+                &manifest.custom_types,
+                exec_mode,
+                scope,
+            ) {
                 Ok(clean) => {
                     validations.push(format!("{name}={clean} ({}: OK)", def.type_name));
                     validated.insert(name.clone(), clean);
@@ -1975,10 +2010,11 @@ pub fn dry_run(
                 }
             }
         } else if let Some(ref default_val) = def.default {
-            let dv = validate_arg_in(
+            let dv = validate_arg_with_custom_types_in(
                 name,
                 def,
                 &toml_value_to_string(default_val),
+                &manifest.custom_types,
                 exec_mode,
                 scope,
             )?;
@@ -2068,6 +2104,7 @@ mod tests {
             browser: None,
             source_dir: None,
             scope: None,
+            custom_types: HashMap::new(),
         }
     }
 
@@ -3835,6 +3872,69 @@ mod tests {
         assert!(!serde_json::to_string(&out)
             .unwrap()
             .contains("tok-value-123"));
+    }
+
+    fn http_json_response(_: &str, _: u16) -> String {
+        let body = r#"{"name":"ok","count":3}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn http_json_manifest(port: u16, schema: &str) -> Manifest {
+        crate::parse_manifest(&format!(
+            "[tool]\nname = \"http_json\"\nversion = \"1.0.0\"\nbinary = \"http\"\n\
+             description = \"d\"\ntimeout_seconds = 5\n\n\
+             [http]\nmethod = \"GET\"\nurl = \"http://127.0.0.1:{port}/j\"\n\n\
+             [output]\nformat = \"json\"\nparser = \"builtin:json\"\n\n{schema}"
+        ))
+        .unwrap_or_else(|e| panic!("manifest should load: {e}"))
+    }
+
+    #[test]
+    fn test_http_body_is_parsed_and_schema_checked() {
+        // A conforming body is parsed into results.
+        let server = TestServer::start(http_json_response);
+        let m = http_json_manifest(
+            server.port,
+            "[output.schema]\ntype = \"object\"\nrequired = [\"name\"]\n\n\
+             [output.schema.properties.count]\ntype = \"integer\"\n",
+        );
+        let out = execute(&m, &HashMap::new());
+        server.finish();
+        let out = out.unwrap();
+        assert_eq!(out.status, "success");
+        assert_eq!(out.results["name"], "ok");
+        assert_eq!(out.results["count"], 3);
+        assert_eq!(out.results["http_status"], 200);
+
+        // A body that violates the schema fails closed.
+        let server = TestServer::start(http_json_response);
+        let m = http_json_manifest(
+            server.port,
+            "[output.schema]\ntype = \"object\"\n\n\
+             [output.schema.properties.count]\ntype = \"string\"\n",
+        );
+        let out = execute(&m, &HashMap::new());
+        server.finish();
+        let out = out.unwrap();
+        assert_eq!(out.status, "schema_error");
+        assert!(out.results["schema_error"].is_string(), "{}", out.results);
+        assert_eq!(out.results["raw_output"], r#"{"name":"ok","count":3}"#);
+        assert!(out.results.get("name").is_none());
+
+        // A body that does not parse fails closed too.
+        let server = TestServer::start(|_, _| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot json".to_string()
+        });
+        let m = http_json_manifest(server.port, "");
+        let out = execute(&m, &HashMap::new());
+        server.finish();
+        let out = out.unwrap();
+        assert_eq!(out.status, "parse_error");
+        assert_eq!(out.results["raw_output"], "not json");
     }
 
     #[test]

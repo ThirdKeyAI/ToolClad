@@ -446,6 +446,9 @@ func TestExecuteMCP(t *testing.T) {
 	if env.Status != "delegation_preview" {
 		t.Errorf("expected status 'delegation_preview', got %q", env.Status)
 	}
+	if env.Command != "mcp://mcp://security-tools.example.com/remote_scan" {
+		t.Errorf("envelope command must be mcp://<server>/<tool>, got %q", env.Command)
+	}
 	if env.Results["mcp_server"] != "mcp://security-tools.example.com" {
 		t.Errorf("unexpected mcp_server: %v", env.Results["mcp_server"])
 	}

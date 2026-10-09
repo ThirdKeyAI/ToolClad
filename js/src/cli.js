@@ -1,15 +1,20 @@
 #!/usr/bin/env node
 
+import { createRequire } from "node:module";
 import { Command } from "commander";
 import { loadManifest, loadManifestWithOptions } from "./manifest.js";
+// loadManifest discovers toolclad.toml (custom types) and checks every
+// argument type at load, so validate/run/test/schema all share one path.
 import { defaultGate, execute, generateMcpSchema } from "./executor.js";
+
+const { version } = createRequire(import.meta.url)("../package.json");
 
 const program = new Command();
 
 program
   .name("toolclad")
   .description("ToolClad manifest executor")
-  .version("0.1.0");
+  .version(version);
 
 program
   .command("validate <manifest>")
