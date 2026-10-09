@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,135 +38,327 @@ type EvidenceEnvelope struct {
 	Error      string         `json:"error,omitempty"`
 }
 
-// resolveVars validates arguments and resolves all template variables (args,
-// defaults, mappings) into a single interpolation context.
-func resolveVars(m *manifest.Manifest, args map[string]string) (map[string]string, error) {
-	cleaned := make(map[string]string)
+// newScanID returns a scan identifier for one invocation.
+func newScanID(start time.Time) string {
+	return fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+}
+
+// evidenceDir returns the evidence root: TOOLCLAD_EVIDENCE_DIR or
+// <tmpdir>/toolclad-evidence.
+func evidenceDir() string {
+	if dir := os.Getenv("TOOLCLAD_EVIDENCE_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), "toolclad-evidence")
+}
+
+// resolveVars validates arguments and resolves every template variable into
+// the two variable classes of the command model:
+//
+//   - vars holds single-token variables: every declared arg (validated),
+//     [command.defaults] entries, and the executor-injected _scan_id,
+//     _evidence_dir and _output_file. Each is exactly one argv token's worth
+//     of text and is never split.
+//   - trusted holds multi-token variables produced from manifest-controlled
+//     text: _<arg>_flags from [command.mappings] (tokenized here) and
+//     _<cond> from [command.conditionals] (tokenized at load, substituted
+//     here). A whole-token placeholder naming one of these splices its
+//     token vector into argv.
+func resolveVars(m *manifest.Manifest, args map[string]string, scanID string) (map[string]string, map[string][]string, error) {
+	// allow_whitespace is honored only for a manifest that declared exec
+	// itself; the executor escape hatch always validates in strict mode.
+	execMode := m.Command.ExecWasDeclared && m.Command.Executor == ""
+	vars := make(map[string]string)
 	for name, argDef := range m.Args {
 		val, provided := args[name]
 		if !provided {
 			if argDef.Required {
-				return nil, fmt.Errorf("missing required argument: %q", name)
+				return nil, nil, fmt.Errorf("missing required argument: %q", name)
 			}
-			if argDef.Default != nil {
-				val = fmt.Sprintf("%v", argDef.Default)
-			} else {
-				val = ""
+			if argDef.Default == nil {
+				// Unset optional: resolves to the empty string so a
+				// whole-token placeholder for it disappears from argv.
+				vars[name] = ""
+				continue
 			}
+			val = fmt.Sprintf("%v", argDef.Default)
 		}
 
-		validated, err := validator.ValidateArg(argDef, val)
+		validated, err := validator.ValidateArgMode(argDef, val, execMode)
 		if err != nil {
-			return nil, fmt.Errorf("argument %q: %w", name, err)
+			return nil, nil, fmt.Errorf("argument %q: %w", name, err)
 		}
-		cleaned[name] = validated
+		vars[name] = validated
 	}
 
 	for k, v := range m.Command.Defaults {
-		if _, exists := cleaned[k]; !exists {
-			cleaned[k] = fmt.Sprintf("%v", v)
+		if _, exists := vars[k]; !exists {
+			vars[k] = fmt.Sprintf("%v", v)
 		}
 	}
 
+	evDir := evidenceDir()
+	vars["_scan_id"] = scanID
+	vars["_evidence_dir"] = evDir
+	vars["_output_file"] = filepath.Join(evDir, scanID+"-output")
+
+	trusted := make(map[string][]string)
 	for argName, mapping := range m.Command.Mappings {
-		val, ok := cleaned[argName]
+		val := vars[argName]
+		mapped, ok := mapping[val]
 		if !ok {
+			if val == "" {
+				// An absent optional argument contributes nothing.
+				trusted["_"+argName+"_flags"] = []string{}
+				continue
+			}
+			return nil, nil, fmt.Errorf(
+				"no mapping for argument '%s' value '%s' in [command.mappings.%s]",
+				argName, val, argName)
+		}
+		// Mapping values come from the manifest, so splitting them is safe.
+		// A value mapped to "" yields no tokens.
+		tokens, err := manifest.TokenizeTemplate(mapped)
+		if err != nil {
+			return nil, nil, fmt.Errorf("command.mappings.%s: %w", argName, err)
+		}
+		if tokens == nil {
+			tokens = []string{}
+		}
+		trusted["_"+argName+"_flags"] = tokens
+	}
+
+	// Conditionals are evaluated in name order so the result is deterministic.
+	condNames := make([]string, 0, len(m.Command.Conditionals))
+	for name := range m.Command.Conditionals {
+		condNames = append(condNames, name)
+	}
+	sort.Strings(condNames)
+	for _, name := range condNames {
+		cond := m.Command.Conditionals[name]
+		if !evaluateCondition(cond.When, vars) {
+			trusted["_"+name] = []string{}
 			continue
 		}
-		mapped, ok := mapping[val]
-		if ok {
-			cleaned["_"+argName+"_flags"] = mapped
-			if strings.HasSuffix(argName, "_type") {
-				prefix := strings.TrimSuffix(argName, "_type")
-				cleaned["_"+prefix+"_flags"] = mapped
+		tokens := cond.Tokens
+		if tokens == nil && cond.Template != "" {
+			// Manifest built in memory without going through load.
+			var err error
+			tokens, err = manifest.TokenizeTemplate(cond.Template)
+			if err != nil {
+				return nil, nil, fmt.Errorf("command.conditionals.%s.template: %w", name, err)
 			}
 		}
+		expanded, err := expandTokens(tokens, vars, trusted, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("command.conditionals.%s: %w", name, err)
+		}
+		trusted["_"+name] = expanded
 	}
 
-	return cleaned, nil
+	return vars, trusted, nil
 }
 
-// BuildCommandArgv builds an argv array from the manifest's exec field.
-// Each element is interpolated independently, preserving argument boundaries.
-// This avoids the template→string→split round-trip that breaks when values
-// contain spaces or quote characters.
-func BuildCommandArgv(m *manifest.Manifest, args map[string]string) ([]string, error) {
-	if len(m.Command.Exec) == 0 {
-		return nil, fmt.Errorf("manifest %q has no exec array", m.Tool.Name)
+// evaluateCondition evaluates a [command.conditionals.<n>].when expression
+// against the single-token variables.
+//
+// Supported forms: a comparison of a variable against the empty string or a
+// quoted or bare literal using != or ==, joined by ` and ` or ` or ` (one
+// level, no nesting). A missing variable compares as the empty string.
+//
+// SECURITY: this is a closed-vocabulary evaluator. Never replace it with
+// dynamic code evaluation of any kind.
+func evaluateCondition(when string, vars map[string]string) bool {
+	if strings.Contains(when, " and ") {
+		for _, part := range strings.Split(when, " and ") {
+			if !evaluateSingle(strings.TrimSpace(part), vars) {
+				return false
+			}
+		}
+		return true
 	}
-
-	cleaned, err := resolveVars(m, args)
-	if err != nil {
-		return nil, err
+	if strings.Contains(when, " or ") {
+		for _, part := range strings.Split(when, " or ") {
+			if evaluateSingle(strings.TrimSpace(part), vars) {
+				return true
+			}
+		}
+		return false
 	}
+	return evaluateSingle(strings.TrimSpace(when), vars)
+}
 
-	argv := make([]string, len(m.Command.Exec))
-	for i, element := range m.Command.Exec {
-		argv[i] = interpolateString(element, cleaned)
+// evaluateSingle evaluates one `lhs OP rhs` comparison, OP being != or ==.
+// Any other shape evaluates to false.
+func evaluateSingle(expr string, vars map[string]string) bool {
+	for _, op := range []string{"!=", "=="} {
+		idx := strings.Index(expr, op)
+		if idx < 0 {
+			continue
+		}
+		lhs := strings.TrimSpace(expr[:idx])
+		rhs := strings.Trim(strings.TrimSpace(expr[idx+len(op):]), "'\"")
+		val := vars[lhs]
+		if op == "!=" {
+			return val != rhs
+		}
+		return val == rhs
 	}
+	return false
+}
 
-	if len(argv) == 0 || argv[0] == "" {
-		return nil, fmt.Errorf("exec array produced empty argv")
+// endOfOptionsState tracks the single `--` insertion for one build.
+type endOfOptionsState struct {
+	enabled  bool
+	inserted bool
+	isUser   func(name string) bool
+}
+
+// expandTokens substitutes a compiled token vector into argv tokens:
+//
+//  1. A token that is exactly `{name}` naming a trusted multi-token variable
+//     splices that variable's token vector (0..n tokens).
+//  2. Otherwise every `{name}` occurrence is substituted textually inside
+//     the single token, which is never re-split. A token that was exactly one
+//     placeholder resolving to the empty string is dropped. `{{` and `}}`
+//     become literal braces. An unresolved name is an error, and so is a
+//     trusted multi-token variable glued to literal text.
+//
+// When eoo is non-nil and enabled, a literal `--` is inserted immediately
+// before the first argv token produced from a whole-token user-arg
+// placeholder, at most once.
+func expandTokens(tokens []string, vars map[string]string, trusted map[string][]string, eoo *endOfOptionsState) ([]string, error) {
+	argv := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		if name, ok := manifest.SolePlaceholder(tok); ok {
+			if tv, ok := trusted[name]; ok {
+				argv = append(argv, tv...)
+				continue
+			}
+			v, ok := vars[name]
+			if !ok {
+				return nil, fmt.Errorf("unresolved placeholder '{%s}' in command", name)
+			}
+			if v == "" {
+				continue
+			}
+			if eoo != nil && eoo.enabled && !eoo.inserted && eoo.isUser(name) {
+				argv = append(argv, "--")
+				eoo.inserted = true
+			}
+			argv = append(argv, v)
+			continue
+		}
+		// A multi-token variable may only appear as a whole token; glued
+		// to literal text it is never joined into one token.
+		for _, name := range manifest.Placeholders(tok) {
+			if _, ok := trusted[name]; ok {
+				return nil, fmt.Errorf(
+					"placeholder '{%s}' expands to multiple tokens and must be a whole token in command", name)
+			}
+		}
+		out, err := manifest.ExpandToken(tok, func(name string) (string, bool) {
+			v, ok := vars[name]
+			return v, ok
+		})
+		if err != nil {
+			return nil, err
+		}
+		argv = append(argv, out)
 	}
-
 	return argv, nil
 }
 
-// BuildCommand validates arguments and interpolates the command template.
-// It returns the fully constructed command string ready for execution.
-// For new manifests, prefer BuildCommandArgv with the exec array format.
-func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) {
+// compiledExec returns the manifest's canonical exec form, compiling a
+// legacy template on the fly for manifests built in memory.
+func compiledExec(m *manifest.Manifest) ([]string, error) {
+	if err := m.EnsureCompiled(); err != nil {
+		return nil, err
+	}
+	return m.Command.Exec, nil
+}
+
+// build constructs argv and returns the resolved single-token variables
+// alongside it (the executor escape hatch exports them as environment
+// variables).
+func build(m *manifest.Manifest, args map[string]string, scanID string) ([]string, map[string]string, error) {
+	tokens, err := compiledExec(m)
+	if err != nil {
+		return nil, nil, err
+	}
+	if m.Command.Executor == "" && len(tokens) == 0 {
+		return nil, nil, fmt.Errorf("manifest %q has no command exec, template, or executor", m.Tool.Name)
+	}
+
+	vars, trusted, err := resolveVars(m, args, scanID)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	if m.Command.Executor != "" {
-		return m.Command.Executor, nil
+		return []string{m.Command.Executor}, vars, nil
 	}
 
-	if m.Command.Template == "" {
-		return "", fmt.Errorf("manifest %q has no command template or executor", m.Tool.Name)
+	eoo := &endOfOptionsState{
+		enabled: m.Command.EndOfOptions == "--",
+		isUser:  func(name string) bool { return m.Args[name] != nil },
 	}
+	argv, err := expandTokens(tokens, vars, trusted, eoo)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, nil, fmt.Errorf("command produced empty argv")
+	}
+	return argv, vars, nil
+}
 
-	cleaned, err := resolveVars(m, args)
+// BuildCommandArgv validates arguments and builds the argv array from the
+// manifest's canonical exec form. Each element is one argv token: values are
+// substituted into single tokens and never re-split, so a value containing
+// whitespace or quote characters cannot change the argument structure.
+func BuildCommandArgv(m *manifest.Manifest, args map[string]string) ([]string, error) {
+	argv, _, err := build(m, args, newScanID(time.Now()))
+	return argv, err
+}
+
+// BuildCommand validates arguments and returns the constructed command as a
+// display string (argv joined, with tokens quoted where needed). The string
+// is for display and evidence only; execution always uses BuildCommandArgv.
+func BuildCommand(m *manifest.Manifest, args map[string]string) (string, error) {
+	argv, err := BuildCommandArgv(m, args)
 	if err != nil {
 		return "", err
 	}
-
-	// SECURITY: This evaluator uses a closed-vocabulary parser.
-	// Never use eval() or equivalent dynamic code execution for conditions.
-
-	result := m.Command.Template
-	for k, v := range cleaned {
-		result = strings.ReplaceAll(result, "{"+k+"}", v)
-	}
-
-	return result, nil
+	return FormatArgv(argv), nil
 }
 
-// shellSplit splits a command string into arguments, respecting single and
-// double quotes. This replaces strings.Fields() which breaks on quoted args.
-func shellSplit(cmd string) []string {
-	var args []string
-	var current strings.Builder
-	inSingle := false
-	inDouble := false
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
-		switch {
-		case c == '\'' && !inDouble:
-			inSingle = !inSingle
-		case c == '"' && !inSingle:
-			inDouble = !inDouble
-		case c == ' ' && !inSingle && !inDouble:
-			if current.Len() > 0 {
-				args = append(args, current.String())
-				current.Reset()
-			}
-		default:
-			current.WriteByte(c)
+// FormatArgv renders argv for display. Tokens containing whitespace, quotes
+// or shell metacharacters are single-quoted so argument boundaries are
+// visible; the result is never executed.
+func FormatArgv(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, tok := range argv {
+		parts[i] = quoteForDisplay(tok)
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteForDisplay(tok string) string {
+	if tok == "" {
+		return "''"
+	}
+	needsQuote := false
+	for _, r := range tok {
+		if r <= ' ' || r == 0x7f || strings.ContainsRune(`'"\$`+"`;|&<>(){}[]!*?~#", r) {
+			needsQuote = true
+			break
 		}
 	}
-	if current.Len() > 0 {
-		args = append(args, current.String())
+	if !needsQuote {
+		return tok
 	}
-	return args
+	return "'" + strings.ReplaceAll(tok, "'", `'\''`) + "'"
 }
 
 // Execute validates arguments, builds the command, executes it with a timeout,
@@ -187,53 +381,25 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 	}
 
 	start := time.Now()
-	scanID := fmt.Sprintf("%d-%d", start.Unix(), start.UnixNano()%100000)
+	scanID := newScanID(start)
 
-	cmdStr, err := BuildCommand(m, args)
+	cmdArgs, vars, err := build(m, args, scanID)
 	if err != nil {
 		return &EvidenceEnvelope{
 			Status:    "error",
 			ScanID:    scanID,
 			Tool:      m.Tool.Name,
 			Timestamp: start.UTC().Format(time.RFC3339),
+			ExitCode:  -1,
 			Error:     err.Error(),
 		}, err
 	}
+	cmdStr := FormatArgv(cmdArgs)
 
 	timeout := time.Duration(m.Tool.TimeoutSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Prefer exec array (shell-free) over template string (requires splitting).
-	var cmdArgs []string
-	if len(m.Command.Exec) > 0 {
-		argv, err := BuildCommandArgv(m, args)
-		if err != nil {
-			return &EvidenceEnvelope{
-				Status:    "error",
-				ScanID:    scanID,
-				Tool:      m.Tool.Name,
-				Timestamp: start.UTC().Format(time.RFC3339),
-				ExitCode:  -1,
-				Error:     err.Error(),
-			}, err
-		}
-		cmdArgs = argv
-		cmdStr = strings.Join(argv, " ")
-	} else {
-		// Legacy: split template string using quote-aware splitter.
-		cmdArgs = shellSplit(cmdStr)
-	}
-	if len(cmdArgs) == 0 {
-		return &EvidenceEnvelope{
-			Status:    "error",
-			ScanID:    scanID,
-			Tool:      m.Tool.Name,
-			Timestamp: start.UTC().Format(time.RFC3339),
-			ExitCode:  -1,
-			Error:     "empty command after splitting",
-		}, fmt.Errorf("empty command after splitting")
-	}
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 
 	// Set process group so we can kill the entire group on timeout.
@@ -241,21 +407,9 @@ func Execute(m *manifest.Manifest, args map[string]string) (*EvidenceEnvelope, e
 
 	// If using a custom executor, pass validated args as env vars.
 	if m.Command.Executor != "" {
-		for name, argDef := range m.Args {
-			val, provided := args[name]
-			if !provided {
-				if argDef.Default != nil {
-					val = fmt.Sprintf("%v", argDef.Default)
-				} else {
-					val = ""
-				}
-			}
-			validated, vErr := validator.ValidateArg(argDef, val)
-			if vErr != nil {
-				return nil, fmt.Errorf("argument %q: %w", name, vErr)
-			}
+		for name := range m.Args {
 			envKey := "TOOLCLAD_ARG_" + strings.ToUpper(name)
-			cmd.Env = append(cmd.Env, envKey+"="+validated)
+			cmd.Env = append(cmd.Env, envKey+"="+vars[name])
 		}
 		cmd.Env = append(cmd.Env, "TOOLCLAD_SCAN_ID="+scanID)
 	}

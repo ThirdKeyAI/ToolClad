@@ -1,7 +1,17 @@
-export { loadManifest } from "./manifest.js";
-export { validateArg, checkInjection } from "./validator.js";
+export { loadManifest, loadCustomTypes } from "./manifest.js";
+export {
+  validateArg,
+  validateArgMode,
+  validateArgWithCustomTypes,
+  validateArgWithCustomTypesMode,
+  anchorPattern,
+  checkInjection,
+} from "./validator.js";
 export {
   buildCommand,
+  buildCommandArgv,
+  compileCommand,
+  tokenizeTemplate,
   execute,
   executeHttp,
   executeMcp,

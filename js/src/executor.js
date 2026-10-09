@@ -2,7 +2,22 @@ import { spawnSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateArg } from "./validator.js";
+import { validateArgMode } from "./validator.js";
+
+/**
+ * One left-to-right pass over a token: `{{` and `}}` are escapes for literal
+ * braces and `{name}` is a placeholder. Escapes are never placeholders.
+ */
+const BRACE_PASS_RE = /\{\{|\}\}|\{(\w+)\}/g;
+
+/** A token that consists solely of one placeholder. */
+const WHOLE_PLACEHOLDER_RE = /^\{(\w+)\}$/;
+
+/** Variables the executor injects into every command context. */
+const EXECUTOR_VARS = ["_scan_id", "_output_file", "_evidence_dir"];
+
+const TEMPLATE_DEPRECATION_WARNING =
+  "warning: [command] template is deprecated and will be removed in the next minor release; use exec = [...]";
 
 /**
  * Replace {_secret:name} placeholders with TOOLCLAD_SECRET_<NAME> env vars.
@@ -21,45 +36,258 @@ export function injectTemplateVars(template) {
 }
 
 /**
- * Split a command string into an array of arguments, respecting quoted strings.
- * This avoids shell interpretation when passing to spawnSync.
- * @param {string} cmd - The command string to split
- * @returns {string[]} Array of arguments
+ * Tokenize a manifest command template into an argv-style token array.
+ *
+ * Runs on trusted manifest text only; substituted values are never re-split.
+ * Honors single and double quotes and backslash escapes. A placeholder may
+ * not appear inside quotes (it must be a whole, unquoted token), but the
+ * `{{` escape for a literal brace is allowed anywhere.
+ *
+ * @param {string} template - The template text
+ * @param {string} [where="command template"] - Label used in error messages
+ * @returns {string[]} Tokens, with `{{`/`}}` escapes left intact for substitution
  */
-function splitCommand(cmd) {
-  const args = [];
-  let current = "";
+export function tokenizeTemplate(template, where = "command template") {
+  const s = String(template);
+  const tokens = [];
+  let cur = "";
+  let started = false;
   let inSingle = false;
   let inDouble = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const c = cmd[i];
-    if (c === "'" && !inDouble) {
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\" && !inSingle) {
+      if (i + 1 >= s.length) {
+        throw new Error(`trailing backslash in ${where}`);
+      }
+      cur += s[++i];
+      started = true;
+    } else if (c === "'" && !inDouble) {
       inSingle = !inSingle;
+      started = true;
     } else if (c === '"' && !inSingle) {
       inDouble = !inDouble;
-    } else if (c === " " && !inSingle && !inDouble) {
-      if (current.length > 0) {
-        args.push(current);
-        current = "";
+      started = true;
+    } else if (c === "{" && (inSingle || inDouble)) {
+      if (s[i + 1] === "{") {
+        cur += "{{";
+        started = true;
+        i++;
+      } else {
+        throw new Error(
+          `${where} places a placeholder inside quotes at offset ${i}; placeholders must be whole, unquoted tokens (use exec = [...])`
+        );
+      }
+    } else if (/\s/.test(c) && !inSingle && !inDouble) {
+      if (started) {
+        tokens.push(cur);
+        cur = "";
+        started = false;
       }
     } else {
-      current += c;
+      cur += c;
+      started = true;
     }
   }
-  if (current.length > 0) {
-    args.push(current);
+
+  if (inSingle || inDouble) {
+    throw new Error(`unbalanced quote in ${where}`);
   }
-  return args;
+  if (started) {
+    tokens.push(cur);
+  }
+  return tokens;
+}
+
+function defineHidden(obj, key, value) {
+  Object.defineProperty(obj, key, {
+    value,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  });
 }
 
 /**
- * Resolve all argument values: apply defaults, validate types, resolve mappings.
+ * Compile `[command]` into its canonical exec form. Idempotent: safe to call
+ * from loadManifest and again from the build path for in-memory manifests.
+ *
+ * - `exec` is used as-is (one element = one token, never split).
+ * - `template` is tokenized into `exec` at load; `template` is kept for
+ *   display and a deprecation warning is emitted once per compile.
+ * - Every conditional template is tokenized into a hidden token array.
+ * - `end_of_options` must be exactly "--" when present.
+ * - Every placeholder must name a declared variable.
+ *
+ * Sets the hidden flag `command._execWasDeclared` (true only when the manifest
+ * declared `exec` directly), which selects exec-mode validation.
+ *
+ * @param {object} manifest - Parsed manifest (mutated in place)
+ * @returns {object} The same manifest
+ */
+export function compileCommand(manifest) {
+  const command = manifest.command;
+  if (!command || command._compiled) return manifest;
+
+  if (
+    Object.hasOwn(command, "end_of_options") &&
+    command.end_of_options !== "--"
+  ) {
+    throw new Error(
+      `Invalid manifest: command.end_of_options must be exactly "--" (got ${JSON.stringify(command.end_of_options)})`
+    );
+  }
+
+  if (command.template !== undefined && typeof command.template !== "string") {
+    throw new Error("Invalid manifest: command.template must be a string");
+  }
+
+  const hasExec = command.exec !== undefined && command.exec !== null;
+  if (hasExec) {
+    if (
+      !Array.isArray(command.exec) ||
+      command.exec.length === 0 ||
+      !command.exec.every((e) => typeof e === "string")
+    ) {
+      throw new Error(
+        "Invalid manifest: command.exec must be a non-empty array of strings"
+      );
+    }
+    defineHidden(command, "_execWasDeclared", true);
+  } else if (typeof command.template === "string" && command.template.length > 0) {
+    command.exec = tokenizeTemplate(command.template);
+    defineHidden(command, "_execWasDeclared", false);
+    console.warn(TEMPLATE_DEPRECATION_WARNING);
+  } else {
+    defineHidden(command, "_execWasDeclared", false);
+  }
+
+  if (command.conditionals) {
+    for (const [name, cond] of Object.entries(command.conditionals)) {
+      if (!cond || typeof cond !== "object") {
+        throw new Error(
+          `Invalid manifest: command.conditionals.${name} must be a table`
+        );
+      }
+      if (typeof cond.when !== "string") {
+        throw new Error(
+          `Invalid manifest: command.conditionals.${name} requires a 'when' expression`
+        );
+      }
+      if (typeof cond.template !== "string") {
+        throw new Error(
+          `Invalid manifest: command.conditionals.${name} requires a 'template'`
+        );
+      }
+      defineHidden(
+        cond,
+        "_tokens",
+        tokenizeTemplate(cond.template, `command.conditionals.${name} template`)
+      );
+    }
+  }
+
+  if (command.mappings) {
+    const argDefs = manifest.args || {};
+    for (const [argName, mapping] of Object.entries(command.mappings)) {
+      if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
+        throw new Error(
+          `Invalid manifest: command.mappings.${argName} must be a table`
+        );
+      }
+      const def = argDefs[argName];
+      // An enum's mapping table must cover every allowed value; map a value
+      // to "" to mean "no flags". A missing case fails here, not silently.
+      if (def && def.type === "enum" && Array.isArray(def.allowed)) {
+        const missing = def.allowed.filter(
+          (v) => !Object.hasOwn(mapping, String(v))
+        );
+        if (missing.length > 0) {
+          throw new Error(
+            `Invalid manifest: [command.mappings.${argName}] does not cover enum values: ${missing.join(", ")} (map a value to "" for no flags)`
+          );
+        }
+      }
+    }
+  }
+
+  checkPlaceholders(manifest);
+  defineHidden(command, "_compiled", true);
+  return manifest;
+}
+
+/**
+ * The two variable classes a command may reference.
+ * - single: one argv token's worth of text (args, command.defaults, executor vars)
+ * - multi: a token vector spliced into argv (mappings as `_<arg>_flags`,
+ *   conditionals as `_<cond>`)
+ */
+function declaredVariables(manifest) {
+  const command = manifest.command || {};
+  const single = new Set([
+    ...Object.keys(manifest.args || {}),
+    ...Object.keys(command.defaults || {}),
+    ...EXECUTOR_VARS,
+  ]);
+  const multi = new Set();
+  for (const argName of Object.keys(command.mappings || {})) {
+    multi.add(`_${argName}_flags`);
+  }
+  for (const condName of Object.keys(command.conditionals || {})) {
+    multi.add(`_${condName}`);
+  }
+  return { single, multi };
+}
+
+/**
+ * Load-time check: every placeholder in exec and in conditional templates
+ * must name a declared variable, and multi-token variables must stand alone.
+ */
+function checkPlaceholders(manifest) {
+  const command = manifest.command;
+  const { single, multi } = declaredVariables(manifest);
+
+  const scan = (tokens, where) => {
+    for (const token of tokens) {
+      const whole = WHOLE_PLACEHOLDER_RE.test(token);
+      for (const m of token.matchAll(BRACE_PASS_RE)) {
+        if (m[0] === "{{" || m[0] === "}}") continue;
+        const name = m[1];
+        if (multi.has(name)) {
+          if (!whole) {
+            throw new Error(
+              `placeholder '{${name}}' expands to multiple tokens and must be a whole token in ${where}`
+            );
+          }
+          continue;
+        }
+        if (!single.has(name)) {
+          throw new Error(
+            `Invalid manifest: unresolved placeholder '{${name}}' in ${where}`
+          );
+        }
+      }
+    }
+  };
+
+  if (Array.isArray(command.exec)) {
+    scan(command.exec, "command");
+  }
+  for (const [name, cond] of Object.entries(command.conditionals || {})) {
+    scan(cond._tokens, `command.conditionals.${name}`);
+  }
+}
+
+/**
+ * Resolve all argument values: apply defaults, validate types.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
+ * @param {boolean} [execMode=false] - true only when the manifest declared exec
  * @returns {object} Validated argument map
  */
-function resolveArgs(manifest, args) {
+function resolveArgs(manifest, args, execMode = false) {
   const argDefs = manifest.args || {};
   const resolved = {};
 
@@ -75,119 +303,229 @@ function resolveArgs(manifest, args) {
       if (value === undefined) continue;
     }
 
-    resolved[name] = validateArg(def, value);
+    resolved[name] = validateArgMode(def, value, execMode);
   }
 
   return resolved;
 }
 
+function lookupSingle(vars, name, where) {
+  if (!Object.hasOwn(vars, name) || vars[name] === undefined || vars[name] === null) {
+    throw new Error(`unresolved placeholder '{${name}}' in ${where}`);
+  }
+  return String(vars[name]);
+}
+
 /**
- * Resolve all template variables: args, defaults, mappings, conditionals,
- * and executor-injected variables into a single interpolation context.
+ * Substitute variables into a compiled token array, producing argv elements.
+ *
+ * - A token that is exactly `{name}` naming a multi-token var splices that
+ *   var's tokens (0..n elements).
+ * - Otherwise every `{name}` in the token is replaced textually, in one pass
+ *   that also unescapes `{{`/`}}`. The result is never re-split.
+ * - A token that was exactly one placeholder resolving to "" is dropped.
+ * - An unknown placeholder throws.
+ *
+ * @param {string[]} tokens
+ * @param {object} vars - Single-token variables
+ * @param {object} multi - Multi-token variables (name -> string[])
+ * @param {object} [opts]
+ * @param {Set<string>} [opts.userArgs] - Declared arg names (for end_of_options)
+ * @param {boolean} [opts.endOfOptions] - Insert `--` before the first user-arg token
+ * @param {string} [opts.where="command"] - Label for error messages
+ * @returns {string[]} argv elements
+ */
+function substituteTokens(tokens, vars, multi, opts = {}) {
+  const { userArgs = null, endOfOptions = false, where = "command" } = opts;
+  const argv = [];
+  let separatorInserted = false;
+
+  for (const token of tokens) {
+    const whole = WHOLE_PLACEHOLDER_RE.exec(token);
+    if (whole) {
+      const name = whole[1];
+      if (Object.hasOwn(multi, name)) {
+        argv.push(...multi[name]);
+        continue;
+      }
+      const value = lookupSingle(vars, name, where);
+      if (value === "") continue;
+      if (endOfOptions && !separatorInserted && userArgs && userArgs.has(name)) {
+        argv.push("--");
+        separatorInserted = true;
+      }
+      argv.push(value);
+      continue;
+    }
+
+    const out = token.replace(BRACE_PASS_RE, (m, name) => {
+      if (m === "{{") return "{";
+      if (m === "}}") return "}";
+      if (Object.hasOwn(multi, name)) {
+        throw new Error(
+          `placeholder '{${name}}' expands to multiple tokens and must be a whole token in ${where}`
+        );
+      }
+      return lookupSingle(vars, name, where);
+    });
+    argv.push(out);
+  }
+
+  return argv;
+}
+
+/**
+ * Resolve the full substitution context: validated args, single-token vars
+ * (args, command.defaults, executor-injected), and multi-token vars
+ * (mappings as `_<arg>_flags`, conditionals as `_<cond>`).
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {{ resolvedArgs: object, context: object }}
+ * @returns {{ resolvedArgs: object, vars: object, multi: object, userArgs: Set<string>, execMode: boolean }}
  */
 function resolveContext(manifest, args) {
-  const resolvedArgs = resolveArgs(manifest, args);
+  compileCommand(manifest);
   const command = manifest.command;
-  const context = { ...resolvedArgs };
+  const execMode = command._execWasDeclared === true;
+  const resolvedArgs = resolveArgs(manifest, args, execMode);
+  const argDefs = manifest.args || {};
 
+  const vars = Object.create(null);
+  // Declared-but-unset optionals resolve to "" so their tokens disappear.
+  for (const name of Object.keys(argDefs)) {
+    vars[name] = "";
+  }
+  for (const [name, value] of Object.entries(resolvedArgs)) {
+    vars[name] = value;
+  }
   if (command.defaults) {
     for (const [key, val] of Object.entries(command.defaults)) {
-      if (context[key] === undefined) {
-        context[key] = val;
+      if (!Object.hasOwn(resolvedArgs, key)) {
+        vars[key] = val;
       }
     }
   }
 
   const scanId = `${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
-  context._scan_id = scanId;
-  context._output_file = `/tmp/toolclad-${scanId}-output`;
-  context._evidence_dir = process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
+  vars._scan_id = scanId;
+  vars._output_file = `/tmp/toolclad-${scanId}-output`;
+  vars._evidence_dir =
+    process.env.TOOLCLAD_EVIDENCE_DIR || join(tmpdir(), "toolclad-evidence");
 
+  const multi = Object.create(null);
   if (command.mappings) {
     for (const [argName, mapping] of Object.entries(command.mappings)) {
-      const argValue = context[argName];
-      if (argValue !== undefined && mapping[argValue] !== undefined) {
-        context[`_${argName}_flags`] = mapping[argValue];
-        context["_scan_flags"] = mapping[argValue];
+      const key = `_${argName}_flags`;
+      // An absent optional (no value, no default) contributes nothing.
+      if (!Object.hasOwn(resolvedArgs, argName)) {
+        multi[key] = [];
+        continue;
       }
+      // A value that exists but has no entry is an error, never an empty splice.
+      const mapKey = String(resolvedArgs[argName]);
+      if (!Object.hasOwn(mapping, mapKey)) {
+        throw new Error(
+          `no mapping for argument '${argName}' value '${mapKey}' in [command.mappings.${argName}]`
+        );
+      }
+      // Mapping values are manifest-controlled text, so splitting is safe.
+      multi[key] = tokenizeTemplate(
+        String(mapping[mapKey]),
+        `command.mappings.${argName} value`
+      );
     }
   }
 
   if (command.conditionals) {
     for (const [name, cond] of Object.entries(command.conditionals)) {
-      const result = evaluateCondition(cond.when, context);
-      context[`_cond_${name}`] = result ? interpolate(cond.template, context) : "";
+      const key = `_${name}`;
+      multi[key] = evaluateCondition(cond.when, vars)
+        ? substituteTokens(cond._tokens, vars, multi, {
+            where: `command.conditionals.${name}`,
+          })
+        : [];
     }
   }
 
-  return { resolvedArgs, context };
+  const userArgs = new Set(Object.keys(argDefs));
+  return { resolvedArgs, vars, multi, userArgs, execMode };
 }
 
 /**
- * Build an argv array from the manifest's exec field and validated args.
- * Each element is interpolated independently, preserving argument boundaries.
- * This avoids the template→string→split round-trip that breaks when values
- * contain spaces or quote characters.
+ * Build an argv array from the manifest's compiled exec form and validated
+ * args. Each token is substituted independently and never re-split, so a
+ * value containing whitespace stays one argv element.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
  * @returns {{ argv: string[], resolvedArgs: object }}
  */
 export function buildCommandArgv(manifest, args) {
-  const execArray = manifest.command.exec;
-  if (!execArray || execArray.length === 0) {
+  compileCommand(manifest);
+  const command = manifest.command;
+  const execArray = command.exec;
+  if (!Array.isArray(execArray) || execArray.length === 0) {
     throw new Error("Manifest has no exec array");
   }
 
-  const { resolvedArgs, context } = resolveContext(manifest, args);
-  const argv = execArray.map((element) => interpolate(element, context));
+  const ctx = resolveContext(manifest, args);
+  const argv = substituteTokens(execArray, ctx.vars, ctx.multi, {
+    userArgs: ctx.userArgs,
+    endOfOptions: command.end_of_options === "--",
+    where: "command",
+  });
 
-  if (argv.length === 0 || !argv[0]) {
+  if (argv.length === 0 || argv[0] === "") {
     throw new Error("exec array produced empty argv");
   }
 
-  return { argv, resolvedArgs };
+  return { argv, resolvedArgs: ctx.resolvedArgs };
 }
 
 /**
- * Build the final command string from a manifest template and validated args.
- * For new manifests, prefer buildCommandArgv with the exec array format.
+ * Build the command for a manifest. The authoritative result is `argv`;
+ * `command` is a display string (argv joined by single spaces).
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
- * @returns {{ command: string, resolvedArgs: object }} The constructed command and resolved args
+ * @returns {{ command: string, argv: string[], resolvedArgs: object, isExecutor: boolean }}
  */
 export function buildCommand(manifest, args) {
+  compileCommand(manifest);
   const command = manifest.command;
 
-  // If using an executor script, return that info
+  // Escape hatch: a wrapper script receives validated args via env vars.
   if (command.executor) {
-    const resolvedArgs = resolveArgs(manifest, args);
-    return { command: command.executor, resolvedArgs, isExecutor: true };
+    const resolvedArgs = resolveArgs(manifest, args, false);
+    return {
+      command: command.executor,
+      argv: [command.executor],
+      resolvedArgs,
+      isExecutor: true,
+    };
   }
 
-  const { resolvedArgs, context } = resolveContext(manifest, args);
-  const result = interpolate(command.template, context);
-
+  const { argv, resolvedArgs } = buildCommandArgv(manifest, args);
   return {
-    command: result.replace(/\s+/g, " ").trim(),
+    command: argv.join(" "),
+    argv,
     resolvedArgs,
     isExecutor: false,
   };
 }
 
 /**
- * Interpolate {placeholder} references in a template string.
+ * Interpolate {placeholder} references in an HTTP template string.
+ * `{{`/`}}` are literal braces; an unknown placeholder throws.
  */
 function interpolate(template, context) {
-  return template.replace(/\{(\w+)\}/g, (match, key) => {
-    const val = context[key];
-    if (val === undefined) return "";
-    return String(val);
+  return template.replace(BRACE_PASS_RE, (m, key) => {
+    if (m === "{{") return "{";
+    if (m === "}}") return "}";
+    if (!Object.hasOwn(context, key) || context[key] === undefined) {
+      throw new Error(`unresolved placeholder '{${key}}' in template`);
+    }
+    return String(context[key]);
   });
 }
 
@@ -221,7 +559,7 @@ function evaluateSingleCondition(expr, context) {
 
 /**
  * Execute a tool using its manifest and supplied arguments.
- * Validates args, builds command, spawns process, wraps output in evidence envelope.
+ * Validates args, builds argv, spawns process, wraps output in evidence envelope.
  *
  * @param {object} manifest - Parsed manifest
  * @param {object} args - User-supplied arguments (key=value)
@@ -252,31 +590,19 @@ export function execute(manifest, args, options = {}) {
     return executeMcp(manifest, args);
   }
 
-  // Determine if we're using exec array, template, or custom executor.
-  let cmdParts;
-  let commandDisplay;
-  let resolvedArgs;
-  let isExecutor = false;
-
-  if (manifest.command.exec && manifest.command.exec.length > 0) {
-    // PREFERRED: Array-based command — maps directly to execve, no splitting.
-    const built = buildCommandArgv(manifest, args);
-    cmdParts = built.argv;
-    resolvedArgs = built.resolvedArgs;
-    commandDisplay = cmdParts.join(" ");
-  } else {
-    const built = buildCommand(manifest, args);
-    commandDisplay = built.command;
-    resolvedArgs = built.resolvedArgs;
-    isExecutor = built.isExecutor;
-    cmdParts = splitCommand(built.command);
-  }
+  compileCommand(manifest);
+  const built = buildCommand(manifest, args);
+  const cmdParts = built.argv;
+  const commandDisplay = built.command;
+  const resolvedArgs = built.resolvedArgs;
+  const isExecutor = built.isExecutor;
 
   if (options.dryRun) {
     return {
       status: "dry_run",
       tool: manifest.tool.name,
       command: commandDisplay,
+      argv: cmdParts,
       resolvedArgs,
     };
   }

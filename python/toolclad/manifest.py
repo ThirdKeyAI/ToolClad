@@ -71,6 +71,13 @@ class ArgDef:
     sanitize: List[str] = field(default_factory=list)
     schemes: List[str] = field(default_factory=list)
     scope_check: bool = False
+    # Permit a value starting with '-' or '+'. Off by default so a value can
+    # never be read as an option by the invoked binary.
+    allow_leading_dash: bool = False
+    # Permit whitespace inside a value. Honored only when the manifest
+    # declared `exec` directly (CommandDef.exec_was_declared); a compiled
+    # template stays strict.
+    allow_whitespace: bool = False
 
 
 @dataclass
@@ -80,6 +87,9 @@ class ConditionalDef:
     name: str = ""
     when: str = ""
     template: str = ""
+    # `template` tokenized at load; placeholders are substituted per token at
+    # resolve time and the result is spliced in for `{_<name>}`.
+    tokens: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -88,9 +98,11 @@ class CommandDef:
 
     Supports two invocation forms:
     - ``exec = ["cmd", "arg1", "{placeholder}"]`` — preferred, shell-free array execution
-    - ``template = "cmd arg1 {placeholder}"`` — legacy string template (split via shlex)
+    - ``template = "cmd arg1 {placeholder}"`` — deprecated; tokenized at load
+      into ``exec`` (the manifest text is split, substituted values never are)
 
-    When both are present, ``exec`` takes precedence.
+    When both are present, ``exec`` takes precedence and ``template`` is kept
+    for display only.
     """
 
     template: str = ""
@@ -99,6 +111,12 @@ class CommandDef:
     defaults: Dict[str, Any] = field(default_factory=dict)
     mappings: Dict[str, Dict[str, str]] = field(default_factory=dict)
     conditionals: Dict[str, ConditionalDef] = field(default_factory=dict)
+    # Only "--" is accepted. When set, a literal "--" is inserted once before
+    # the first argv element produced from a sole declared-arg placeholder.
+    end_of_options: str = ""
+    # True when the manifest declared `exec` directly. A template compiled to
+    # exec leaves this False, which keeps `allow_whitespace` disabled.
+    exec_was_declared: bool = False
 
 
 @dataclass
@@ -288,6 +306,8 @@ def _parse_arg(name: str, data: Dict[str, Any]) -> ArgDef:
         sanitize=data.get("sanitize", []),
         schemes=data.get("schemes", []),
         scope_check=data.get("scope_check", False),
+        allow_leading_dash=bool(data.get("allow_leading_dash", False)),
+        allow_whitespace=bool(data.get("allow_whitespace", False)),
     )
 
 
@@ -299,13 +319,21 @@ def _parse_command(data: Dict[str, Any]) -> CommandDef:
             when=cond_data.get("when", ""),
             template=cond_data.get("template", ""),
         )
+    exec_list = data.get("exec", [])
+    if not isinstance(exec_list, list) or not all(isinstance(e, str) for e in exec_list):
+        raise ValueError("[command] exec must be an array of strings")
+    template = data.get("template", "")
+    if not isinstance(template, str):
+        raise ValueError("[command] template must be a string")
     return CommandDef(
-        template=data.get("template", ""),
-        exec=data.get("exec", []),
+        template=template,
+        exec=list(exec_list),
         executor=data.get("executor", ""),
         defaults=data.get("defaults", {}),
         mappings=data.get("mappings", {}),
         conditionals=conditionals,
+        end_of_options=str(data.get("end_of_options", "")),
+        exec_was_declared=bool(exec_list),
     )
 
 
@@ -477,7 +505,10 @@ def load_manifest(path: str) -> Manifest:
 
     Raises:
         FileNotFoundError: If the file does not exist.
-        ValueError: If required sections are missing.
+        ValueError: If required sections are missing, a command template is
+            malformed (placeholder inside quotes, unbalanced quote), a
+            placeholder names no declared variable, or ``end_of_options`` is
+            not ``"--"``.
         tomllib.TOMLDecodeError: If the file is not valid TOML.
     """
     file_path = Path(path)
@@ -517,7 +548,19 @@ def load_manifest(path: str) -> Manifest:
         manifest.browser = _parse_browser(data["browser"])
 
     _validate_manifest(manifest)
+    _compile_command(manifest)
     return manifest
+
+
+def _compile_command(manifest: Manifest) -> None:
+    """Tokenize a legacy template into exec and check every placeholder.
+
+    Emits the template deprecation warning once per load. Deferred import:
+    the executor module imports this one.
+    """
+    from toolclad.executor import compile_command
+
+    compile_command(manifest, warn=True)
 
 
 def _validate_manifest(manifest: Manifest) -> None:

@@ -15,8 +15,21 @@ from toolclad.manifest import (
     BrowserStateDef,
     load_manifest,
 )
-from toolclad.validator import validate_arg
-from toolclad.executor import build_command, execute, inject_template_vars
+from toolclad.validator import (
+    ValidationError,
+    validate_arg,
+    validate_arg_mode,
+    validate_arg_with_custom_types,
+    validate_arg_with_custom_types_mode,
+)
+from toolclad.executor import (
+    build_command,
+    build_command_argv,
+    compile_command,
+    execute,
+    inject_template_vars,
+    tokenize_template,
+)
 
 __all__ = [
     "Manifest",
@@ -30,8 +43,15 @@ __all__ = [
     "BrowserScopeDef",
     "BrowserStateDef",
     "load_manifest",
+    "ValidationError",
     "validate_arg",
+    "validate_arg_mode",
+    "validate_arg_with_custom_types",
+    "validate_arg_with_custom_types_mode",
     "build_command",
+    "build_command_argv",
+    "compile_command",
     "execute",
     "inject_template_vars",
+    "tokenize_template",
 ]

@@ -1,9 +1,10 @@
-use crate::types::{EvidenceEnvelope, Manifest, ToolCladError};
-use crate::validator::validate_arg;
+use crate::types::{ConditionalDef, EvidenceEnvelope, Manifest, ToolCladError};
+use crate::validator::validate_arg_mode;
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -199,27 +200,253 @@ fn execute_mcp_proxy(
     })
 }
 
-/// Build an argv array from the manifest `exec` field and validated arguments.
+/// Matches, in one left-to-right pass, either a brace escape (`{{` / `}}`)
+/// or a `{name}` placeholder. Escapes are consumed before placeholders so a
+/// literal `%{{http_code}}` is never misread as a placeholder.
+static PLACEHOLDER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{|\}\}|\{(\w+)\}").unwrap());
+
+/// Variables the executor injects into every command; always resolvable.
+pub const INJECTED_VARS: &[&str] = &["_scan_id", "_output_file", "_evidence_dir"];
+
+/// Tokenize a trusted manifest template string into an argv-shaped vector.
 ///
-/// Each element in `exec` is interpolated independently, preserving argument
-/// boundaries. This avoids the template→string→split round-trip that breaks
-/// when argument values contain spaces or quote characters.
+/// POSIX-like: `'…'` and `"…"` group whitespace, `\` escapes the next
+/// character outside single quotes. The tokenizer runs on manifest text only
+/// — substituted values are never re-split. A `{` inside quotes is refused
+/// (unless it opens a `{{` escape) because a quoted placeholder would let a
+/// value break out of its token; placeholders must be whole, unquoted tokens.
+pub fn tokenize_template(s: &str) -> Result<Vec<String>, ToolCladError> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' if !in_single => match chars.next() {
+                Some((_, next)) => {
+                    cur.push(next);
+                    started = true;
+                }
+                None => {
+                    return Err(ToolCladError::ManifestError(
+                        "trailing backslash in command template".to_string(),
+                    ))
+                }
+            },
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            '{' if in_single || in_double => {
+                if chars.peek().map(|(_, n)| *n) == Some('{') {
+                    // `{{` escape: a literal brace is fine inside quotes.
+                    chars.next();
+                    cur.push_str("{{");
+                    started = true;
+                } else {
+                    return Err(ToolCladError::ManifestError(format!(
+                        "command template places a placeholder inside quotes at offset {i}; \
+                         placeholders must be whole, unquoted tokens (use exec = [...])"
+                    )));
+                }
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    tokens.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return Err(ToolCladError::ManifestError(
+            "unbalanced quote in command template".to_string(),
+        ));
+    }
+    if started {
+        tokens.push(cur);
+    }
+    Ok(tokens)
+}
+
+/// Placeholder names referenced by one token, in order, skipping `{{`/`}}`
+/// escapes. Shared by the load-time scan and build-time substitution so the
+/// two can never disagree about what counts as a placeholder.
+pub fn placeholder_names(token: &str) -> Vec<String> {
+    PLACEHOLDER_RE
+        .captures_iter(token)
+        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
+/// If `token` is exactly one `{name}` placeholder (no surrounding text, not
+/// an escape), return `name`.
+fn exact_placeholder(token: &str) -> Option<&str> {
+    let cap = PLACEHOLDER_RE.captures(token)?;
+    let whole = cap.get(0)?;
+    if whole.start() == 0 && whole.end() == token.len() {
+        cap.get(1).map(|m| m.as_str())
+    } else {
+        None
+    }
+}
+
+/// The compiled exec form of a manifest: the declared `exec` array, or the
+/// tokenized `template` when the manifest was built without going through the
+/// loader (which compiles the template at load).
+fn compiled_exec(manifest: &Manifest) -> Result<Vec<String>, ToolCladError> {
+    if let Some(ref exec) = manifest.command.exec {
+        return Ok(exec.clone());
+    }
+    if let Some(ref template) = manifest.command.template {
+        return tokenize_template(template);
+    }
+    Err(ToolCladError::CommandError(
+        "no exec array or command template in manifest (use executor for custom wrappers)"
+            .to_string(),
+    ))
+}
+
+/// The token vector of a conditional: the load-compiled `tokens`, or the
+/// tokenized `template` for manifests built without the loader.
+fn conditional_tokens(cond: &ConditionalDef) -> Result<Vec<String>, ToolCladError> {
+    if !cond.tokens.is_empty() || cond.template.is_empty() {
+        return Ok(cond.tokens.clone());
+    }
+    tokenize_template(&cond.template)
+}
+
+/// Single-token variables (`vars`) and trusted multi-token variables
+/// (`trusted`) resolved for one invocation.
+struct ResolvedVars {
+    /// User args, `[command.defaults]`, and executor-injected values. Each is
+    /// exactly one argv token's worth of text and is only ever substituted
+    /// textually inside a single token.
+    vars: HashMap<String, String>,
+    /// `_<arg>_flags` from `[command.mappings]` and `_<cond>` from
+    /// `[command.conditionals]`: manifest-controlled token vectors spliced
+    /// into argv when referenced as a whole token.
+    trusted: HashMap<String, Vec<String>>,
+}
+
+/// Substitute one token vector per W1.3.
+///
+/// A token that is exactly `{name}` for a trusted var splices that var's
+/// tokens; every other token has its placeholders substituted textually and is
+/// emitted as a single argv entry, never re-split. A token that was exactly one
+/// placeholder resolving to the empty string is dropped. Returns the argv
+/// slice plus the index of the first entry produced from a token that was
+/// solely a user-argument placeholder (for `end_of_options`).
+fn substitute_tokens(
+    tokens: &[String],
+    vars: &HashMap<String, String>,
+    trusted: &HashMap<String, Vec<String>>,
+    user_args: &HashSet<&str>,
+    context: &str,
+) -> Result<(Vec<String>, Option<usize>), ToolCladError> {
+    let mut out: Vec<String> = Vec::new();
+    let mut first_user_arg: Option<usize> = None;
+
+    for token in tokens {
+        let exact = exact_placeholder(token);
+        if let Some(name) = exact {
+            if let Some(vec) = trusted.get(name) {
+                out.extend(vec.iter().cloned());
+                continue;
+            }
+        }
+
+        let mut result = String::with_capacity(token.len());
+        let mut last = 0;
+        for cap in PLACEHOLDER_RE.captures_iter(token) {
+            let whole = cap.get(0).unwrap();
+            result.push_str(&token[last..whole.start()]);
+            match whole.as_str() {
+                "{{" => result.push('{'),
+                "}}" => result.push('}'),
+                _ => {
+                    let name = &cap[1];
+                    match vars.get(name) {
+                        Some(v) => result.push_str(v),
+                        None if trusted.contains_key(name) => {
+                            return Err(ToolCladError::CommandError(format!(
+                                "placeholder '{{{name}}}' expands to multiple tokens and must be a whole token in {context}"
+                            )));
+                        }
+                        None => {
+                            return Err(ToolCladError::CommandError(format!(
+                                "unresolved placeholder '{{{name}}}' in {context}"
+                            )));
+                        }
+                    }
+                }
+            }
+            last = whole.end();
+        }
+        result.push_str(&token[last..]);
+
+        if let Some(name) = exact {
+            if result.is_empty() {
+                // An unset optional disappears from argv entirely.
+                continue;
+            }
+            if first_user_arg.is_none() && user_args.contains(name) {
+                first_user_arg = Some(out.len());
+            }
+        }
+        out.push(result);
+    }
+
+    Ok((out, first_user_arg))
+}
+
+/// Build an argv array from the manifest's compiled exec form and validated
+/// arguments.
+///
+/// Each element is substituted independently (see [`tokenize_template`] for
+/// how a `template` becomes elements). Trusted multi-token variables
+/// (`{_<arg>_flags}`, `{_<cond>}`) splice their token vectors; everything else
+/// is substituted inside its own element and never re-split, so a value
+/// containing spaces or quotes stays exactly one argv entry.
 pub fn build_command_argv(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<Vec<String>, ToolCladError> {
-    let exec = manifest
-        .command
-        .exec
-        .as_ref()
-        .ok_or_else(|| ToolCladError::CommandError("no exec array in manifest".to_string()))?;
+    let tokens = compiled_exec(manifest)?;
+    let resolved = resolve_vars(manifest, args)?;
+    let user_args: HashSet<&str> = manifest.args.keys().map(String::as_str).collect();
 
-    let vars = resolve_vars(manifest, args)?;
+    let (mut argv, first_user_arg) = substitute_tokens(
+        &tokens,
+        &resolved.vars,
+        &resolved.trusted,
+        &user_args,
+        "command",
+    )?;
 
-    let argv: Vec<String> = exec
-        .iter()
-        .map(|element| interpolate_template(element, &vars))
-        .collect();
+    if let Some(ref eoo) = manifest.command.end_of_options {
+        if eoo != "--" {
+            return Err(ToolCladError::CommandError(format!(
+                "end_of_options must be exactly \"--\" (got '{eoo}')"
+            )));
+        }
+        if let Some(idx) = first_user_arg {
+            argv.insert(idx, "--".to_string());
+        }
+    }
 
     if argv.is_empty() {
         return Err(ToolCladError::CommandError(
@@ -230,48 +457,37 @@ pub fn build_command_argv(
     Ok(argv)
 }
 
-/// Build the command string from a manifest template and validated arguments.
+/// Build a display string for the command from a manifest and validated
+/// arguments.
 ///
-/// Performs template interpolation including:
-/// - Direct argument substitution (`{arg_name}`)
-/// - Mapping resolution (`{_scan_flags}` from `[command.mappings.scan_type]`)
-/// - Default value injection (`[command.defaults]`)
-/// - Conditional fragment inclusion (`[command.conditionals]`)
+/// Compatibility shim: this is [`build_command_argv`] joined with single
+/// spaces. The string is for display only and is never re-split or executed;
+/// use [`build_command_argv`] for anything that reaches a process.
+#[deprecated(note = "use build_command_argv; the joined string is for display only")]
 pub fn build_command(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<String, ToolCladError> {
-    let template = manifest
-        .command
-        .template
-        .as_ref()
-        .ok_or_else(|| {
-            ToolCladError::CommandError(
-                "no command template (use executor for custom wrappers)".to_string(),
-            )
-        })?
-        .clone();
-
-    let vars = resolve_vars(manifest, args)?;
-
-    // Perform final template interpolation.
-    let result = interpolate_template(&template, &vars);
-
-    // Clean up multiple spaces from empty interpolations.
-    let cleaned = result.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    Ok(cleaned)
+    Ok(build_command_argv(manifest, args)?.join(" "))
 }
 
-/// Resolve all template variables: args, defaults, mappings, conditionals, executor vars.
+/// Resolve the two variable classes for one invocation: single-token vars
+/// (declared args, `[command.defaults]`, executor-injected values) and trusted
+/// multi-token vars (`_<arg>_flags` from mappings, `_<cond>` from conditionals).
 fn resolve_vars(
     manifest: &Manifest,
     args: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, ToolCladError> {
-    // Start with provided args.
-    let mut vars: HashMap<String, String> = args.clone();
+) -> Result<ResolvedVars, ToolCladError> {
+    let mut vars: HashMap<String, String> = HashMap::new();
 
-    // Inject defaults for missing args.
+    // Declared args only: an undeclared key can never reach a placeholder.
+    for name in manifest.args.keys() {
+        if let Some(v) = args.get(name) {
+            vars.insert(name.clone(), v.clone());
+        }
+    }
+
+    // [command.defaults] for anything not supplied.
     if let Some(ref defaults) = manifest.command.defaults {
         for (key, val) in defaults {
             vars.entry(key.clone())
@@ -279,7 +495,7 @@ fn resolve_vars(
         }
     }
 
-    // Inject defaults from arg definitions for missing args.
+    // Per-arg defaults for anything still missing.
     for (key, def) in &manifest.args {
         if !vars.contains_key(key) {
             if let Some(ref default_val) = def.default {
@@ -288,64 +504,71 @@ fn resolve_vars(
         }
     }
 
-    // Resolve mappings: for each mapping `[command.mappings.<arg_name>]`, look up
-    // the arg value and produce a `_{arg_name}_flags` variable.
-    if let Some(ref mappings) = manifest.command.mappings {
-        for (arg_name, mapping) in mappings {
-            if let Some(arg_val) = vars.get(arg_name) {
-                if let Some(mapped) = mapping.get(arg_val) {
-                    // Convention: the mapped variable is `_<arg_name>_flags`
-                    // but manifests may reference it as `_{arg_name}_flags` or
-                    // `_scan_flags` etc. We insert both forms.
-                    vars.insert(format!("_{arg_name}_flags"), mapped.clone());
-                    // Also insert the shorter form in case the template uses it.
-                    vars.insert(format!("_{arg_name}"), mapped.clone());
-                }
-            }
-        }
-    }
-
-    // Auto-generate executor-injected variables.
+    // Executor-injected single-token vars. Inserted after user args so a
+    // declared arg can never shadow them.
     let scan_id = format!(
         "{}-{}",
         chrono::Utc::now().timestamp(),
         &uuid::Uuid::new_v4().to_string()[..5]
     );
-    vars.insert("_scan_id".to_string(), scan_id.clone());
-
     let evidence_dir = std::env::var("TOOLCLAD_EVIDENCE_DIR").unwrap_or_else(|_| {
         let mut dir = std::env::temp_dir();
         dir.push("toolclad-evidence");
         dir.to_string_lossy().to_string()
     });
-    vars.insert("_evidence_dir".to_string(), evidence_dir.clone());
-
     let output_file = format!("{evidence_dir}/{scan_id}-output");
+    vars.insert("_scan_id".to_string(), scan_id);
+    vars.insert("_evidence_dir".to_string(), evidence_dir);
     vars.insert("_output_file".to_string(), output_file);
 
-    // Resolve conditionals.
-    if let Some(ref conditionals) = manifest.command.conditionals {
-        for (cond_name, cond_def) in conditionals {
-            let include = evaluate_condition(&cond_def.when, &vars);
-            if include {
-                let fragment = interpolate_template(&cond_def.template, &vars);
-                vars.insert(format!("_{cond_name}"), fragment);
-            } else {
-                vars.insert(format!("_{cond_name}"), String::new());
-            }
+    let mut trusted: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Mappings: `[command.mappings.<arg>]` → `_<arg>_flags`. The mapped value
+    // is manifest text, so tokenizing it is safe; it is spliced verbatim.
+    if let Some(ref mappings) = manifest.command.mappings {
+        for (arg_name, mapping) in mappings {
+            let tokens = match vars.get(arg_name) {
+                Some(arg_val) => match mapping.get(arg_val) {
+                    Some(mapped) => tokenize_template(mapped)?,
+                    None => {
+                        return Err(ToolCladError::CommandError(format!(
+                            "no mapping for argument '{arg_name}' value '{arg_val}' in [command.mappings.{arg_name}]"
+                        )));
+                    }
+                },
+                None => Vec::new(),
+            };
+            trusted.insert(format!("_{arg_name}_flags"), tokens);
         }
     }
 
-    Ok(vars)
-}
-
-/// Interpolate `{placeholder}` references in a template string.
-fn interpolate_template(template: &str, vars: &HashMap<String, String>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in vars {
-        result = result.replace(&format!("{{{key}}}"), value);
+    // Conditionals: `[command.conditionals.<name>]` → `_<name>`. Each token of
+    // the compiled fragment is substituted individually; a false condition
+    // contributes nothing. Resolved in name order so the result is stable.
+    if let Some(ref conditionals) = manifest.command.conditionals {
+        let mut names: Vec<&String> = conditionals.keys().collect();
+        names.sort();
+        let no_user_args: HashSet<&str> = HashSet::new();
+        for cond_name in names {
+            let cond_def = &conditionals[cond_name];
+            let tokens = if evaluate_condition(&cond_def.when, &vars) {
+                let fragment = conditional_tokens(cond_def)?;
+                let (out, _) = substitute_tokens(
+                    &fragment,
+                    &vars,
+                    &trusted,
+                    &no_user_args,
+                    &format!("conditional '{cond_name}'"),
+                )?;
+                out
+            } else {
+                Vec::new()
+            };
+            trusted.insert(format!("_{cond_name}"), tokens);
+        }
     }
-    result
+
+    Ok(ResolvedVars { vars, trusted })
 }
 
 /// Evaluate a simple condition expression against variables.
@@ -674,11 +897,15 @@ pub fn execute(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<EvidenceEnvelope, ToolCladError> {
-    // Phase 1: Validate all arguments.
+    // Phase 1: Validate all arguments. `allow_whitespace` is honored only when
+    // the manifest declared `exec` directly; a compiled template stays strict,
+    // and so does the `executor` escape hatch (it takes precedence over
+    // exec/template and its argument handling is opaque to us).
+    let exec_mode = manifest.command.executor.is_none() && manifest.command.exec_was_declared;
     let mut validated = HashMap::new();
     for (name, def) in &manifest.args {
         if let Some(val) = args.get(name) {
-            let clean = validate_arg(name, def, val)?;
+            let clean = validate_arg_mode(name, def, val, exec_mode)?;
             validated.insert(name.clone(), clean);
         } else if def.required {
             if let Some(ref default_val) = def.default {
@@ -733,33 +960,16 @@ pub fn execute(
 
             let cmd_display = format!("{executor_path} (custom executor)");
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
-        } else if manifest.command.exec.is_some() {
-            // PREFERRED: Array-based command construction maps directly to execve.
-            // No string→split round-trip; values with spaces are safe.
+        } else {
+            // Array-based command construction maps directly to execve. A
+            // `template` was tokenized at load into the same array, so there is
+            // no string→split round-trip anywhere on the spawn path.
             let argv = build_command_argv(manifest, &validated)?;
             let cmd_display = argv.join(" ");
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]);
 
             run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_display)?
-        } else {
-            // LEGACY: String template → shlex split → execve.
-            // Use `exec` for new manifests to avoid quote/space edge cases.
-            let cmd_string = build_command(manifest, &validated)?;
-            let argv = shlex::split(&cmd_string).ok_or_else(|| {
-                ToolCladError::CommandError(
-                    "failed to parse command string (mismatched quotes)".to_string(),
-                )
-            })?;
-            if argv.is_empty() {
-                return Err(ToolCladError::CommandError(
-                    "command template produced empty command".to_string(),
-                ));
-            }
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
-
-            run_command_with_timeout(cmd, manifest.tool.timeout_seconds, &cmd_string)?
         };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -910,13 +1120,14 @@ pub fn dry_run(
     manifest: &Manifest,
     args: &HashMap<String, String>,
 ) -> Result<DryRunResult, ToolCladError> {
-    // Validate all arguments.
+    // Validate all arguments (strict for the executor escape hatch).
+    let exec_mode = manifest.command.executor.is_none() && manifest.command.exec_was_declared;
     let mut validated = HashMap::new();
     let mut validations = Vec::new();
 
     for (name, def) in &manifest.args {
         if let Some(val) = args.get(name) {
-            match validate_arg(name, def, val) {
+            match validate_arg_mode(name, def, val, exec_mode) {
                 Ok(clean) => {
                     validations.push(format!("{name}={clean} ({}: OK)", def.type_name));
                     validated.insert(name.clone(), clean);
@@ -945,10 +1156,8 @@ pub fn dry_run(
 
     let command = if let Some(ref exec) = manifest.command.executor {
         format!("{exec} (custom executor)")
-    } else if manifest.command.exec.is_some() {
-        build_command_argv(manifest, &validated)?.join(" ")
     } else {
-        build_command(manifest, &validated)?
+        build_command_argv(manifest, &validated)?.join(" ")
     };
 
     Ok(DryRunResult {
@@ -1019,6 +1228,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_build_command_simple() {
         let m = minimal_manifest();
         let mut args = HashMap::new();
@@ -1028,6 +1238,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_build_command_with_defaults() {
         let mut m = minimal_manifest();
         m.command.template = Some("echo --rate {max_rate} {target}".to_string());
@@ -1042,6 +1253,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_build_command_with_mappings() {
         let mut m = minimal_manifest();
         m.command.template = Some("nmap {_scan_type_flags} {target}".to_string());
@@ -1202,5 +1414,334 @@ mod tests {
     fn test_split_csv_escaped_quotes() {
         let result = split_csv_line(r#""he said ""hi""",val"#, ',');
         assert_eq!(result, vec![r#"he said "hi""#, "val"]);
+    }
+
+    // ---- W1: tokenizer -------------------------------------------------
+
+    #[test]
+    fn test_tokenize_template_basic() {
+        assert_eq!(
+            tokenize_template("nmap {_scan_type_flags}  {target}").unwrap(),
+            vec!["nmap", "{_scan_type_flags}", "{target}"]
+        );
+        assert_eq!(tokenize_template("").unwrap(), Vec::<String>::new());
+        assert_eq!(tokenize_template("   ").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_tokenize_template_quotes_and_escapes() {
+        assert_eq!(
+            tokenize_template(r#"curl -H 'X: y' -w "a b" c\ d"#).unwrap(),
+            vec!["curl", "-H", "X: y", "-w", "a b", "c d"]
+        );
+        // Empty quoted string is a real (empty) token.
+        assert_eq!(tokenize_template("echo ''").unwrap(), vec!["echo", ""]);
+        // Backslash is literal inside single quotes.
+        assert_eq!(
+            tokenize_template(r"echo '\n'").unwrap(),
+            vec!["echo", r"\n"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_template_rejects_placeholder_inside_quotes() {
+        let err = tokenize_template("curl -H '{headers}' {url}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside quotes"), "unexpected: {err}");
+        assert!(err.contains("use exec = [...]"), "unexpected: {err}");
+        assert!(tokenize_template(r#"curl -H "X: {value}""#).is_err());
+    }
+
+    #[test]
+    fn test_tokenize_template_allows_brace_escape_inside_quotes() {
+        assert_eq!(
+            tokenize_template("curl -w '%{{http_code}}' {url}").unwrap(),
+            vec!["curl", "-w", "%{{http_code}}", "{url}"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_template_rejects_unbalanced_quotes_and_trailing_backslash() {
+        let err = tokenize_template("echo 'oops").unwrap_err().to_string();
+        assert!(err.contains("unbalanced quote"), "unexpected: {err}");
+        assert!(tokenize_template("echo \"oops").is_err());
+        let err = tokenize_template("echo x\\").unwrap_err().to_string();
+        assert!(err.contains("trailing backslash"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_placeholder_names_skip_escapes() {
+        assert_eq!(placeholder_names("%{{http_code}}"), Vec::<String>::new());
+        assert_eq!(placeholder_names("{a}-{{x}}-{b}"), vec!["a", "b"]);
+        assert_eq!(exact_placeholder("{target}"), Some("target"));
+        assert_eq!(exact_placeholder("x{target}"), None);
+        assert_eq!(exact_placeholder("{{target}}"), None);
+    }
+
+    // ---- W1: substitution ----------------------------------------------
+
+    fn exec_manifest(exec: &[&str]) -> Manifest {
+        let mut m = minimal_manifest();
+        m.command.template = None;
+        m.command.exec = Some(exec.iter().map(|s| s.to_string()).collect());
+        m.command.exec_was_declared = true;
+        m
+    }
+
+    #[test]
+    fn test_value_with_space_stays_one_argv_element() {
+        let mut m = exec_manifest(&["echo", "--name", "{label}", "{target}"]);
+        m.args.insert(
+            "label".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                allow_whitespace: true,
+                ..Default::default()
+            },
+        );
+        let args = HashMap::from([
+            ("label".to_string(), "X: y -d @/etc/passwd".to_string()),
+            ("target".to_string(), "10.0.1.1".to_string()),
+        ]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv.len(), 4, "argv: {argv:?}");
+        assert_eq!(
+            argv,
+            vec!["echo", "--name", "X: y -d @/etc/passwd", "10.0.1.1"]
+        );
+    }
+
+    #[test]
+    fn test_empty_sole_placeholder_is_dropped() {
+        let mut m = exec_manifest(&["echo", "{extra}", "--x={extra}", "{target}"]);
+        m.args.insert(
+            "extra".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                default: Some(toml::Value::String(String::new())),
+                ..Default::default()
+            },
+        );
+        let args = HashMap::from([("target".to_string(), "10.0.1.1".to_string())]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        // `{extra}` alone vanishes; `--x={extra}` keeps its literal text.
+        assert_eq!(argv, vec!["echo", "--x=", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_unresolved_placeholder_is_build_error() {
+        let m = exec_manifest(&["echo", "{nope}"]);
+        let args = HashMap::from([("target".to_string(), "10.0.1.1".to_string())]);
+        let err = build_command_argv(&m, &args).unwrap_err().to_string();
+        assert!(
+            err.contains("unresolved placeholder '{nope}' in command"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_literal_brace_escape_in_exec() {
+        let m = exec_manifest(&["echo", "-w", "%{{http_code}}", "{target}"]);
+        let args = HashMap::from([("target".to_string(), "10.0.1.1".to_string())]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-w", "%{http_code}", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_mapping_splices_tokens_and_legacy_alias_removed() {
+        let mut m = exec_manifest(&["echo", "{_scan_type_flags}", "{target}"]);
+        m.args.insert(
+            "scan_type".to_string(),
+            ArgDef {
+                type_name: "enum".to_string(),
+                allowed: Some(vec!["ping".to_string(), "service".to_string()]),
+                ..Default::default()
+            },
+        );
+        m.command.mappings = Some(HashMap::from([(
+            "scan_type".to_string(),
+            HashMap::from([
+                ("ping".to_string(), "-sn -PE".to_string()),
+                ("service".to_string(), "-sT -sV".to_string()),
+            ]),
+        )]));
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("scan_type".to_string(), "service".to_string()),
+        ]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-sT", "-sV", "10.0.1.1"]);
+
+        // The legacy `_<arg>` short alias no longer exists.
+        m.command.exec = Some(vec![
+            "echo".into(),
+            "{_scan_type}".into(),
+            "{target}".into(),
+        ]);
+        let err = build_command_argv(&m, &args).unwrap_err().to_string();
+        assert!(
+            err.contains("unresolved placeholder '{_scan_type}'"),
+            "unexpected: {err}"
+        );
+
+        // A trusted var embedded in a larger token is refused, never joined.
+        m.command.exec = Some(vec!["echo".into(), "--f={_scan_type_flags}".into()]);
+        let err = build_command_argv(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("whole token"), "unexpected: {err}");
+
+        // A value with no mapping entry is a build error, not a silent drop.
+        m.command.exec = Some(vec!["echo".into(), "{_scan_type_flags}".into()]);
+        let bad = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("scan_type".to_string(), "stealth".to_string()),
+        ]);
+        let err = build_command_argv(&m, &bad).unwrap_err().to_string();
+        assert!(err.contains("no mapping"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_conditional_tokens_substituted_individually() {
+        let mut m = exec_manifest(&["echo", "{_header_flags}", "{target}"]);
+        m.args.insert(
+            "headers".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                allow_whitespace: true,
+                default: Some(toml::Value::String(String::new())),
+                ..Default::default()
+            },
+        );
+        m.command.conditionals = Some(HashMap::from([(
+            "header_flags".to_string(),
+            ConditionalDef {
+                when: "headers != ''".to_string(),
+                template: "-H {headers}".to_string(),
+                tokens: Vec::new(),
+            },
+        )]));
+
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("headers".to_string(), "X-Trace: abc".to_string()),
+        ]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-H", "X-Trace: abc", "10.0.1.1"]);
+
+        // Condition false: the conditional contributes nothing.
+        let args = HashMap::from([("target".to_string(), "10.0.1.1".to_string())]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_end_of_options_inserted_before_first_user_arg() {
+        let mut m = exec_manifest(&["echo", "-v", "{_scan_type_flags}", "{target}", "{extra}"]);
+        m.command.end_of_options = Some("--".to_string());
+        m.args.insert(
+            "scan_type".to_string(),
+            ArgDef {
+                type_name: "enum".to_string(),
+                allowed: Some(vec!["ping".to_string()]),
+                ..Default::default()
+            },
+        );
+        m.args.insert(
+            "extra".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                default: Some(toml::Value::String(String::new())),
+                ..Default::default()
+            },
+        );
+        m.command.mappings = Some(HashMap::from([(
+            "scan_type".to_string(),
+            HashMap::from([("ping".to_string(), "-sn -PE".to_string())]),
+        )]));
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("scan_type".to_string(), "ping".to_string()),
+            ("extra".to_string(), "more".to_string()),
+        ]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        // `--` lands before the first user-arg token, not before mapping
+        // output, and is inserted exactly once.
+        assert_eq!(
+            argv,
+            vec!["echo", "-v", "-sn", "-PE", "--", "10.0.1.1", "more"]
+        );
+
+        // No user-arg-only token: nothing inserted.
+        m.command.exec = Some(vec!["echo".into(), "{_scan_type_flags}".into()]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-sn", "-PE"]);
+
+        // Anything but "--" is refused.
+        m.command.end_of_options = Some("-".to_string());
+        assert!(build_command_argv(&m, &args).is_err());
+    }
+
+    #[test]
+    fn test_injected_vars_cannot_be_shadowed_by_args() {
+        let m = exec_manifest(&["echo", "{_scan_id}", "{target}"]);
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("_scan_id".to_string(), "forged".to_string()),
+        ]);
+        let argv = build_command_argv(&m, &args).unwrap();
+        assert_ne!(argv[1], "forged");
+        assert_eq!(argv[2], "10.0.1.1");
+    }
+
+    #[test]
+    fn test_executor_hatch_takes_precedence_and_is_strict() {
+        // executor + declared exec + allow_whitespace: the executor wins, and
+        // its validation is strict, so the spaced value is refused.
+        let mut m = exec_manifest(&["echo", "{label}", "{target}"]);
+        m.command.executor = Some("/usr/bin/true".to_string());
+        m.args.insert(
+            "label".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                allow_whitespace: true,
+                ..Default::default()
+            },
+        );
+        let args = HashMap::from([
+            ("label".to_string(), "a b".to_string()),
+            ("target".to_string(), "10.0.1.1".to_string()),
+        ]);
+        let err = dry_run(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("whitespace"), "unexpected: {err}");
+
+        let ok = HashMap::from([
+            ("label".to_string(), "ab".to_string()),
+            ("target".to_string(), "10.0.1.1".to_string()),
+        ]);
+        let dry = dry_run(&m, &ok).unwrap();
+        assert_eq!(dry.command, "/usr/bin/true (custom executor)");
+    }
+
+    #[test]
+    fn test_template_mode_rejects_whitespace_even_with_allow_whitespace() {
+        // A manifest built from a template (not a declared exec) is strict:
+        // the executor passes exec_mode = false, so the value is refused.
+        let mut m = minimal_manifest();
+        m.command.template = Some("echo {label} {target}".to_string());
+        m.args.insert(
+            "label".to_string(),
+            ArgDef {
+                type_name: "string".to_string(),
+                allow_whitespace: true,
+                ..Default::default()
+            },
+        );
+        assert!(!m.command.exec_was_declared);
+        let args = HashMap::from([
+            ("label".to_string(), "a b".to_string()),
+            ("target".to_string(), "10.0.1.1".to_string()),
+        ]);
+        let err = dry_run(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("whitespace"), "unexpected: {err}");
     }
 }

@@ -16,7 +16,18 @@
 //! because the interface doesn't permit it.
 //!
 //! All string-based types reject shell metacharacters (`;|&$\`(){}[]<>!`)
-//! by default.
+//! by default. String-derived values (`string`, `path`, `credential_file`,
+//! `regex_match`, `url`, `scope_target`, `duration`, `msf_options`) are also
+//! refused if they contain NUL or control characters, quotes or backslashes,
+//! whitespace, or start with `-`/`+`, so a value can never be re-split into
+//! extra arguments or parsed by the target binary as an option. An arg opts
+//! out per rule with `allow_leading_dash = true` or (declared `exec` only)
+//! `allow_whitespace = true`.
+//!
+//! Commands are built from an argv array. A legacy `[command] template` is
+//! tokenized once at load, on manifest text only; substituted values are
+//! never re-split and `end_of_options = "--"` can fence user values off from
+//! option parsing entirely.
 //!
 //! ## Core Types
 //!
@@ -87,7 +98,7 @@ pub mod executor;
 pub mod types;
 pub mod validator;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use types::{CustomTypeDef, Manifest, ToolCladError};
 
@@ -102,21 +113,131 @@ pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, ToolCladError>
 
 /// Parse a manifest from a TOML string.
 pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
-    let manifest: Manifest = toml::from_str(toml_str)
+    let mut manifest: Manifest = toml::from_str(toml_str)
         .map_err(|e| ToolCladError::ManifestError(format!("TOML parse error: {e}")))?;
+    compile_command(&mut manifest)?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+/// Compile the `[command]` section into its canonical exec form.
+///
+/// A `template` with no `exec` is tokenized here, once, on trusted manifest
+/// text; every conditional template is tokenized the same way. The result is
+/// what the executor substitutes into — values are never re-split.
+fn compile_command(manifest: &mut Manifest) -> Result<(), ToolCladError> {
+    let cmd = &mut manifest.command;
+    cmd.exec_was_declared = cmd.exec.is_some();
+
+    if cmd.exec.is_none() {
+        if let Some(ref template) = cmd.template {
+            cmd.exec = Some(executor::tokenize_template(template)?);
+            eprintln!(
+                "warning: [command] template is deprecated and will be removed in the next minor release; use exec = [...]"
+            );
+        }
+    }
+
+    if let Some(ref mut conditionals) = cmd.conditionals {
+        for (name, cond) in conditionals.iter_mut() {
+            cond.tokens = executor::tokenize_template(&cond.template).map_err(|e| {
+                let msg = match e {
+                    ToolCladError::ManifestError(m) => m,
+                    other => other.to_string(),
+                };
+                ToolCladError::ManifestError(format!("conditional '{name}': {msg}"))
+            })?;
+        }
+    }
+
+    if let Some(ref eoo) = cmd.end_of_options {
+        if eoo != "--" {
+            return Err(ToolCladError::ManifestError(format!(
+                "end_of_options must be exactly \"--\" (got '{eoo}')"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Load-time placeholder check: every `{name}` in the compiled exec form and
+/// in every conditional must name a declared arg, a `[command.defaults]` key,
+/// `_<arg>_flags` for a mapped arg, `_<cond>` for a declared conditional, or
+/// an executor-injected variable. A trusted multi-token variable must stand
+/// alone as a whole token.
+fn check_placeholders(manifest: &Manifest) -> Result<(), ToolCladError> {
+    let cmd = &manifest.command;
+
+    let mut single: HashSet<String> = manifest.args.keys().cloned().collect();
+    if let Some(ref defaults) = cmd.defaults {
+        single.extend(defaults.keys().cloned());
+    }
+    single.extend(executor::INJECTED_VARS.iter().map(|s| s.to_string()));
+
+    let mut trusted: HashSet<String> = HashSet::new();
+    if let Some(ref mappings) = cmd.mappings {
+        trusted.extend(mappings.keys().map(|k| format!("_{k}_flags")));
+    }
+    if let Some(ref conditionals) = cmd.conditionals {
+        trusted.extend(conditionals.keys().map(|k| format!("_{k}")));
+    }
+
+    let check = |tokens: &[String], context: &str| -> Result<(), ToolCladError> {
+        for token in tokens {
+            for name in executor::placeholder_names(token) {
+                if trusted.contains(&name) {
+                    if token != &format!("{{{name}}}") {
+                        return Err(ToolCladError::ManifestError(format!(
+                            "placeholder '{{{name}}}' expands to multiple tokens and must be a whole token in {context}"
+                        )));
+                    }
+                } else if !single.contains(&name) {
+                    return Err(ToolCladError::ManifestError(format!(
+                        "unresolved placeholder '{{{name}}}' in {context}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(ref exec) = cmd.exec {
+        check(exec, "command")?;
+    }
+    if let Some(ref conditionals) = cmd.conditionals {
+        for (name, cond) in conditionals {
+            check(&cond.tokens, &format!("conditional '{name}'"))?;
+        }
+    }
+    if let Some(ref mappings) = cmd.mappings {
+        for (arg, table) in mappings {
+            for value in table.values() {
+                executor::tokenize_template(value).map_err(|e| {
+                    let msg = match e {
+                        ToolCladError::ManifestError(m) => m,
+                        other => other.to_string(),
+                    };
+                    ToolCladError::ManifestError(format!("mapping for '{arg}': {msg}"))
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Binaries that connect to a network destination derived from their arguments
 /// — the ones for which an unconstrained `scope_target`/`url` is an SSRF surface.
 const EGRESS_BINARIES: &[&str] = &[
-    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh",
-    "ping", "fping", "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
+    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh", "ping", "fping",
+    "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
 ];
 
 fn command_basename(s: &str) -> String {
-    s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase()
+    s.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase()
 }
 
 /// True if the manifest's command dispatches one of the known egress binaries
@@ -207,16 +328,39 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
         }
     }
 
-    // Validate that mapping keys reference existing args.
+    // Validate that mapping keys reference existing args, and that a mapping
+    // over an enum covers every allowed value: a missing case must be a load
+    // failure, not a silently flag-less invocation. Map a value to "" to say
+    // "no flags".
     if let Some(ref mappings) = manifest.command.mappings {
-        for arg_name in mappings.keys() {
-            if !manifest.args.contains_key(arg_name) {
+        for (arg_name, table) in mappings {
+            let Some(def) = manifest.args.get(arg_name) else {
                 return Err(ToolCladError::ManifestError(format!(
                     "mapping references unknown argument '{arg_name}'"
                 )));
+            };
+            if def.type_name == "enum" {
+                if let Some(ref allowed) = def.allowed {
+                    let mut missing: Vec<&str> = allowed
+                        .iter()
+                        .filter(|v| !table.contains_key(*v))
+                        .map(String::as_str)
+                        .collect();
+                    missing.sort_unstable();
+                    if !missing.is_empty() {
+                        return Err(ToolCladError::ManifestError(format!(
+                            "mapping for enum argument '{arg_name}' does not cover allowed values: [{}] (map a value to \"\" for no flags)",
+                            missing.join(", ")
+                        )));
+                    }
+                }
             }
         }
     }
+
+    // Every placeholder in the compiled command must resolve to something the
+    // manifest declares; a typo must not survive to build time.
+    check_placeholders(manifest)?;
 
     // Validate risk_tier values.
     let valid_tiers = ["info", "low", "medium", "high", "critical"];
@@ -1079,5 +1223,305 @@ type = "object"
         assert!(m.http.is_some());
         assert!(m.command.template.is_none());
         assert!(m.command.executor.is_none());
+    }
+
+    // ---- W1: compile-to-exec at load ------------------------------------
+
+    /// A non-egress manifest skeleton; `$COMMAND` is replaced per test.
+    fn echo_manifest(command: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "echo_tool"
+version = "1.0.0"
+binary = "echo"
+description = "x"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+
+[args.label]
+position = 2
+required = false
+type = "string"
+default = ""
+allow_whitespace = true
+
+{command}
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    #[test]
+    fn test_template_is_compiled_to_exec_at_load() {
+        let m = parse_manifest(WHOIS_MANIFEST).unwrap();
+        assert_eq!(
+            m.command.exec.as_deref(),
+            Some(&["whois".to_string(), "{target}".to_string()][..])
+        );
+        // The template is kept for display; it did not declare exec.
+        assert_eq!(m.command.template.as_deref(), Some("whois {target}"));
+        assert!(!m.command.exec_was_declared);
+
+        let declared =
+            parse_manifest(&echo_manifest("[command]\nexec = [\"echo\", \"{target}\"]")).unwrap();
+        assert!(declared.command.exec_was_declared);
+
+        // Both present: exec wins and counts as declared.
+        let both = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {target}\"\nexec = [\"echo\", \"{target}\"]",
+        ))
+        .unwrap();
+        assert!(both.command.exec_was_declared);
+    }
+
+    #[test]
+    fn test_template_placeholder_inside_quotes_refused_at_load() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo '{label}' {target}\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("inside quotes"), "unexpected: {err}");
+
+        // Same rule for a conditional template.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_lbl} {target}\"\n\n[command.conditionals.lbl]\nwhen = \"label != ''\"\ntemplate = \"-l \\\"{label}\\\"\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("conditional 'lbl'"), "unexpected: {err}");
+        assert!(err.contains("inside quotes"), "unexpected: {err}");
+
+        // A brace escape inside quotes is fine.
+        let m = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo -w '%{{http_code}}' {target}\"",
+        ))
+        .unwrap();
+        assert_eq!(m.command.exec.as_ref().unwrap()[2], "%{{http_code}}");
+    }
+
+    #[test]
+    fn test_unresolved_placeholder_refused_at_load() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {nope} {target}\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{nope}' in command"),
+            "unexpected: {err}"
+        );
+        let err = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"--x={typo}\", \"{target}\"]",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{typo}'"),
+            "unexpected: {err}"
+        );
+
+        // Inside a conditional.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_lbl} {target}\"\n\n[command.conditionals.lbl]\nwhen = \"label != ''\"\ntemplate = \"-l {labl}\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{labl}'"),
+            "unexpected: {err}"
+        );
+        assert!(err.contains("conditional 'lbl'"), "unexpected: {err}");
+
+        // The legacy `_<arg>` mapping alias is gone; only `_<arg>_flags` exists.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_label} {target}\"\n\n[command.mappings.label]\nx = \"-x\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{_label}'"),
+            "unexpected: {err}"
+        );
+        assert!(parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_label_flags} {target}\"\n\n[command.mappings.label]\nx = \"-x\"",
+        ))
+        .is_ok());
+
+        // Injected vars and [command.defaults] keys resolve.
+        assert!(parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_scan_id} {_output_file} {_evidence_dir} {rate} {target}\"\n\n[command.defaults]\nrate = 10",
+        ))
+        .is_ok());
+
+        // A trusted multi-token var glued to literal text is refused.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo --f={_label_flags} {target}\"\n\n[command.mappings.label]\nx = \"-x\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("whole token"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_literal_brace_escape_survives_load_and_build() {
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"-w\", \"%{{http_code}}\", \"{target}\"]",
+        ))
+        .unwrap();
+        let args = HashMap::from([("target".to_string(), "10.0.1.1".to_string())]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-w", "%{http_code}", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_end_of_options_validated_at_load_and_applied() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"{target}\"]\nend_of_options = \"-\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("end_of_options"), "unexpected: {err}");
+
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"-n\", \"{target}\", \"{label}\"]\nend_of_options = \"--\"",
+        ))
+        .unwrap();
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("label".to_string(), "x".to_string()),
+        ]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-n", "--", "10.0.1.1", "x"]);
+        let dry = executor::dry_run(&m, &args).unwrap();
+        assert_eq!(dry.command, "echo -n -- 10.0.1.1 x");
+    }
+
+    #[test]
+    fn test_exec_value_with_space_is_one_argv_element() {
+        // Declared exec + allow_whitespace: the value passes validation in
+        // exec mode and lands in argv as exactly one element.
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"--label\", \"{label}\", \"{target}\"]",
+        ))
+        .unwrap();
+        assert!(m.command.exec_was_declared);
+        let label = validator::validate_arg_mode(
+            "label",
+            &m.args["label"],
+            "X: y -d @/etc/passwd",
+            m.command.exec_was_declared,
+        )
+        .unwrap();
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("label".to_string(), label),
+        ]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv.len(), 4, "argv: {argv:?}");
+        assert_eq!(argv[2], "X: y -d @/etc/passwd");
+        let dry = executor::dry_run(&m, &args).unwrap();
+        assert_eq!(dry.command, "echo --label X: y -d @/etc/passwd 10.0.1.1");
+
+        // The same manifest written as a template stays strict: the compiled
+        // exec is not a declared exec, so allow_whitespace is not honored.
+        let t = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo --label {label} {target}\"",
+        ))
+        .unwrap();
+        assert!(!t.command.exec_was_declared);
+        let err = executor::dry_run(&t, &args).unwrap_err().to_string();
+        assert!(
+            err.contains("must not contain whitespace"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_conditional_tokens_populated_at_load() {
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"{_lbl}\", \"{target}\"]\n\n[command.conditionals.lbl]\nwhen = \"label != ''\"\ntemplate = \"-l {label}\"",
+        ))
+        .unwrap();
+        let cond = &m.command.conditionals.as_ref().unwrap()["lbl"];
+        assert_eq!(cond.tokens, vec!["-l", "{label}"]);
+
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("label".to_string(), "X-Trace: abc".to_string()),
+        ]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-l", "X-Trace: abc", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_enum_mapping_must_cover_allowed_values_at_load() {
+        let base = r#"
+[tool]
+name = "echo_tool"
+version = "1.0.0"
+binary = "echo"
+description = "x"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+
+[args.mode]
+position = 2
+required = true
+type = "enum"
+allowed = ["fast", "slow", "none"]
+
+[command]
+exec = ["echo", "{_mode_flags}", "{target}"]
+
+[command.mappings.mode]
+$MAPPING
+
+[output]
+format = "text"
+"#;
+        // Two of three allowed values mapped: refused, naming the gap.
+        let err = parse_manifest(&base.replace("$MAPPING", "fast = \"-T4\"\nslow = \"-T1\""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mapping for enum argument 'mode'"),
+            "unexpected: {err}"
+        );
+        assert!(err.contains("[none]"), "unexpected: {err}");
+
+        // Mapping the remaining value to "" means "no flags" and loads.
+        let m = parse_manifest(
+            &base.replace("$MAPPING", "fast = \"-T4\"\nslow = \"-T1\"\nnone = \"\""),
+        )
+        .unwrap();
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("mode".to_string(), "none".to_string()),
+        ]);
+        assert_eq!(
+            executor::build_command_argv(&m, &args).unwrap(),
+            vec!["echo", "10.0.1.1"]
+        );
+    }
+
+    #[test]
+    fn test_unbalanced_mapping_value_refused_at_load() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_label_flags} {target}\"\n\n[command.mappings.label]\nx = \"-x 'oops\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mapping for 'label'"), "unexpected: {err}");
+        assert!(err.contains("unbalanced quote"), "unexpected: {err}");
     }
 }

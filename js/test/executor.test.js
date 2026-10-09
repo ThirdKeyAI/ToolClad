@@ -87,7 +87,7 @@ describe("buildCommand - mappings", () => {
         },
       },
       command: {
-        template: "nmap {_scan_flags} {target}",
+        template: "nmap {_scan_type_flags} {target}",
         mappings: {
           scan_type: {
             ping: "-sn -PE",

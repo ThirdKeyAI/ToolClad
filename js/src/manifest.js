@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import TOML from "@iarna/toml";
+import { compileCommand } from "./executor.js";
 
 /**
  * Load and parse a .clad.toml manifest file.
@@ -51,6 +52,13 @@ export function loadManifest(path) {
         throw new Error(`Invalid manifest: missing [output] section (or set tool.dispatch = "callback" for validator-only manifests)`);
       }
     }
+  }
+
+  // Compile [command] into its canonical exec form: tokenize a legacy
+  // template, tokenize conditionals, check end_of_options, and verify every
+  // placeholder names a declared variable.
+  if (manifest.command) {
+    compileCommand(manifest);
   }
 
   return manifest;

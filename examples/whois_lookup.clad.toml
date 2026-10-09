@@ -20,11 +20,12 @@ type = "scope_target"
 description = "Domain name or IP address to query"
 
 [command]
-template = "whois {target}"
+exec = ["whois", "{target}"]
 
 [output]
 format = "text"
 envelope = true
+max_bytes = 8388608
 
 [output.schema]
 type = "object"

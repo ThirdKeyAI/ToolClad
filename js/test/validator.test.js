@@ -25,7 +25,7 @@ describe("validateArg - string", () => {
   });
 
   it("rejects injection in strings", () => {
-    assert.throws(() => validateArg({ type: "string" }, "foo;rm -rf /"), /Injection/);
+    assert.throws(() => validateArg({ type: "string" }, "foo;whoami"), /Injection/);
   });
 
   it("validates pattern constraint", () => {
@@ -128,9 +128,11 @@ describe("validateArg - scope_target", () => {
       () => validateArg({ type: "scope_target" }, " example.com"),
       /whitespace/
     );
+    // A tab is a control character (rule 2), which is checked before the
+    // whitespace rule.
     assert.throws(
       () => validateArg({ type: "scope_target" }, "\texample.com"),
-      /whitespace/
+      /control characters/
     );
   });
 
@@ -222,7 +224,17 @@ describe("validateArg - cidr", () => {
 describe("validateArg - number (float)", () => {
   it("accepts valid floats", () => {
     assert.equal(validateArg({ type: "number" }, "0.5"), 0.5);
-    assert.equal(validateArg({ type: "number" }, "-3.14"), -3.14);
+    assert.equal(
+      validateArg({ type: "number", allow_leading_dash: true }, "-3.14"),
+      -3.14
+    );
+  });
+
+  it("rejects a negative result unless allow_leading_dash is set", () => {
+    assert.throws(
+      () => validateArg({ type: "number" }, "-3.14"),
+      /must not start with '-' or '\+'/
+    );
   });
 
   it("rejects NaN and infinity", () => {

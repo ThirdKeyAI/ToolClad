@@ -35,8 +35,12 @@ class TestStringValidation:
             validate_arg(ad, "ABC123")
 
     def test_string_injection_rejected(self):
-        with pytest.raises(ValidationError, match="shell metacharacters"):
+        # Whitespace hygiene fires first on the classic payload; a
+        # whitespace-free payload reaches the metacharacter blocklist.
+        with pytest.raises(ValidationError, match="whitespace"):
             validate_arg(_arg("string"), "hello; rm -rf /")
+        with pytest.raises(ValidationError, match="shell metacharacters"):
+            validate_arg(_arg("string"), "hello;rm")
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +52,9 @@ class TestIntegerValidation:
         assert validate_arg(_arg("integer"), "42") == "42"
 
     def test_negative_integer(self):
-        assert validate_arg(_arg("integer"), "-5") == "-5"
+        with pytest.raises(ValidationError, match="must not start with"):
+            validate_arg(_arg("integer"), "-5")
+        assert validate_arg(_arg("integer", allow_leading_dash=True), "-5") == "-5"
 
     def test_not_a_number(self):
         with pytest.raises(ValidationError, match="Expected integer"):
@@ -164,17 +170,21 @@ class TestScopeTargetValidation:
             validate_arg(_arg("scope_target"), "*.example.com")
 
     def test_injection_in_target(self):
-        with pytest.raises(ValidationError, match="shell metacharacters"):
+        with pytest.raises(ValidationError, match="whitespace"):
             validate_arg(_arg("scope_target"), "10.0.1.1; echo pwned")
+        with pytest.raises(ValidationError, match="shell metacharacters"):
+            validate_arg(_arg("scope_target"), "10.0.1.1;echo")
 
     def test_invalid_target(self):
-        # "!!!" contains shell metacharacter '!', so injection check fires first
-        with pytest.raises(ValidationError, match="shell metacharacters"):
+        # Whitespace hygiene fires before the metacharacter blocklist.
+        with pytest.raises(ValidationError, match="whitespace"):
             validate_arg(_arg("scope_target"), "not a valid target at all!!!")
 
     def test_invalid_target_no_metachar(self):
-        with pytest.raises(ValidationError, match="Invalid scope target"):
+        with pytest.raises(ValidationError, match="whitespace"):
             validate_arg(_arg("scope_target"), "not a valid target")
+        with pytest.raises(ValidationError, match="Invalid scope target"):
+            validate_arg(_arg("scope_target"), "not_a_valid_target")
 
     def test_trailing_whitespace_rejected(self):
         # RFC 1035 / RFC 5891 don't permit terminal whitespace in hostname
@@ -183,9 +193,10 @@ class TestScopeTargetValidation:
             validate_arg(_arg("scope_target"), "example.com ")
         with pytest.raises(ValidationError, match="whitespace"):
             validate_arg(_arg("scope_target"), " example.com")
-        with pytest.raises(ValidationError, match="whitespace"):
+        # Tab and newline are control characters and are rejected as such.
+        with pytest.raises(ValidationError, match="control characters"):
             validate_arg(_arg("scope_target"), "\texample.com")
-        with pytest.raises(ValidationError, match="whitespace"):
+        with pytest.raises(ValidationError, match="control characters"):
             validate_arg(_arg("scope_target"), "example.com\n")
 
     def test_overlong_rejected(self):

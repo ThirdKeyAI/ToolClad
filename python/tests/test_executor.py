@@ -112,7 +112,7 @@ class TestBasicInterpolation:
 class TestMappings:
     def test_scan_type_mapping(self):
         m = _simple_manifest(
-            "nmap {_scan_flags} {target}",
+            "nmap {_scan_type_flags} {target}",
             args={
                 "target": ArgDef(name="target", position=1, required=True, type="scope_target"),
                 "scan_type": ArgDef(
@@ -131,8 +131,8 @@ class TestMappings:
         result = build_command(m, {"target": "10.0.1.0/24", "scan_type": "service"})
         assert result == "nmap -sT -sV --version-intensity 5 10.0.1.0/24"
 
-    def test_mapping_unknown_value_empty(self):
-        """A mapping value not in the table resolves to empty string."""
+    def test_mapping_enum_table_must_be_exhaustive(self):
+        """An enum mapping table that misses an allowed value is refused."""
         m = _simple_manifest(
             "tool {_mode_flags} {target}",
             args={
@@ -144,9 +144,29 @@ class TestMappings:
             },
             mappings={"mode": {"a": "--alpha", "b": "--beta"}},
         )
-        result = build_command(m, {"target": "x", "mode": "c"})
-        # c has no mapping, so {_mode_flags} resolves to ""
-        assert result == "tool x"
+        with pytest.raises(ValueError, match="missing entries for enum values: 'c'"):
+            build_command(m, {"target": "x", "mode": "c"})
+
+    def test_mapping_unknown_value_is_error(self):
+        """A present value with no table entry is a build error, not an empty splice."""
+        m = _simple_manifest(
+            "tool {_mode_flags} {target}",
+            args={
+                "target": ArgDef(name="target", position=1, required=True, type="string"),
+                "mode": ArgDef(name="mode", position=2, required=False, type="string"),
+            },
+            mappings={"mode": {"a": "--alpha", "b": "--beta"}},
+        )
+        with pytest.raises(
+            ValidationError,
+            match=r"no mapping for argument 'mode' value 'c' in \[command.mappings.mode\]",
+        ):
+            build_command(m, {"target": "x", "mode": "c"})
+        # An absent optional still contributes nothing.
+        assert build_command(m, {"target": "x"}) == "tool x"
+        # Mapping to "" means "no flags".
+        m.command.mappings["mode"]["c"] = ""
+        assert build_command(m, {"target": "x", "mode": "c"}) == "tool x"
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +255,13 @@ class TestValidationInBuild:
 
     def test_injection_blocked(self):
         m = _simple_manifest("echo {target}")
-        with pytest.raises(ValidationError, match="shell metacharacters"):
+        # The whitespace rule rejects the classic payload before the
+        # metacharacter blocklist is reached; a whitespace-free payload
+        # still trips the blocklist.
+        with pytest.raises(ValidationError, match="whitespace"):
             build_command(m, {"target": "hello; rm -rf /"})
+        with pytest.raises(ValidationError, match="shell metacharacters"):
+            build_command(m, {"target": "hello;rm"})
 
 
 # ---------------------------------------------------------------------------

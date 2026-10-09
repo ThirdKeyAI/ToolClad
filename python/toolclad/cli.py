@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from typing import Dict, List, Optional, Tuple
 
 import click
 
-from toolclad.executor import build_command, execute
+from toolclad.executor import build_command_argv, execute
 from toolclad.manifest import Manifest, load_manifest
-from toolclad.validator import ValidationError
+from toolclad.validator import ValidationError, validate_arg_mode
 
 
 def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
@@ -61,7 +62,11 @@ def validate(manifest_path: str) -> None:
         click.echo(f"  {arg.name}: {arg.type} ({req})")
     if manifest.command.template:
         click.echo(f"Template:     {manifest.command.template}")
-    elif manifest.command.executor:
+    if manifest.command.exec:
+        click.echo(f"Exec:         {json.dumps(manifest.command.exec)}")
+    if manifest.command.end_of_options:
+        click.echo(f"End of opts:  {manifest.command.end_of_options}")
+    if manifest.command.executor:
         click.echo(f"Executor:     {manifest.command.executor}")
     out_format = manifest.output.format if manifest.output else "(none — callback dispatch)"
     click.echo(f"Output:       {out_format}")
@@ -191,15 +196,16 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
         manifest = load_manifest(manifest_path)
         args = _parse_args(arg_pairs)
 
-        # Validate each arg individually for nice reporting.
-        from toolclad.validator import validate_arg
+        # Validate each arg individually for nice reporting. allow_whitespace
+        # is honored only when the manifest declared exec directly.
+        exec_mode = manifest.command.exec_was_declared
 
         click.echo(f"  Manifest:  {manifest.source_path}")
         click.echo(f"  Arguments:")
         for arg_name, arg_def in manifest.args.items():
             if arg_name in args:
                 try:
-                    cleaned = validate_arg(arg_def, args[arg_name])
+                    cleaned = validate_arg_mode(arg_def, args[arg_name], exec_mode)
                     click.echo(f"    {arg_name}={cleaned} ({arg_def.type}: OK)")
                 except ValidationError as ve:
                     click.echo(f"    {arg_name}={args[arg_name]} ({arg_def.type}: FAIL - {ve})")
@@ -210,8 +216,9 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
                 click.echo(f"    {arg_name}=??? (MISSING - required)")
                 sys.exit(1)
 
-        command = build_command(manifest, args)
-        click.echo(f"  Command:   {command}")
+        argv = build_command_argv(manifest, args)
+        click.echo(f"  Command:   {shlex.join(argv)}")
+        click.echo(f"  Argv:      {json.dumps(argv)}")
         if manifest.tool.cedar.resource:
             click.echo(
                 f"  Cedar:     {manifest.tool.cedar.resource} / "

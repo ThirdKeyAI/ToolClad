@@ -124,21 +124,36 @@ pub struct ArgDef {
     /// tools that legitimately target internal hosts are unaffected.
     #[serde(default)]
     pub block_internal: bool,
+    /// Permit a value that starts with `-` or `+`. Off by default so a user
+    /// value can never be parsed by the target binary as an option
+    /// (`-iL /etc/passwd`, `--output=/etc/cron.d/x`, `-rf`).
+    #[serde(default)]
+    pub allow_leading_dash: bool,
+    /// Permit whitespace inside a string-derived value. Honored only when the
+    /// manifest declares `command.exec` directly, because an `exec` element is
+    /// a single argv entry that is never re-split. A `template`, even one
+    /// compiled to exec at load, stays strict.
+    #[serde(default)]
+    pub allow_whitespace: bool,
 }
 
 /// Command construction definition `[command]`.
 ///
 /// Supports two invocation forms:
-/// - `exec = ["cmd", "arg1", "{placeholder}"]` — preferred, shell-free array execution
-/// - `template = "cmd arg1 {placeholder}"` — legacy string template (split via shlex)
+/// - `exec = ["cmd", "arg1", "{placeholder}"]` — canonical, shell-free array execution
+/// - `template = "cmd arg1 {placeholder}"` — deprecated string form, tokenized
+///   at load into the same array (placeholders must be whole, unquoted tokens)
 ///
-/// When both are present, `exec` takes precedence.
+/// When both are present, `exec` takes precedence and `template` is kept for
+/// display only.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandDef {
     pub template: Option<String>,
-    /// Preferred: array-based command construction that maps directly to execve.
+    /// Canonical array-based command construction that maps directly to execve.
     /// Each element is a separate argv entry; `{placeholder}` tokens are interpolated
     /// but the result is never re-split, so values containing spaces are safe.
+    /// When only `template` is given, the loader fills this in from the
+    /// tokenized template.
     pub exec: Option<Vec<String>>,
     pub executor: Option<String>,
     #[serde(default)]
@@ -147,6 +162,17 @@ pub struct CommandDef {
     pub mappings: Option<HashMap<String, HashMap<String, String>>>,
     #[serde(default)]
     pub conditionals: Option<HashMap<String, ConditionalDef>>,
+    /// When set to `"--"` (the only accepted value), argv construction inserts
+    /// a literal `--` immediately before the first argv entry that came from a
+    /// token consisting solely of a user-argument placeholder, so the target
+    /// binary stops option parsing before any user-controlled value.
+    #[serde(default)]
+    pub end_of_options: Option<String>,
+    /// True when the manifest declared `exec` directly (as opposed to a
+    /// `template` compiled to exec at load). Only a declared `exec` unlocks
+    /// `allow_whitespace`. Set by the loader; not part of the TOML surface.
+    #[serde(skip)]
+    pub exec_was_declared: bool,
 }
 
 /// A conditional fragment `[command.conditionals.<name>]`.
@@ -154,6 +180,11 @@ pub struct CommandDef {
 pub struct ConditionalDef {
     pub when: String,
     pub template: String,
+    /// The template tokenized at load (placeholders still unresolved). Each
+    /// token is substituted individually at build time and the result is
+    /// spliced into argv as `{_<name>}`. Not part of the TOML surface.
+    #[serde(skip)]
+    pub tokens: Vec<String>,
 }
 
 /// Output definition `[output]`.

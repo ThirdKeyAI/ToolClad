@@ -58,18 +58,21 @@ func validateCmd() *cobra.Command {
 				}
 			}
 
-			// Validate command has template or executor.
-			if m.Command.Template == "" && m.Command.Executor == "" {
-				fmt.Fprintf(os.Stderr, "%s  ERROR: no command template or executor\n", path)
-				return fmt.Errorf("no command template or executor")
-			}
-
+			// LoadManifest has already compiled [command] into its canonical
+			// exec form (or accepted another backend), so an exec-only
+			// manifest is valid here.
 			fmt.Printf("%s  OK\n", path)
 			fmt.Printf("  Tool:    %s v%s\n", m.Tool.Name, m.Tool.Version)
 			fmt.Printf("  Binary:  %s\n", m.Tool.Binary)
 			fmt.Printf("  Risk:    %s\n", m.Tool.RiskTier)
 			fmt.Printf("  Args:    %d (%d required)\n", len(m.Args), len(m.RequiredArgs()))
 			fmt.Printf("  Timeout: %ds\n", m.Tool.TimeoutSeconds)
+			switch {
+			case m.Command.Executor != "":
+				fmt.Printf("  Command: executor %s\n", m.Command.Executor)
+			case len(m.Command.Exec) > 0:
+				fmt.Printf("  Command: %s\n", executor.FormatArgv(m.Command.Exec))
+			}
 			return nil
 		},
 	}
@@ -172,7 +175,9 @@ func testCmd() *cobra.Command {
 					}
 				}
 
-				validated, vErr := validator.ValidateArg(argDef, val)
+				// allow_whitespace is honored only when the manifest
+				// declared exec = [...] itself.
+				validated, vErr := validator.ValidateArgMode(argDef, val, m.Command.ExecWasDeclared)
 				status := "OK"
 				if vErr != nil {
 					status = fmt.Sprintf("FAIL: %v", vErr)
@@ -191,15 +196,17 @@ func testCmd() *cobra.Command {
 				fmt.Println("(none)")
 			}
 
-			// Build command.
-			cmdStr, buildErr := executor.BuildCommand(m, toolArgs)
+			// Build argv from the canonical exec form.
+			argv, buildErr := executor.BuildCommandArgv(m, toolArgs)
 			if buildErr != nil {
 				fmt.Printf("  Command:   ERROR: %v\n", buildErr)
 				if firstFailure == nil {
 					firstFailure = buildErr
 				}
 			} else {
-				fmt.Printf("  Command:   %s\n", cmdStr)
+				fmt.Printf("  Command:   %s\n", executor.FormatArgv(argv))
+				argvJSON, _ := json.Marshal(argv)
+				fmt.Printf("  Argv:      %s\n", argvJSON)
 			}
 
 			if m.Tool.Cedar != nil {

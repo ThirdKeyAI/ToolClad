@@ -22,6 +22,18 @@ class ValidationError(Exception):
     """Raised when an argument value fails validation."""
 
 
+# Types whose value is passed through as text and therefore get the full
+# string-derived hygiene rules (NUL, control characters, quotes/backslash,
+# whitespace, leading dash) before any type-specific parsing.
+STRING_DERIVED_TYPES = frozenset(
+    {"string", "path", "credential_file", "regex_match", "url", "scope_target",
+     "duration", "msf_options"}
+)
+
+# Numeric types get the leading-dash rule on the *output* value, after range
+# checking and clamping, so `-5` with `clamp` and `min = 1` yields `1`.
+NUMERIC_TYPES = frozenset({"integer", "number", "port"})
+
 def _check_injection(value: str) -> None:
     """Reject values containing shell metacharacters."""
     found = set(value) & SHELL_METACHARACTERS
@@ -32,10 +44,73 @@ def _check_injection(value: str) -> None:
         )
 
 
+def _check_leading_dash(arg_def: ArgDef, value: str) -> None:
+    """Reject a value that an invoked binary could read as an option."""
+    if value[:1] in ("-", "+") and not arg_def.allow_leading_dash:
+        raise ValidationError(
+            "must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+        )
+
+
+def _check_hygiene(arg_def: ArgDef, value: str, exec_mode: bool) -> None:
+    """String-derived value hygiene, in the normative order.
+
+    NUL is checked by the caller for every type. Control characters (every
+    C0 including tab, newline and carriage return, DEL, and the C1 range)
+    are rejected unconditionally. ``msf_options`` is exempt from the
+    whitespace rule only (the ASCII space is its ``KEY VALUE`` separator).
+    ``allow_whitespace`` is honored only in exec mode (a manifest that
+    declared ``exec`` directly, never a template compiled to exec) and even
+    then permits only the ASCII space U+0020; a non-breaking or ideographic
+    space is a homoglyph, not a separator. A ``url`` never contains
+    whitespace, whatever the opt-in says.
+    """
+    for c in value:
+        code = ord(c)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            raise ValidationError("must not contain control characters")
+    if "\\" in value and arg_def.type == "scope_target":
+        raise ValidationError(
+            f"scope_target must not contain backslash escape sequences: {value!r}"
+        )
+    if "'" in value or '"' in value or "\\" in value:
+        raise ValidationError("must not contain quote or backslash characters")
+    if any(c.isspace() for c in value):
+        space_ok = arg_def.type == "msf_options" or (
+            arg_def.allow_whitespace and exec_mode and arg_def.type != "url"
+        )
+        if not space_ok or any(c.isspace() and c != " " for c in value):
+            raise ValidationError("must not contain whitespace")
+    _check_leading_dash(arg_def, value)
+
+
+def _anchor_pattern(pattern: str) -> str:
+    """Anchor a manifest pattern as ``^(?:<pat>)\\Z``.
+
+    One leading ``^`` and one trailing unescaped ``$`` are stripped first.
+    ``\\Z`` rather than ``$`` so a trailing newline cannot match.
+    """
+    if pattern.startswith("^"):
+        pattern = pattern[1:]
+    if pattern.endswith("$"):
+        trailing_backslashes = len(pattern) - 1 - len(pattern[:-1].rstrip("\\"))
+        if trailing_backslashes % 2 == 0:
+            pattern = pattern[:-1]
+    return r"^(?:" + pattern + r")\Z"
+
+
+def _matches_pattern(pattern: str, value: str) -> bool:
+    """Full-match ``value`` against the anchored form of ``pattern``."""
+    try:
+        return re.match(_anchor_pattern(pattern), value) is not None
+    except re.error as exc:
+        raise ValidationError(f"Invalid pattern {pattern!r}: {exc}")
+
+
 def _validate_string(arg_def: ArgDef, value: str) -> str:
     _check_injection(value)
     if arg_def.pattern:
-        if not re.match(arg_def.pattern, value):
+        if not _matches_pattern(arg_def.pattern, value):
             raise ValidationError(
                 f"Value '{value}' does not match pattern: {arg_def.pattern}"
             )
@@ -312,7 +387,7 @@ def _validate_regex_match(arg_def: ArgDef, value: str) -> str:
     _check_injection(value)
     if not arg_def.pattern:
         raise ValidationError("regex_match type requires a 'pattern' field")
-    if not re.match(arg_def.pattern, value):
+    if not _matches_pattern(arg_def.pattern, value):
         raise ValidationError(f"Value {value!r} does not match required pattern: {arg_def.pattern}")
     return value
 
@@ -339,12 +414,30 @@ _TYPE_HANDLERS = {
 SUPPORTED_TYPES: List[str] = sorted(_TYPE_HANDLERS.keys())
 
 
-def validate_arg(arg_def: ArgDef, value: Any) -> str:
+def _run_validation(arg_def: ArgDef, str_value: str, exec_mode: bool) -> str:
+    """Apply hygiene, the type handler, and the numeric leading-dash rule."""
+    handler = _TYPE_HANDLERS.get(arg_def.type)
+    if handler is None:
+        raise ValidationError(f"Unknown type: {arg_def.type!r}")
+    if "\0" in str_value:
+        raise ValidationError("must not contain NUL bytes")
+    if arg_def.type in STRING_DERIVED_TYPES:
+        _check_hygiene(arg_def, str_value, exec_mode)
+    result = handler(arg_def, str_value)
+    if arg_def.type in NUMERIC_TYPES:
+        _check_leading_dash(arg_def, result)
+    return result
+
+
+def validate_arg_mode(arg_def: ArgDef, value: Any, exec_mode: bool) -> str:
     """Validate a value against an argument definition and return the cleaned value.
 
     Args:
         arg_def: The argument definition from the manifest.
         value: The raw value to validate (will be converted to str).
+        exec_mode: True only when the manifest declared ``command.exec``
+            directly. This is the sole mode in which ``allow_whitespace``
+            is honored; a template compiled to exec is still strict.
 
     Returns:
         The cleaned, validated string value.
@@ -352,31 +445,34 @@ def validate_arg(arg_def: ArgDef, value: Any) -> str:
     Raises:
         ValidationError: If the value fails validation.
     """
-    str_value = str(value)
-
-    handler = _TYPE_HANDLERS.get(arg_def.type)
-    if handler is None:
-        raise ValidationError(f"Unknown type: {arg_def.type!r}")
-
-    return handler(arg_def, str_value)
+    return _run_validation(arg_def, str(value), exec_mode)
 
 
-def validate_arg_with_custom_types(
+def validate_arg(arg_def: ArgDef, value: Any) -> str:
+    """Validate a value in strict (template) mode: whitespace is always rejected.
+
+    Equivalent to ``validate_arg_mode(arg_def, value, exec_mode=False)``.
+    """
+    return validate_arg_mode(arg_def, value, exec_mode=False)
+
+
+def validate_arg_with_custom_types_mode(
     arg_def: ArgDef,
     value: Any,
     custom_types: Dict[str, "CustomTypeDef"],
+    exec_mode: bool,
 ) -> str:
     """Validate using custom type definitions.
 
     If the arg type matches a custom type, create a synthetic ArgDef
-    from the custom type and delegate to the base type validator.
+    from the custom type and delegate to the base type validator. The
+    custom type's ``pattern`` is anchored exactly like a built-in one.
     """
     from toolclad.manifest import CustomTypeDef  # avoid circular import  # noqa: F811
 
     if arg_def.type in custom_types:
         custom = custom_types[arg_def.type]
-        handler = _TYPE_HANDLERS.get(custom.base)
-        if handler is None:
+        if custom.base not in _TYPE_HANDLERS:
             raise ValidationError(f"Custom type '{arg_def.type}' has invalid base type '{custom.base}'")
 
         # Create synthetic ArgDef with custom type constraints merged
@@ -397,8 +493,19 @@ def validate_arg_with_custom_types(
             sanitize=arg_def.sanitize,
             schemes=arg_def.schemes,
             scope_check=arg_def.scope_check,
+            allow_leading_dash=arg_def.allow_leading_dash,
+            allow_whitespace=arg_def.allow_whitespace,
         )
-        return handler(synthetic, str(value))
+        return _run_validation(synthetic, str(value), exec_mode)
 
     # Not a custom type, use standard validation
-    return validate_arg(arg_def, value)
+    return validate_arg_mode(arg_def, value, exec_mode)
+
+
+def validate_arg_with_custom_types(
+    arg_def: ArgDef,
+    value: Any,
+    custom_types: Dict[str, "CustomTypeDef"],
+) -> str:
+    """Strict-mode form of ``validate_arg_with_custom_types_mode``."""
+    return validate_arg_with_custom_types_mode(arg_def, value, custom_types, exec_mode=False)

@@ -11,16 +11,33 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
+import warnings
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from toolclad.manifest import Manifest
-from toolclad.validator import ValidationError, validate_arg
+from toolclad.validator import ValidationError, validate_arg, validate_arg_mode
+
+# Variables the executor injects into every command context.
+INJECTED_VARS: Tuple[str, ...] = ("_scan_id", "_output_file", "_evidence_dir")
+
+# One left-to-right pass over a token: `{{` and `}}` are escapes for literal
+# braces and are consumed before `{name}` can match, so `%{{http_code}}` is
+# never read as a placeholder named `http_code`.
+_PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{(\w+)\}")
+# A token that is exactly one placeholder (used with fullmatch).
+_SOLE_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+_TEMPLATE_DEPRECATION = (
+    "[command] template is deprecated and will be removed in the next minor "
+    "release; use exec = [...]"
+)
 
 
 def _generate_scan_id() -> str:
@@ -65,25 +82,272 @@ def _evaluate_single(expr: str, resolved: Dict[str, str]) -> bool:
     return False
 
 
-def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
-    """Validate arguments and resolve all template variables into a single context."""
-    resolved: Dict[str, str] = {}
+def tokenize_template(s: str) -> List[str]:
+    """Split a trusted manifest template into argv tokens.
+
+    POSIX-like: single and double quotes group text, a backslash outside
+    single quotes escapes the next character, and unquoted whitespace
+    separates tokens. This runs on manifest text only; substituted values are
+    never re-split.
+
+    A ``{`` inside quotes is rejected unless it starts a ``{{`` escape, so a
+    placeholder can only ever be a whole, unquoted token.
+
+    Raises:
+        ValueError: On a placeholder inside quotes, an unbalanced quote, or a
+            trailing backslash.
+    """
+    tokens: List[str] = []
+    cur: List[str] = []
+    started = False
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and not in_single:
+            if i + 1 >= n:
+                raise ValueError("trailing backslash in command template")
+            cur.append(s[i + 1])
+            started = True
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            started = True
+        elif c == '"' and not in_single:
+            in_double = not in_double
+            started = True
+        elif c == "{" and (in_single or in_double):
+            if s[i + 1 : i + 2] == "{":
+                cur.append("{{")
+                started = True
+                i += 2
+                continue
+            raise ValueError(
+                f"command template places a placeholder inside quotes at offset {i}; "
+                "placeholders must be whole, unquoted tokens (use exec = [...])"
+            )
+        elif c.isspace() and not in_single and not in_double:
+            if started:
+                tokens.append("".join(cur))
+                cur = []
+                started = False
+        else:
+            cur.append(c)
+            started = True
+        i += 1
+    if in_single or in_double:
+        raise ValueError("unbalanced quote in command template")
+    if started:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _placeholder_names(text: str) -> List[str]:
+    """Placeholder names in ``text`` in order, skipping ``{{``/``}}`` escapes."""
+    return [m.group(1) for m in _PLACEHOLDER_RE.finditer(text) if m.group(1)]
+
+
+def _sole_placeholder(token: str) -> Optional[str]:
+    """Return the name when ``token`` is exactly ``{name}``, else None."""
+    m = _SOLE_PLACEHOLDER_RE.fullmatch(token)
+    return m.group(1) if m else None
+
+
+def _single_var_names(manifest: Manifest) -> Set[str]:
+    names: Set[str] = set(manifest.args)
+    names.update(manifest.command.defaults)
+    names.update(INJECTED_VARS)
+    return names
+
+
+def _trusted_var_names(manifest: Manifest) -> Set[str]:
+    cmd = manifest.command
+    names = {f"_{arg}_flags" for arg in cmd.mappings}
+    names.update(f"_{cond}" for cond in cmd.conditionals)
+    return names
+
+
+def _check_placeholders(manifest: Manifest) -> None:
+    """Load-time check: every placeholder must name a known variable.
+
+    Known names are declared args, ``[command.defaults]`` keys,
+    ``_<arg>_flags`` for mapped args, ``_<cond>`` for declared conditionals,
+    and the injected ``_scan_id`` / ``_output_file`` / ``_evidence_dir``.
+    A multi-token variable must be a whole token: ``x{_flags}`` is rejected
+    because splicing a token vector into literal text would re-join it.
+    """
+    single = _single_var_names(manifest)
+    trusted = _trusted_var_names(manifest)
+
+    def scan(tokens: List[str], where: str) -> None:
+        for token in tokens:
+            sole = _sole_placeholder(token)
+            for name in _placeholder_names(token):
+                if name in trusted:
+                    if sole != name:
+                        raise ValueError(
+                            f"placeholder '{{{name}}}' expands to multiple tokens and "
+                            f"must be a whole token in {where}"
+                        )
+                    continue
+                if name not in single:
+                    raise ValueError(f"unresolved placeholder '{{{name}}}' in {where}")
+
+    cmd = manifest.command
+    scan(cmd.exec, "command")
+    if cmd.template and cmd.exec_was_declared:
+        # exec takes precedence and the template is display-only, but it may
+        # still only reference declared names.
+        for name in _placeholder_names(cmd.template):
+            if name not in single and name not in trusted:
+                raise ValueError(f"unresolved placeholder '{{{name}}}' in command")
+    for cond_name, cond in cmd.conditionals.items():
+        scan(cond.tokens, f"command (conditional '{cond_name}')")
+
+
+def _check_mappings(manifest: Manifest) -> None:
+    """Load-time check: an enum's mapping table must cover every allowed value.
+
+    A missing case would otherwise surface only when that value is used. An
+    author who wants "this value adds no flags" maps it to ``""``.
+    """
+    for map_arg, table in manifest.command.mappings.items():
+        arg_def = manifest.args.get(map_arg)
+        if arg_def is None or arg_def.type != "enum":
+            continue
+        missing = [str(v) for v in arg_def.allowed if str(v) not in table]
+        if missing:
+            raise ValueError(
+                f"[command.mappings.{map_arg}] is missing entries for enum values: "
+                + ", ".join(repr(v) for v in missing)
+                + ' (map a value to "" to mean no flags)'
+            )
+
+
+def compile_command(manifest: Manifest, *, warn: bool = True) -> None:
+    """Compile ``[command]`` to its canonical exec form and check it.
+
+    Idempotent. When ``template`` is set and ``exec`` is empty, the template
+    is tokenized into ``exec`` (``exec_was_declared`` stays False so the
+    manifest remains in strict template mode). Every conditional template is
+    tokenized into ``ConditionalDef.tokens``. ``end_of_options``, every
+    placeholder, and enum mapping coverage are validated.
+
+    Args:
+        manifest: The manifest to compile in place.
+        warn: Emit the template deprecation warning (once per load).
+
+    Raises:
+        ValueError: On a malformed template, a bad ``end_of_options`` value,
+            or an unresolved placeholder.
+    """
+    cmd = manifest.command
+    if cmd.end_of_options not in ("", "--"):
+        raise ValueError(
+            f'[command] end_of_options must be "--" when set, got {cmd.end_of_options!r}'
+        )
+    if cmd.template and not cmd.exec:
+        cmd.exec = tokenize_template(cmd.template)
+        cmd.exec_was_declared = False
+        if warn:
+            warnings.warn(_TEMPLATE_DEPRECATION, DeprecationWarning, stacklevel=2)
+            sys.stderr.write(f"warning: {_TEMPLATE_DEPRECATION}\n")
+    for cond_name, cond in cmd.conditionals.items():
+        try:
+            cond.tokens = tokenize_template(cond.template)
+        except ValueError as exc:
+            raise ValueError(f"[command.conditionals.{cond_name}] {exc}") from exc
+    _check_placeholders(manifest)
+    _check_mappings(manifest)
+
+
+def _expand_tokens(
+    tokens: List[str],
+    single: Dict[str, str],
+    trusted: Dict[str, List[str]],
+    user_args: Set[str],
+) -> List[Tuple[str, bool]]:
+    """Substitute one token list into argv pieces.
+
+    A token that is exactly ``{name}`` naming a trusted multi-token variable
+    splices that variable's tokens. Any other token has every ``{name}``
+    replaced textually inside that one token (``{{``/``}}`` become literal
+    braces) and is never split; a token that was exactly one placeholder
+    resolving to the empty string is dropped.
+
+    Returns:
+        ``(argv_token, from_user_arg)`` pairs; ``from_user_arg`` is True for
+        a token produced from a sole placeholder naming a declared arg.
+    """
+    out: List[Tuple[str, bool]] = []
+    for token in tokens:
+        name = _sole_placeholder(token)
+        if name is not None:
+            if name in trusted:
+                out.extend((t, False) for t in trusted[name])
+                continue
+            if name not in single:
+                raise ValueError(f"unresolved placeholder '{{{name}}}' in command")
+            value = single[name]
+            if value == "":
+                continue
+            out.append((value, name in user_args))
+            continue
+
+        def replace(m: re.Match) -> str:  # type: ignore[type-arg]
+            text = m.group(0)
+            if text == "{{":
+                return "{"
+            if text == "}}":
+                return "}"
+            key = m.group(1)
+            if key in single:
+                return single[key]
+            if key in trusted:
+                raise ValueError(
+                    f"placeholder '{{{key}}}' expands to multiple tokens and "
+                    "must be a whole token in command"
+                )
+            raise ValueError(f"unresolved placeholder '{{{key}}}' in command")
+
+        out.append((_PLACEHOLDER_RE.sub(replace, token), False))
+    return out
+
+
+def _resolve_context(
+    manifest: Manifest, args: Dict[str, str]
+) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    """Validate arguments and build the two substitution maps.
+
+    Returns:
+        ``(single, trusted)``: single-token variables (validated args,
+        ``[command.defaults]``, injected executor variables) and trusted
+        multi-token variables (``_<arg>_flags`` from mappings, ``_<cond>``
+        from conditionals), each already split into argv tokens.
+    """
+    exec_mode = manifest.command.exec_was_declared
+    single: Dict[str, str] = {}
+    absent: Set[str] = set()
 
     for arg_name, arg_def in manifest.args.items():
         if arg_name in args:
-            resolved[arg_name] = validate_arg(arg_def, args[arg_name])
+            single[arg_name] = validate_arg_mode(arg_def, args[arg_name], exec_mode)
         elif arg_def.default is not None:
-            resolved[arg_name] = str(arg_def.default)
+            single[arg_name] = str(arg_def.default)
         elif arg_def.required:
             raise ValidationError(
                 f"Missing required argument: '{arg_name}'"
             )
         else:
-            resolved[arg_name] = ""
+            single[arg_name] = ""
+            absent.add(arg_name)
 
     for key, val in manifest.command.defaults.items():
-        if key not in resolved:
-            resolved[key] = str(val)
+        if key not in single:
+            single[key] = str(val)
 
     scan_id = _generate_scan_id()
     evidence_dir = os.environ.get("TOOLCLAD_EVIDENCE_DIR", os.path.join(tempfile.gettempdir(), "toolclad-evidence"))
@@ -99,33 +363,46 @@ def _resolve_vars(manifest: Manifest, args: Dict[str, str]) -> Dict[str, str]:
     ext = ext_map.get(out_format, "txt")
     output_file = os.path.join(output_dir, f"scan.{ext}")
 
-    resolved["_scan_id"] = scan_id
-    resolved["_evidence_dir"] = evidence_dir
-    resolved["_output_file"] = output_file
+    single["_scan_id"] = scan_id
+    single["_evidence_dir"] = evidence_dir
+    single["_output_file"] = output_file
 
+    # Mapping values come from the manifest, so splitting them is safe. A
+    # present value with no table entry is an error (never an empty splice);
+    # an absent optional argument contributes nothing.
+    trusted: Dict[str, List[str]] = {}
     for map_arg, mapping_table in manifest.command.mappings.items():
-        arg_value = resolved.get(map_arg, "")
-        mapped = mapping_table.get(arg_value, "")
-        resolved[f"_{map_arg}_flags"] = mapped
-        resolved["_scan_flags"] = mapped
+        if map_arg in absent or map_arg not in single:
+            trusted[f"_{map_arg}_flags"] = []
+            continue
+        arg_value = single[map_arg]
+        if arg_value not in mapping_table:
+            raise ValidationError(
+                f"no mapping for argument '{map_arg}' value '{arg_value}' "
+                f"in [command.mappings.{map_arg}]"
+            )
+        trusted[f"_{map_arg}_flags"] = tokenize_template(str(mapping_table[arg_value]))
 
+    user_args = set(manifest.args)
     for cond_name, cond_def in manifest.command.conditionals.items():
-        if _evaluate_condition(cond_def.when, resolved):
-            fragment = cond_def.template
-            fragment = _interpolate(fragment, resolved)
-            resolved[f"_{cond_name}"] = fragment
+        if _evaluate_condition(cond_def.when, single):
+            expanded = _expand_tokens(cond_def.tokens, single, trusted, user_args)
+            trusted[f"_{cond_name}"] = [t for t, _ in expanded]
         else:
-            resolved[f"_{cond_name}"] = ""
+            trusted[f"_{cond_name}"] = []
 
-    return resolved
+    return single, trusted
 
 
-def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> list:
-    """Build an argv list from the manifest's exec array and validated arguments.
+def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> List[str]:
+    """Build the argv list from a manifest and raw argument values.
 
-    Each element in exec is interpolated independently, preserving argument
-    boundaries. This avoids the template->string->split round-trip that breaks
-    when argument values contain spaces or quote characters.
+    The manifest is compiled to its exec form if needed, every argument is
+    validated, and each exec token is substituted independently so argument
+    boundaries are preserved: a value is always exactly one argv element.
+    When ``end_of_options = "--"`` is set, a literal ``--`` is inserted once,
+    immediately before the first argv element produced from a top-level exec
+    token that was solely a declared-arg placeholder.
 
     Args:
         manifest: The parsed manifest.
@@ -135,17 +412,33 @@ def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> list:
         A list of strings ready for subprocess execution.
 
     Raises:
-        ValidationError: If a required argument is missing or validation fails.
-        ValueError: If the manifest has no exec array.
+        ValidationError: If a required argument is missing, validation fails,
+            or a mapped argument's value has no entry in its mapping table.
+        ValueError: If the manifest uses a custom executor, has no command,
+            or references an unresolved placeholder.
     """
-    if not manifest.command.exec:
+    if manifest.command.executor:
         raise ValueError(
-            f"Manifest '{manifest.tool.name}' has no exec array."
+            f"Manifest '{manifest.tool.name}' uses a custom executor "
+            f"({manifest.command.executor}); cannot build a template command."
         )
 
-    resolved = _resolve_vars(manifest, args)
+    compile_command(manifest, warn=False)
+    if not manifest.command.exec:
+        raise ValueError(
+            f"Manifest '{manifest.tool.name}' has no exec array or command template."
+        )
 
-    argv = [_interpolate(element, resolved) for element in manifest.command.exec]
+    single, trusted = _resolve_context(manifest, args)
+    expanded = _expand_tokens(manifest.command.exec, single, trusted, set(manifest.args))
+
+    argv: List[str] = []
+    insert_end_of_options = manifest.command.end_of_options == "--"
+    for token, from_user_arg in expanded:
+        if insert_end_of_options and from_user_arg:
+            argv.append("--")
+            insert_end_of_options = False
+        argv.append(token)
 
     if not argv or not argv[0]:
         raise ValueError("exec array produced empty argv")
@@ -154,37 +447,16 @@ def build_command_argv(manifest: Manifest, args: Dict[str, str]) -> list:
 
 
 def build_command(manifest: Manifest, args: Dict[str, str]) -> str:
-    """Build the final command string from a manifest template and validated arguments.
+    """Build the command as a display string.
 
-    This resolves argument values, applies defaults, expands mappings and
-    conditionals, and performs template interpolation.
-
-    For new manifests, prefer build_command_argv with the exec array format.
-
-    Args:
-        manifest: The parsed manifest.
-        args: Mapping of argument name to raw string value.
-
-    Returns:
-        The fully interpolated command string.
+    This is ``build_command_argv`` rendered with ``shlex.join``; it exists for
+    envelopes and dry-run output. Nothing is ever executed from this string.
 
     Raises:
         ValidationError: If a required argument is missing or validation fails.
-        ValueError: If the manifest uses an executor (not a template).
+        ValueError: If the manifest uses a custom executor or has no command.
     """
-    if manifest.command.executor:
-        raise ValueError(
-            f"Manifest '{manifest.tool.name}' uses a custom executor "
-            f"({manifest.command.executor}); cannot build a template command."
-        )
-
-    resolved = _resolve_vars(manifest, args)
-
-    command = _interpolate(manifest.command.template, resolved)
-
-    # Collapse multiple spaces into one and strip.
-    command = re.sub(r"\s+", " ", command).strip()
-    return command
+    return shlex.join(build_command_argv(manifest, args))
 
 
 def _interpolate(template: str, values: Dict[str, str]) -> str:
@@ -586,13 +858,9 @@ def execute(
     tool_name = manifest.tool.name
     effective_timeout = timeout or manifest.tool.timeout_seconds
 
-    # Build command — prefer exec array over template string.
-    if manifest.command.exec:
-        args_list = build_command_argv(manifest, args)
-        command = " ".join(args_list)
-    else:
-        command = build_command(manifest, args)
-        args_list = shlex.split(command)
+    # Build argv from the compiled exec form; values are never re-split.
+    args_list = build_command_argv(manifest, args)
+    command = shlex.join(args_list)
 
     envelope: Dict[str, Any] = {
         "status": "success",

@@ -68,6 +68,9 @@ program
       console.log(`  Tool:      ${manifest.tool.name}`);
       console.log(`  Arguments: ${formatArgs(result.resolvedArgs)}`);
       console.log(`  Command:   ${result.command}`);
+      if (result.argv) {
+        console.log(`  Argv:      ${JSON.stringify(result.argv)}`);
+      }
       if (manifest.tool.cedar) {
         console.log(
           `  Cedar:     ${manifest.tool.cedar.resource} / ${manifest.tool.cedar.action}`

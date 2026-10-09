@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 )
@@ -50,13 +51,134 @@ func CheckInjection(value string) error {
 	return nil
 }
 
-// ValidateArg validates a value against an argument definition and returns the cleaned value.
+// stringDerived lists the types whose value is passed to the tool as text and
+// therefore gets the value-hygiene rules (control characters, quotes and
+// backslashes, whitespace, leading dash) before type-specific parsing.
+var stringDerived = map[string]bool{
+	"string":          true,
+	"path":            true,
+	"credential_file": true,
+	"regex_match":     true,
+	"url":             true,
+	"scope_target":    true,
+	"duration":        true,
+	"msf_options":     true,
+}
+
+// numericTypes get the leading-dash rule applied to their output value, after
+// range checks and clamping.
+var numericTypes = map[string]bool{
+	"integer": true,
+	"number":  true,
+	"port":    true,
+}
+
+// ValidateArg validates a value against an argument definition in template
+// mode (the strict default: whitespace is always rejected) and returns the
+// cleaned value.
 func ValidateArg(def *manifest.ArgDef, value string) (string, error) {
+	return ValidateArgMode(def, value, false)
+}
+
+// ValidateArgMode validates a value against an argument definition. execMode
+// must be true only when the manifest declared `exec = [...]` directly; it is
+// the sole condition under which `allow_whitespace = true` is honored, because
+// only the exec form guarantees that a value stays one argv element.
+func ValidateArgMode(def *manifest.ArgDef, value string, execMode bool) (string, error) {
 	handler, ok := typeHandlers[def.Type]
 	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("unknown type: %q", def.Type))
 	}
-	return handler(def, value)
+	// NUL is rejected for every type, enum and numerics included.
+	if strings.ContainsRune(value, 0) {
+		return "", newErr(def.Name, "must not contain NUL bytes")
+	}
+	if stringDerived[def.Type] {
+		if err := checkHygiene(def, value, execMode); err != nil {
+			return "", err
+		}
+	}
+	out, err := handler(def, value)
+	if err != nil {
+		return "", err
+	}
+	if numericTypes[def.Type] {
+		if err := checkLeadingDash(def, out); err != nil {
+			return "", err
+		}
+	}
+	return out, nil
+}
+
+// checkHygiene applies the string-derived value rules in order: control
+// characters, quotes and backslashes, whitespace, leading dash.
+func checkHygiene(def *manifest.ArgDef, value string, execMode bool) error {
+	// Control characters are rejected unconditionally: every C0 character
+	// (tab, newline and carriage return included), DEL, and the C1 range. A
+	// tool argument never needs a control byte, and CR/LF are the
+	// line-injection characters.
+	for _, r := range value {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return newErr(def.Name, "must not contain control characters")
+		}
+	}
+	if strings.ContainsAny(value, `'"\`) {
+		if def.Type == "scope_target" && strings.Contains(value, `\`) {
+			return newErr(def.Name, fmt.Sprintf("scope_target must not contain backslash escape sequences: %q", value))
+		}
+		return newErr(def.Name, "must not contain quote or backslash characters")
+	}
+	// Whitespace: msf_options uses a space as its KEY VALUE separator, and an
+	// arg may opt in with allow_whitespace when the manifest declared exec.
+	// Either way only the ASCII space U+0020 is permitted; a non-breaking or
+	// exotic space is a homoglyph, never a separator. url never permits any.
+	spaceAllowed := def.Type == "msf_options" ||
+		(def.AllowWhitespace && execMode && def.Type != "url")
+	for _, r := range value {
+		if unicode.IsSpace(r) && !(spaceAllowed && r == ' ') {
+			return newErr(def.Name, "must not contain whitespace")
+		}
+	}
+	return checkLeadingDash(def, value)
+}
+
+// checkLeadingDash rejects a value that would be read as an option by the tool.
+func checkLeadingDash(def *manifest.ArgDef, value string) error {
+	if def.AllowLeadingDash {
+		return nil
+	}
+	if strings.HasPrefix(value, "-") || strings.HasPrefix(value, "+") {
+		return newErr(def.Name, "must not start with '-' or '+' (set allow_leading_dash = true to permit)")
+	}
+	return nil
+}
+
+// AnchorPattern rewrites a manifest `pattern` so it must match the whole
+// value: one leading `^` and one trailing unescaped `$` are stripped, then
+// the pattern is wrapped as `^(?:<pat>)$`.
+func AnchorPattern(pat string) string {
+	pat = strings.TrimPrefix(pat, "^")
+	if strings.HasSuffix(pat, "$") {
+		// Count the backslashes immediately before the final `$`; an odd
+		// count means the `$` is escaped and is a literal, not an anchor.
+		n := 0
+		for i := len(pat) - 2; i >= 0 && pat[i] == '\\'; i-- {
+			n++
+		}
+		if n%2 == 0 {
+			pat = pat[:len(pat)-1]
+		}
+	}
+	return "^(?:" + pat + ")$"
+}
+
+// compilePattern compiles an anchored manifest pattern.
+func compilePattern(def *manifest.ArgDef) (*regexp.Regexp, error) {
+	re, err := regexp.Compile(AnchorPattern(def.Pattern))
+	if err != nil {
+		return nil, newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+	}
+	return re, nil
 }
 
 // typeHandler is a function that validates a value for a specific type.
@@ -102,9 +224,9 @@ func validateString(def *manifest.ArgDef, value string) (string, error) {
 		return "", newErr(def.Name, err.Error())
 	}
 	if def.Pattern != "" {
-		re, err := regexp.Compile(def.Pattern)
+		re, err := compilePattern(def)
 		if err != nil {
-			return "", newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+			return "", err
 		}
 		if !re.MatchString(value) {
 			return "", newErr(def.Name, fmt.Sprintf("value %q does not match pattern: %s", value, def.Pattern))
@@ -119,29 +241,20 @@ func validateInteger(def *manifest.ArgDef, value string) (string, error) {
 		return "", newErr(def.Name, fmt.Sprintf("expected integer, got: %q", value))
 	}
 
-	if def.Min != nil || def.Max != nil {
-		lo := num
-		hi := num
-		if def.Min != nil {
-			lo = *def.Min
+	// Only a declared bound participates in clamping or range checking.
+	if def.Clamp {
+		if def.Min != nil && num < *def.Min {
+			num = *def.Min
 		}
-		if def.Max != nil {
-			hi = *def.Max
+		if def.Max != nil && num > *def.Max {
+			num = *def.Max
 		}
-		if def.Clamp {
-			if num < lo {
-				num = lo
-			}
-			if num > hi {
-				num = hi
-			}
-		} else {
-			if def.Min != nil && num < lo {
-				return "", newErr(def.Name, fmt.Sprintf("value %d is below minimum %d", num, lo))
-			}
-			if def.Max != nil && num > hi {
-				return "", newErr(def.Name, fmt.Sprintf("value %d is above maximum %d", num, hi))
-			}
+	} else {
+		if def.Min != nil && num < *def.Min {
+			return "", newErr(def.Name, fmt.Sprintf("value %d is below minimum %d", num, *def.Min))
+		}
+		if def.Max != nil && num > *def.Max {
+			return "", newErr(def.Name, fmt.Sprintf("value %d is above maximum %d", num, *def.Max))
 		}
 	}
 	return strconv.Itoa(num), nil
@@ -438,9 +551,9 @@ func validateRegexMatch(def *manifest.ArgDef, value string) (string, error) {
 	if def.Pattern == "" {
 		return "", newErr(def.Name, "regex_match type requires a 'pattern' field")
 	}
-	re, err := regexp.Compile(def.Pattern)
+	re, err := compilePattern(def)
 	if err != nil {
-		return "", newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+		return "", err
 	}
 	if !re.MatchString(value) {
 		return "", newErr(def.Name, fmt.Sprintf("value %q does not match required pattern: %s", value, def.Pattern))
@@ -448,35 +561,44 @@ func validateRegexMatch(def *manifest.ArgDef, value string) (string, error) {
 	return value, nil
 }
 
-// ValidateArgWithCustomTypes validates using custom type definitions.
+// ValidateArgWithCustomTypes validates using custom type definitions in
+// template mode.
 func ValidateArgWithCustomTypes(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef) (string, error) {
-	if ct, ok := customTypes[def.Type]; ok {
-		handler, ok := typeHandlers[ct.Base]
-		if !ok {
-			return "", newErr(def.Name, fmt.Sprintf("custom type '%s' has invalid base type '%s'", def.Type, ct.Base))
-		}
-		// Create synthetic def with merged constraints
-		synthetic := *def
-		synthetic.Type = ct.Base
-		if len(ct.Allowed) > 0 {
-			synthetic.Allowed = ct.Allowed
-		}
-		if ct.Pattern != "" {
-			synthetic.Pattern = ct.Pattern
-		}
-		if ct.Min != nil {
-			synthetic.Min = ct.Min
-		}
-		if ct.Max != nil {
-			synthetic.Max = ct.Max
-		}
-		if ct.MinFloat != nil {
-			synthetic.MinFloat = ct.MinFloat
-		}
-		if ct.MaxFloat != nil {
-			synthetic.MaxFloat = ct.MaxFloat
-		}
-		return handler(&synthetic, value)
+	return ValidateArgWithCustomTypesMode(def, value, customTypes, false)
+}
+
+// ValidateArgWithCustomTypesMode validates using custom type definitions.
+// A custom type is resolved to a synthetic definition with its base type and
+// merged constraints, then validated exactly like a built-in type, so value
+// hygiene and pattern anchoring apply to custom types too.
+func ValidateArgWithCustomTypesMode(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, execMode bool) (string, error) {
+	ct, ok := customTypes[def.Type]
+	if !ok {
+		return ValidateArgMode(def, value, execMode)
 	}
-	return ValidateArg(def, value)
+	if _, ok := typeHandlers[ct.Base]; !ok {
+		return "", newErr(def.Name, fmt.Sprintf("custom type '%s' has invalid base type '%s'", def.Type, ct.Base))
+	}
+	// Create synthetic def with merged constraints
+	synthetic := *def
+	synthetic.Type = ct.Base
+	if len(ct.Allowed) > 0 {
+		synthetic.Allowed = ct.Allowed
+	}
+	if ct.Pattern != "" {
+		synthetic.Pattern = ct.Pattern
+	}
+	if ct.Min != nil {
+		synthetic.Min = ct.Min
+	}
+	if ct.Max != nil {
+		synthetic.Max = ct.Max
+	}
+	if ct.MinFloat != nil {
+		synthetic.MinFloat = ct.MinFloat
+	}
+	if ct.MaxFloat != nil {
+		synthetic.MaxFloat = ct.MaxFloat
+	}
+	return ValidateArgMode(&synthetic, value, execMode)
 }

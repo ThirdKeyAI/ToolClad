@@ -19,21 +19,145 @@ export function checkInjection(value) {
 }
 
 /**
+ * Types whose validated value is passed to the tool as free-form text.
+ * They receive the full value-hygiene pass (NUL, control characters,
+ * quotes/backslash, whitespace, leading dash) before type-specific parsing.
+ */
+const STRING_DERIVED_TYPES = new Set([
+  "string",
+  "path",
+  "credential_file",
+  "regex_match",
+  "url",
+  "scope_target",
+  "duration",
+  "msf_options",
+]);
+
+/** Numeric types: the leading-dash rule is applied to the parsed output. */
+const NUMERIC_TYPES = new Set(["integer", "number", "port"]);
+
+const LEADING_DASH_MESSAGE =
+  "must not start with '-' or '+' (set allow_leading_dash = true to permit)";
+
+/**
+ * Anchor a manifest `pattern` so it must match the whole value: strip one
+ * leading `^` and one trailing unescaped `$`, then wrap in `^(?:...)$`.
+ * @param {string} pattern
+ * @returns {string} Anchored pattern source
+ */
+export function anchorPattern(pattern) {
+  let p = String(pattern);
+  if (p.startsWith("^")) p = p.slice(1);
+  if (endsWithUnescapedDollar(p)) p = p.slice(0, -1);
+  return `^(?:${p})$`;
+}
+
+function endsWithUnescapedDollar(p) {
+  if (!p.endsWith("$")) return false;
+  let backslashes = 0;
+  for (let i = p.length - 2; i >= 0 && p[i] === "\\"; i--) backslashes++;
+  return backslashes % 2 === 0;
+}
+
+function compilePattern(pattern) {
+  return new RegExp(anchorPattern(pattern));
+}
+
+function startsWithDash(str) {
+  return str.startsWith("-") || str.startsWith("+");
+}
+
+/**
+ * Value hygiene for string-derived types. Rules run in a fixed order; the NUL
+ * rule is applied to every type by the caller before this runs.
+ */
+function checkValueHygiene(str, argDef, type, execMode) {
+  // Rule 2: every C0 control (tab, newline, CR included), DEL, and the C1
+  // range. Unconditional: allow_whitespace never relaxes it.
+  for (const ch of str) {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) {
+      throw new Error("must not contain control characters");
+    }
+  }
+  // Rule 3: quotes and backslash. scope_target keeps its specific message.
+  if (type === "scope_target" && str.includes("\\")) {
+    throw new Error(
+      `scope_target must not contain backslash escape sequences: ${str}`
+    );
+  }
+  if (/['"\\]/.test(str)) {
+    throw new Error("must not contain quote or backslash characters");
+  }
+  // Rule 4: whitespace. Only the ASCII space U+0020 can ever be permitted:
+  // msf_options needs it as its KEY VALUE separator, and other types may opt
+  // in with allow_whitespace, honored only when the manifest declared exec
+  // directly (never for url). Every other whitespace character (U+00A0,
+  // U+2000-200A, U+2028, U+2029, U+3000, ...) is a homoglyph, not a separator.
+  if (/\s/.test(str)) {
+    const spaceOk =
+      type === "msf_options" ||
+      (type !== "url" && argDef.allow_whitespace === true && execMode === true);
+    if (!spaceOk || /[^\S ]/.test(str)) {
+      throw new Error("must not contain whitespace");
+    }
+  }
+  // Rule 5: leading dash.
+  if (startsWithDash(str) && argDef.allow_leading_dash !== true) {
+    throw new Error(LEADING_DASH_MESSAGE);
+  }
+}
+
+function runValidation(handler, type, argDef, value, execMode) {
+  const str = String(value);
+  // Rule 1: NUL is rejected for every type, enum and numerics included.
+  if (str.includes("\0")) {
+    throw new Error("must not contain NUL bytes");
+  }
+  if (STRING_DERIVED_TYPES.has(type)) {
+    checkValueHygiene(str, argDef, type, execMode);
+  }
+  const out = handler(argDef, value);
+  if (NUMERIC_TYPES.has(type)) {
+    // The leading-dash rule applies to the output after clamping/range checks,
+    // so a clamped negative that lands on a non-negative bound passes.
+    if (startsWithDash(String(out)) && argDef.allow_leading_dash !== true) {
+      throw new Error(LEADING_DASH_MESSAGE);
+    }
+  }
+  return out;
+}
+
+/**
  * Validate an argument value against its declared type definition.
  * Returns the cleaned/coerced value on success, throws on failure.
  *
  * @param {object} argDef - Argument definition from the manifest
  * @param {*} value - The raw value to validate
+ * @param {boolean} [execMode=false] - true only when the manifest declared
+ *   command.exec directly; enables allow_whitespace. A template compiled to
+ *   exec is still template mode (strict).
  * @returns {*} The validated and possibly coerced value
  */
-export function validateArg(argDef, value) {
+export function validateArgMode(argDef, value, execMode = false) {
   const type = argDef.type;
 
   const handler = TYPE_HANDLERS[type];
   if (!handler) {
     throw new Error(`Unknown argument type: ${type}`);
   }
-  return handler(argDef, value);
+  return runValidation(handler, type, argDef, value, execMode);
+}
+
+/**
+ * Strict (template-mode) validation: whitespace is always rejected.
+ * @param {object} argDef - Argument definition from the manifest
+ * @param {*} value - The raw value to validate
+ * @returns {*} The validated and possibly coerced value
+ */
+export function validateArg(argDef, value) {
+  return validateArgMode(argDef, value, false);
 }
 
 const TYPE_HANDLERS = {
@@ -61,7 +185,7 @@ function validateString(argDef, value) {
   }
   checkInjection(str);
   if (argDef.pattern) {
-    const re = new RegExp(argDef.pattern);
+    const re = compilePattern(argDef.pattern);
     if (!re.test(str)) {
       throw new Error(
         `Value "${str}" does not match pattern: ${argDef.pattern}`
@@ -358,7 +482,7 @@ function validateRegexMatch(argDef, value) {
   if (!argDef.pattern) {
     throw new Error("regex_match type requires a 'pattern' field");
   }
-  const re = new RegExp(argDef.pattern);
+  const re = compilePattern(argDef.pattern);
   if (!re.test(str)) {
     throw new Error(
       `Value '${str}' does not match required pattern: ${argDef.pattern}`
@@ -372,10 +496,16 @@ function validateRegexMatch(argDef, value) {
  * @param {object} argDef - Argument definition
  * @param {*} value - Value to validate
  * @param {object} customTypes - Map of custom type name to definition
+ * @param {boolean} [execMode=false] - See validateArgMode
  * @returns {*} Validated value
  */
-export function validateArgWithCustomTypes(argDef, value, customTypes) {
-  if (customTypes && customTypes[argDef.type]) {
+export function validateArgWithCustomTypesMode(
+  argDef,
+  value,
+  customTypes,
+  execMode = false
+) {
+  if (customTypes && Object.hasOwn(customTypes, argDef.type)) {
     const custom = customTypes[argDef.type];
     const handler = TYPE_HANDLERS[custom.base];
     if (!handler) {
@@ -394,7 +524,18 @@ export function validateArgWithCustomTypes(argDef, value, customTypes) {
       min_float: custom.min_float ?? argDef.min_float,
       max_float: custom.max_float ?? argDef.max_float,
     };
-    return handler(synthetic, value);
+    return runValidation(handler, custom.base, synthetic, value, execMode);
   }
-  return validateArg(argDef, value);
+  return validateArgMode(argDef, value, execMode);
+}
+
+/**
+ * Strict (template-mode) custom-type validation.
+ * @param {object} argDef - Argument definition
+ * @param {*} value - Value to validate
+ * @param {object} customTypes - Map of custom type name to definition
+ * @returns {*} Validated value
+ */
+export function validateArgWithCustomTypes(argDef, value, customTypes) {
+  return validateArgWithCustomTypesMode(argDef, value, customTypes, false);
 }
