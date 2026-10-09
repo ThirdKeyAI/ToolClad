@@ -2,6 +2,8 @@ module github.com/thirdkeyai/toolclad
 
 go 1.21
 
+toolchain go1.26.9
+
 require (
 	github.com/BurntSushi/toml v1.4.0
 	github.com/spf13/cobra v1.8.1
