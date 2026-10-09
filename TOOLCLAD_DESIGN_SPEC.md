@@ -27,7 +27,7 @@ A ToolClad manifest answers four questions:
 1. **What can this tool accept?** Typed parameters with validation constraints (enums, ranges, regex, scope checks, injection sanitization).
 2. **How do you invoke it?** A command template, HTTP request, MCP server call, PTY session, or browser engine action. The LLM never generates raw invocation details.
 3. **What does it produce?** Output format declaration, parsing rules, and a mandatory output schema that normalize raw tool output into structured JSON. The LLM knows the shape of results before proposing a call.
-4. **What is the interaction model?** Three execution modes with five backends share a common governance layer:
+4. **What is the interaction model?** Three execution modes with five backends share a common governance layer. (The reference runtimes in this repository execute the shell and HTTP backends; MCP proxy, session and browser manifests are parsed and validated but not executed — see [Session and Browser Security Requirements](#session-and-browser-security-requirements-normative).)
    - **Oneshot** (default): Execute and return. Three backends: shell command (`[command]`), HTTP request (`[http]`), or MCP server proxy (`[mcp]`).
    - **Session**: Maintain a running CLI process (PTY) where each interaction is independently validated and policy-gated.
    - **Browser**: Maintain a governed headless browser session where navigation, clicks, form submission, and JS execution are typed, scoped, and policy-gated.
@@ -57,7 +57,13 @@ LLM fills typed parameters -> Cedar Gate evaluates policy ->
   structured JSON back to agent
 ```
 
-The agent never sees or generates a command string. It fills in typed fields. The manifest constrains the parameter space to only valid values. This is an allow-list. The dangerous action cannot be expressed because the interface does not permit it.
+The agent never generates a command string. It fills in typed fields. The manifest constrains the parameter space to only valid values. This is an allow-list. The dangerous action cannot be expressed because the interface does not permit it.
+
+The agent does not see one either: the evidence envelope's `command` field
+reports the *declared* command — the `exec` array or template with placeholders
+intact — not the expanded argv. Executor-injected paths and expanded secrets
+therefore never reach the agent. The fully resolved argv is shown only by the
+human-facing dry run (`toolclad test`).
 
 The manifest enables three properties that unstructured shell execution cannot:
 
@@ -83,11 +89,84 @@ ToolClad browser mode:   LLM selects browser command -> Gate validates URL scope
                            -> BrowserExecutor sends CDP command -> page state captured
 ```
 
-Browser agents today (Claude in Chrome, OpenAI Operator, Playwright-based agents) rely on the LLM's instruction-following to stay on allowed domains, avoid submitting sensitive forms, and not execute arbitrary JavaScript. That is prompt-based security. ToolClad browser mode makes it structural: navigation URLs are scope-checked against an allow-list of domains, form submission requires human approval, and JS execution is a separately gated high-risk command. The governance layer is identical to session mode; only the transport differs.
+Browser agents today rely on the model's instruction-following to stay on allowed domains, avoid submitting sensitive forms, and not execute arbitrary JavaScript. That is prompt-based security. ToolClad browser mode makes it structural: navigation URLs are scope-checked against an allow-list of domains, form submission requires human approval, and JS execution is a separately gated high-risk command. The governance layer is identical to session mode; only the transport differs.
+
+### The Gate Is a Seam, Not a Comment
+
+`risk_tier`, `human_approval` and `[tool.cedar]` describe a policy decision.
+A library that validates and runs in a single call gives an embedding runtime
+nowhere to make that decision, so the metadata is documentation and the
+behavior is fail-open. `toolclad run` on a manifest declaring
+`human_approval = true` must not execute it.
+
+Execution therefore takes a caller-supplied gate:
+
+```
+GateDecision = Allow | Deny(reason)
+Gate         = fn(manifest, validated_args) -> GateDecision
+```
+
+The **default** gate denies when `human_approval = true` or `risk_tier` is
+`high` or `critical`, and allows otherwise. A caller that has made the decision
+elsewhere passes its own gate; the CLIs expose this as `--approve`. A denied
+call returns a structured error and spawns nothing.
+
+Cedar evaluation itself is **external** to ToolClad. There is no Cedar engine
+in this project: `[tool.cedar]` declares the resource and action for the
+embedding runtime's evaluator. A deployment that relies on Cedar must wire that
+evaluator into the gate; ToolClad guarantees only that nothing runs until some
+gate says yes.
+
+### Process Environment
+
+The executed tool is not trusted. It receives:
+
+- a **cleared environment** rebuilt from an allow-list (a fixed `PATH`, plus
+  `HOME`, `LANG`, `LC_ALL`, `TZ`, `TERM` when present). Inheriting the
+  runtime's environment hands every tool the runtime's secrets along with
+  `LD_PRELOAD`, `HTTP_PROXY` and `SSLKEYLOGFILE`;
+- **no secrets**. `TOOLCLAD_SECRET_*` is never passed to a child. Secrets are
+  resolved by the runtime at call time, from its own environment or from
+  `TOOLCLAD_SECRETS_FILE` (preferred: a file the child cannot read, with group
+  and other permissions refused);
+- `argv[0]` resolved to an **absolute path** against the fixed `PATH`, with its
+  basename required to equal `tool.binary`'s, so `PATH` cannot redirect the
+  tool;
+- stdin from `/dev/null`, a per-invocation scratch directory mode 0700 as its
+  cwd, and a restrictive umask;
+- resource limits (`RLIMIT_CORE`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, plus
+  `RLIMIT_NPROC`/`RLIMIT_AS`/`RLIMIT_CPU` when declared in `[tool.limits]` —
+  `RLIMIT_NPROC` is per-user on Linux, so it has no safe fixed default) where the language can set them in the pre-exec hook. Go and
+  Node cannot do this portably and skip it — a documented gap, not a silent
+  one.
+
+An interpreter as `argv[0]` (`sh`, `bash`, `python`, `node`, `env`, `xargs`, …)
+defeats the whole model, since the argument becomes code. It is refused at load
+unless the manifest sets `[tool] allow_interpreter = true`.
+
+Evidence lives under a directory created once with mode 0700; identifiers carry
+128 bits of entropy and output files are opened `O_NOFOLLOW | O_EXCL | O_CREAT`
+mode 0600, so a pre-planted symlink in a shared temp directory cannot redirect
+a write.
 
 ---
 
 ## Manifest Format
+
+### Unknown Keys Are Refused
+
+A manifest is a security contract, so an unrecognized key is a load error, not
+a comment. `tiemout_seconds = 5` silently became the 60-second default;
+`block_internal = true` was silently discarded by three of the four runtimes,
+which is how the shipped examples came to look hardened while running without
+the control they declared. Any control that a given runtime does not support
+must make the manifest **fail to load** rather than degrade to "off".
+
+Implementations MUST reject unknown keys in every section
+(`#[serde(deny_unknown_fields)]`, `toml.MetaData.Undecoded()`, or an explicit
+per-section allow-list). The only escape hatch is
+`toolclad validate --allow-unknown-keys`, which downgrades the error to a
+warning for authoring; library loading is always strict.
 
 ### Minimal Example
 
@@ -112,7 +191,7 @@ type = "scope_target"
 description = "Domain name or IP address to query"
 
 [command]
-template = "whois {target}"
+exec = ["whois", "{target}"]
 
 [output]
 format = "text"
@@ -153,6 +232,8 @@ hash = "sha256"
 position = 1
 required = true
 type = "scope_target"
+# nmap dials this target, so the egress policy is mandatory: see Egress Safety.
+block_internal = true
 description = "Target CIDR, IP, or hostname"
 
 [args.scan_type]
@@ -162,18 +243,24 @@ type = "enum"
 allowed = ["ping", "service", "version", "syn", "os_detect", "aggressive", "vuln_script"]
 description = "Type of scan to perform"
 
-[args.extra_flags]
-position = 3
-required = false
-type = "string"
-sanitize = ["injection"]
-default = ""
-description = "Additional nmap flags (must pass Gate approval)"
+# There is deliberately no free-form flag parameter. A `string` argument
+# interpolated as tool options is an option-injection channel: nmap's `-iL`
+# reads arbitrary files and `--script=<path>` executes attacker-supplied Lua in
+# a process that usually holds CAP_NET_RAW. Every supported invocation is an
+# entry in [command.mappings.scan_type] instead.
 
 # --- Command Construction ---
 
 [command]
-template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} --no-stylesheet -v {extra_flags} {target}"
+exec = [
+    "nmap",
+    "{_scan_type_flags}",
+    "--max-rate", "{max_rate}",
+    "-oX", "{_output_file}",
+    "--no-stylesheet",
+    "-v",
+    "{target}",
+]
 
 [command.defaults]
 max_rate = 1000
@@ -192,8 +279,8 @@ vuln_script = "-sV --script=vuln --script-timeout 60s"
 [output]
 format = "xml"
 parser = "builtin:xml"
-# OR: parser = "scripts/parse-outputs/parse-nmap-xml.py"
 envelope = true
+max_bytes = 8388608
 
 [output.schema]
 type = "object"
@@ -363,7 +450,7 @@ description = "Raw module execution output"
 
 ## Type System
 
-Built-in validation types cover the patterns repeated across all existing wrapper scripts. Every type includes injection sanitization (shell metacharacter rejection) by default. Types are designed so that "valid according to the type" means "safe to interpolate into a shell command."
+Built-in validation types cover the patterns repeated across all existing wrapper scripts. Types are designed so that "valid according to the type" means "safe as exactly one argv entry" — see [Argument Hygiene](#argument-hygiene-normative) for the rules every string-derived type enforces, which are stricter and sink-aware rather than a shell-metacharacter blocklist.
 
 ### Core Types
 
@@ -376,7 +463,7 @@ Built-in validation types cover the patterns repeated across all existing wrappe
 | `boolean` | Exactly `"true"` or `"false"` | Feature flags |
 | `enum` | Value in declared `allowed` list | Scan types, protocols, severity levels |
 | `scope_target` | Injection-safe + ASCII-only + reject IDN/punycode + block wildcards/traversal | IPs, CIDRs, ASCII hostnames |
-| `url` | Valid URL structure, host extracted for scope validation | Web application targets |
+| `url` | Scheme allow-list (`http`/`https` by default), dangerous schemes refused, no userinfo or whitespace, host put through the egress policy | Web application targets |
 | `path` | No traversal (`../`), optionally must exist | Wordlists, config files, output dirs |
 | `ip_address` | Valid IPv4 or IPv6 | Listener addresses, bind addresses |
 | `cidr` | Valid CIDR notation | Network ranges |
@@ -385,10 +472,37 @@ Built-in validation types cover the patterns repeated across all existing wrappe
 
 | Type | Validates | Use Case |
 |------|-----------|----------|
-| `msf_options` | Semicolon-delimited `set KEY VALUE` pairs, no shell metacharacters | Metasploit extra options |
+| `msf_options` | Semicolon-delimited `set KEY VALUE` pairs; space is the pair separator, but quotes, control characters and a leading dash are refused | Metasploit extra options |
 | `credential_file` | Path type + must exist + read-only check | Username/password lists |
 | `duration` | Integer with suffix (s/m/h) or bare seconds | Timeout overrides |
 | `regex_match` | Matches a declared `pattern` (PCRE) | Module paths, format strings |
+
+#### `url` validation (normative)
+
+One validator, identical in every runtime. In order:
+
+1. The [Argument Hygiene](#argument-hygiene-normative) rules. Whitespace is
+   never permitted in a `url`, even with `allow_whitespace`. The
+   metacharacter blocklist refuses `{` and `}`, so a value can never carry a
+   `{_secret:…}` reference.
+2. The value must contain `://`.
+3. The scheme must be in `schemes` when that list is present, otherwise in the
+   default `["http", "https"]`. Comparison is case-insensitive.
+4. `javascript`, `data`, `file`, `blob`, `about`, `gopher`, `dict`, `ftp`,
+   `ldap`, `jar`, `netdoc`, `mailto`, `ws` and `wss` are refused with a
+   dedicated message **even if a manifest lists them in `schemes`**. A
+   `gopher://127.0.0.1:6379/_FLUSHALL` is a Redis command, not a fetch.
+5. Userinfo is refused: an `@` in the authority hides the real host from a
+   human reviewer.
+6. The host is everything between `://` and the first `/`, `?`, or `#`. An
+   empty host is refused; a bracketed IPv6 literal is unwrapped; a trailing
+   `:port` must be 1–65535.
+7. The host goes through the [Egress Safety](#egress-safety) policy.
+8. `scope_check` applies if set.
+
+A manifest that omits `schemes` is therefore http/https only. Earlier releases
+let Go and Python accept any scheme in that case, and let Rust ignore `schemes`
+entirely.
 
 #### `scope_target` ASCII / IDN policy (since v0.6.0)
 
@@ -409,6 +523,104 @@ All four reference impls (Rust, Python, JS, Go) enforce two additional invariant
 Empty values are also refused with `scope_target must not be empty`. Implementations must apply these checks **before** the regex catch-all so the refusal message names the specific failure shape — collapsing them into "Invalid scope target" hides which fence fired and breaks forensic triage.
 
 CLIs must not silently strip whitespace from values before passing them to validators. The Python `toolclad` CLI previously did `value.strip()` in argument parsing, which masked the whitespace policy from cross-impl test harnesses; this was corrected in the same release that introduced the explicit whitespace check.
+
+### Argument Hygiene (normative)
+
+"Valid according to the type" must mean "safe as exactly one argv entry". The
+original shell-metacharacter blocklist (`;|&$\`(){}[]<>!\n\r`) does not deliver
+that: it is aimed at a shell that is not in the execution path and is blind to
+the sink that is — an option parser. A value of `-iL /etc/passwd` contains no
+metacharacter at all.
+
+Every **string-derived** type (`string`, `path`, `credential_file`,
+`regex_match`, `url`, `scope_target`, `duration`, `msf_options`) therefore
+rejects, in this order and before any type-specific parsing:
+
+| Rule | Rejected | Opt-out |
+|---|---|---|
+| NUL | `\0` anywhere — for *every* type, including `enum` and the numerics | none |
+| Control characters | U+0000–U+001F, U+007F | none |
+| Quotes and backslash | `'`, `"`, `\` | none |
+| Whitespace | any Unicode whitespace | `allow_whitespace = true`, honored **only** in `exec` mode |
+| Leading dash | a value starting with `-` or `+` | `allow_leading_dash = true` |
+
+The shell-metacharacter blocklist is retained on top of these as defense in
+depth, not as the primary control.
+
+```toml
+[args.headers]
+type = "string"
+# A header line is "Key: Value", so a space belongs to the value. In the array
+# form the value stays one argv entry, so whitespace cannot add arguments.
+allow_whitespace = true
+
+[args.verbosity_flag]
+type = "string"
+allow_leading_dash = true   # this argument really is meant to be an option
+```
+
+`allow_whitespace` is deliberately inert for the deprecated `template` form:
+a space in a value is only provably harmless once the argv boundaries were
+fixed before the value existed.
+
+For the numeric types the leading-dash rule applies to the **result**, after
+range checking and clamping, so `clamp` with a non-negative `min` keeps working
+while a bare `-1` is refused.
+
+`pattern` is **anchored**: the implementation compiles `^(?:<pat>)$` (`\Z` in
+Python, so a trailing newline cannot match). An author who writes `[a-z]+`
+gets a whole-value match, not a substring search.
+
+### Egress Safety
+
+A tool that dials a network destination derived from its arguments is an SSRF
+surface, and the single most valuable target behind it is the cloud metadata
+endpoint. Two controls apply.
+
+**Per-argument policy.** `block_internal = true` on a `scope_target`, `url`,
+`ip_address`, or `cidr` argument refuses targets that are not provably public:
+
+- *Always blocked, with or without the flag*: IPv4 link-local `169.254.0.0/16`
+  (which contains `169.254.169.254`), IPv6 link-local `fe80::/10`, and their
+  IPv4-mapped IPv6 forms.
+- *Blocked under the flag*: loopback, RFC 1918 private space, CGNAT
+  `100.64.0.0/10`, the unspecified and broadcast addresses, the documentation
+  and benchmarking ranges, reserved `240.0.0.0/4`, IPv6 `::1`, `::`,
+  `fc00::/7`, `2001:db8::/32`, and their IPv4-mapped forms.
+
+A string check over literals is not sufficient, because the agent chooses the
+spelling. Implementations MUST also:
+
+- refuse non-canonical literal encodings (`2130706433`, `0x7f000001`,
+  `0177.0.0.1`, `127.1`) rather than passing them through as "hostnames" for a
+  resolver to expand;
+- refuse the internal-name set unconditionally: `localhost` and any
+  `.localhost`, `.local`, `.internal`, `.home.arpa`, `.lan`, `.intranet`,
+  `.corp`, `.private` suffix, and `metadata.google.internal`;
+- detect an **IP literal embedded in a hostname** — the wildcard-DNS forms
+  `127.0.0.1.nip.io` and `10-0-0-1.nip.io` resolve to the embedded address, so
+  the range policy applies to it;
+- test a CIDR argument for **overlap** with each blocked range, not just its
+  base address. `8.0.0.0/5` has a public base and contains all of `10.0.0.0/8`;
+- **resolve a hostname** under `block_internal` and apply the range policy to
+  every A/AAAA answer, then pin the resolved address into the invocation
+  (`curl --resolve host:443:ip`) or refuse. Resolution failure is a refusal:
+  a name that cannot be resolved cannot be shown to be public. Where a runtime
+  has no synchronous resolver (the JavaScript validator), it refuses a hostname
+  under `block_internal` outright and offers an async validator for the
+  resolving path.
+
+**Manifest-level lint.** `[tool] network_egress = true`, or a command whose
+`argv[0]` is a known egress binary (`curl`, `wget`, `nmap`, `nc`, `masscan`,
+`ssh`, `nikto`, …), makes `block_internal` **mandatory** on every
+`scope_target`, `url`, `ip_address`, and `cidr` argument. A manifest that omits
+it is refused at load, so "the control was never switched on" is not a
+reachable state. `[http]` and `[browser]` manifests are treated as
+`network_egress = true`.
+
+A custom type cannot carry `block_internal` or `scope_check`. An argument that
+names a network target must therefore use a built-in type; a manifest that
+dispatches an egress binary with a custom-typed target is refused.
 
 ### Type Composition
 
@@ -483,33 +695,93 @@ The command construction layer is the core mechanism that prevents LLMs from gen
 
 ### Invocation Forms
 
-ToolClad supports two invocation forms for command construction:
+The argv array is the only invocation form that reaches a process. `exec` declares
+it directly; `template` is deprecated sugar that is compiled into it at load.
 
-**Array form (preferred):** Each argument is a separate argv entry, passed directly to `execve`/`os/exec`/`subprocess` without shell interpretation. Values containing spaces, quotes, or special characters are safe because they are never re-split.
+**Array form (canonical):** Each element is one argv entry, passed directly to
+`execve`/`os/exec`/`subprocess` without shell interpretation.
 
 ```toml
 [command]
 exec = ["curl", "-H", "Authorization: {token}", "{target}"]
 ```
 
-**String template form (legacy):** A single string that is split into argv via `shlex` (Rust/Python) or a quote-aware splitter (Go/JS) before execution. This works for simple cases but breaks when validated parameter values contain spaces (e.g., commit messages, custom HTTP headers).
+**String template form (deprecated):** A single string that is **tokenized at
+manifest load**, before any value exists, and stored as the array above.
+Implementations MUST emit a load-time deprecation warning; the form will be
+removed in the next minor release.
 
 ```toml
 [command]
 template = "whois {target}"
 ```
 
-When both `exec` and `template` are present, `exec` takes precedence. New manifests SHOULD use `exec`. Executors MUST NOT route either form through a shell (`sh -c`, `bash -c`, `cmd /c`).
+When both `exec` and `template` are present, `exec` takes precedence. Executors
+MUST NOT route either form through a shell (`sh -c`, `bash -c`, `cmd /c`).
+
+#### Tokenization order (normative)
+
+Splitting a command string *after* substituting values makes the splitter a
+shell in all but name: any value containing an unquoted space or a quote that
+closes a template-level quote becomes additional argv entries chosen by the
+agent. Character blocklists cannot fix this, because the real sink is an option
+parser, not a shell. Implementations MUST therefore:
+
+1. **Tokenize first, on the trusted template only.** The tokenizer honors `'`,
+   `"` and backslash, and runs at manifest load.
+2. **Refuse a placeholder inside quotes.** A template such as
+   `curl -H '{headers}'` is rejected at load: a placeholder MUST be a whole,
+   unquoted token. (`{{` and `}}` are escapes for literal braces and are not
+   placeholders, so a `curl -w '%{{http_code}}'` format string is legal.)
+3. **Substitute per token.** A placeholder resolves to exactly one argv entry.
+4. **Never re-split after substitution.** No implementation may call `shlex` or
+   an equivalent splitter on a string that contains a substituted value.
+
+A token that is exactly one placeholder and resolves to the empty string is
+dropped, so unset optional arguments leave no empty argv entry. An unresolved
+placeholder is an error, never a literal argv entry.
+
+Two placeholder classes exist, and they differ precisely because of where the
+text comes from:
+
+- **Manifest-controlled, multi-token:** `{_<arg>_flags}` from
+  `[command.mappings]` and `{_<cond>}` from `[command.conditionals]`. The text
+  is written by the manifest author, so it is tokenized and may expand to zero
+  or more argv entries.
+- **Agent-controlled, single-token:** every `[args.*]` value. It is substituted
+  into one token and can never become two.
+
+#### End of options
+
+```toml
+[command]
+exec = ["grep", "{pattern}", "data.txt"]
+end_of_options = "--"
+```
+
+`end_of_options` accepts only the literal `"--"`. When set, the executor
+inserts one `--` argv entry immediately before the first entry produced from a
+token consisting solely of an agent-controlled placeholder. Use it for any tool
+whose option parser honors `--`; it is the structural defense against option
+injection, with the per-argument leading-dash rule as the type-level one.
 
 ### Template Variables
 
-| Variable | Source |
-|----------|--------|
-| `{arg_name}` | Validated parameter value |
-| `{_scan_flags}` | Resolved from `[command.mappings]` |
-| `{_output_file}` | Auto-generated evidence output path |
-| `{_scan_id}` | Auto-generated scan/invocation ID |
-| `{_evidence_dir}` | Evidence directory from runtime config |
+| Variable | Source | Tokens |
+|----------|--------|--------|
+| `{arg_name}` | Validated parameter value | exactly one |
+| `{_<arg_name>_flags}` | Resolved from `[command.mappings.<arg_name>]` | zero or more |
+| `{_<cond_name>}` | Resolved from `[command.conditionals.<cond_name>]` | zero or more |
+| `{_output_file}` | Auto-generated evidence output path | exactly one |
+| `{_scan_id}` | Auto-generated scan/invocation ID | exactly one |
+| `{_evidence_dir}` | Evidence directory from runtime config | exactly one |
+| `{{` / `}}` | Literal `{` / `}` | — |
+
+Variables prefixed with `_` are injected by the executor, not provided by the
+agent. The mapping variable name is `_{arg_name}_flags`; no other spelling is
+recognized. Every placeholder is checked at load against the declared
+arguments, defaults, mappings, conditionals and executor variables, so a typo
+is a load error rather than a literal token in argv.
 
 Variables prefixed with `_` are injected by the executor, not provided by the agent.
 
@@ -524,7 +796,9 @@ service = "-sT -sV --version-intensity 5"
 syn = "-sS --top-ports 1000"
 ```
 
-The template references the mapped value as `{_scan_flags}` (derived from `scan_type`). The naming convention: `_{arg_name}_flags` or a custom name declared in the mapping.
+The command references the mapped value as `{_scan_type_flags}`, derived from the
+argument name. `_{arg_name}_flags` is the only recognized spelling — there is no
+custom-name mechanism, and no implementation may register aliases.
 
 ### Conditional Sections
 
@@ -574,12 +848,36 @@ Tools like Metasploit, complex Python scanners, and shell wrappers frequently sp
 
 | Platform | Create Group | Kill Group |
 |----------|-------------|------------|
-| Rust | `cmd.process_group(0)` | `libc::killpg(pid, SIGKILL)` |
-| Go | `SysProcAttr{Setpgid: true}` | `syscall.Kill(-pid, SIGKILL)` |
-| Python | `preexec_fn=os.setpgrp` | `os.killpg(os.getpgid(pid), SIGKILL)` |
-| Node.js | `detached: true` | `process.kill(-pid, 'SIGKILL')` |
+| Rust | `cmd.process_group(0)` | `libc::killpg(pid, SIGTERM)` then `SIGKILL` |
+| Go | `SysProcAttr{Setpgid: true}` | `cmd.Cancel` → `syscall.Kill(-pid, SIGTERM)`, `cmd.WaitDelay` → `SIGKILL` |
+| Python | `preexec_fn=os.setpgrp` | `os.killpg(os.getpgid(pid), SIGTERM)` then `SIGKILL` |
+| Node.js | `detached: true` | `process.kill(-pid, 'SIGTERM')` then `'SIGKILL'` |
 
-This prevents zombie process accumulation in long-running agent containers. All four reference implementations enforce process group kill.
+The kill sequence is `SIGTERM` to the group, a grace period, then `SIGKILL` to
+the group. The grace period is `TOOLCLAD_KILL_GRACE_MS`, default 2000 ms. An
+immediate `SIGKILL` denies the tool any chance to flush partial evidence or
+remove its own temporary files, so it is the second step, never the first.
+
+Two further requirements, each closing a way for a tool to outlive its
+deadline:
+
+- **`timeout_seconds = 0` is refused at manifest load.** It must not mean "no
+  timeout". The default remains 60.
+- **The deadline cannot depend on the output pipe closing.** A tool that leaves
+  a background child holding stdout keeps the pipe open past the deadline; an
+  implementation that waits on the pipe (Go's `cmd.Run()` without `WaitDelay`,
+  Node's `spawnSync`) never reaches its own kill path. Implementations MUST
+  bound the wait independently of the pipe: `cmd.WaitDelay` in Go, an async
+  `spawn` with a timer in Node, a polled `try_wait`/`communicate` deadline in
+  Rust and Python.
+
+A child that calls `setsid()` escapes the process group in every language.
+Process groups are a cleanup mechanism, not a containment boundary; a runtime
+that needs escape-proof cleanup must place the tool in its own cgroup (or an
+equivalent job object) and kill that instead.
+
+Partial output captured before the kill is returned in the envelope with
+`"status": "timeout"`, not discarded.
 
 ---
 
@@ -797,7 +1095,34 @@ Unmapped fields pass through with the same name. This decouples the ToolClad con
 parser = "scripts/parse-outputs/parse-nmap-xml.py"
 ```
 
-Custom parsers receive the raw output file path as argv[1] and must emit JSON to stdout. The parser's output is validated against the declared `[output.schema]` before it reaches the agent.
+A custom parser receives the raw output file path as argv[1] and must emit JSON
+to stdout. Its output is validated against the declared `[output.schema]` before
+it reaches the agent, and it runs under the same environment, cwd, timeout and
+process-group rules as a tool.
+
+**The reference runtimes do not implement this.** Rather than accept a
+`parser` value and silently ignore it — which produced unvalidated raw output
+under a manifest that looked like it was parsing and checking — a `parser` that
+is not one of the `builtin:*` names is **refused at manifest load**. A runtime
+that wants custom parsers must execute them under the rules above; until then,
+declaring one is a load error, not a no-op.
+
+### Output Size Limits
+
+```toml
+[output]
+max_bytes = 8388608    # default: 8 MiB
+```
+
+stdout and stderr are each capped at `max_bytes`. Capture stops at the cap, the
+envelope carries `"output_truncated": true`, and the status is otherwise
+unchanged. Without a cap, a tool pointed at a multi-gigabyte response or a host
+that streams unbounded banners exhausts the runtime's memory, which is a denial
+of service reachable from an agent-chosen argument.
+
+XML input containing `<!DOCTYPE` or `<!ENTITY` is refused before parsing. Entity
+expansion on attacker-influenced output is a memory-exhaustion primitive in
+every stock XML parser that resolves internal entities.
 
 ### Output Schema
 
@@ -805,6 +1130,15 @@ Every `dispatch = "exec"` manifest must declare the expected shape of its parsed
 
 1. **MCP `outputSchema` generation**: The LLM sees what data shape it will receive *before* proposing a tool call. This enables more effective reasoning about whether and how to use a tool.
 2. **Parser output validation**: The executor validates parsed results against the schema. Malformed parser output is rejected before it reaches the agent, preventing corrupted state in the ORGA loop.
+
+Validation is **fail-closed**. A schema violation replaces `results` with a
+structured `{"schema_error": "<path>: <message>"}` (the raw output is preserved
+under `results.raw_output`) and sets the envelope status to `"schema_error"`. It
+is never skipped: an implementation that cannot validate must fail, not pass
+the output through. Each runtime bundles a JSON-Schema subset validator — no
+optional dependency — supporting `type`, `properties`, `required`, `items`,
+`additionalProperties` (boolean), `enum`, `minimum`, `maximum`, `minLength`,
+`maxLength` and `pattern`; unknown keywords are ignored.
 
 ```toml
 [output.schema]
@@ -964,6 +1298,8 @@ hash = "sha256"
 
 [session]
 startup_command = "msfconsole -q -x 'color false'"
+# Matched only at line start after a runtime-generated sentinel echo — the far
+# side controls this stream, so an unanchored prompt match is spoofable (S2).
 ready_pattern = "^msf[0-9].*> $"
 startup_timeout_seconds = 30
 idle_timeout_seconds = 300
@@ -971,6 +1307,9 @@ session_timeout_seconds = 1800
 max_interactions = 100
 
 [session.interaction]
+# Deprecated and treated as a no-op: the governing rules are S1 (control
+# characters refused, exactly one terminator appended by the executor) and the
+# command allow-list below. See Session and Browser Security Requirements.
 input_sanitize = ["injection"]
 output_max_bytes = 1048576
 output_wait_ms = 2000
@@ -1228,12 +1567,16 @@ args.selector = { type = "string", required = true }
 [browser.commands.click]
 description = "Click an element by CSS selector"
 risk_tier = "low"
-args.selector = { type = "string", pattern = "^[a-zA-Z0-9_.#\\[\\]=\"' >:()-]+$" }
+# No quotes, backslash, backtick, parentheses or angle brackets: see S4. The
+# selector is passed to CDP as an argument, never concatenated into JavaScript.
+args.selector = { type = "string", pattern = "^[a-zA-Z0-9_.#\\[\\]= >:-]{1,256}$" }
 
 [browser.commands.type_text]
 description = "Type text into the focused element (works in cross-origin iframes)"
 risk_tier = "low"
-args.text = { type = "string", sanitize = ["injection"] }
+# `sanitize = ["injection"]` is deprecated here: the real rule is S1's
+# control-character rejection, which the executor applies unconditionally.
+args.text = { type = "string" }
 
 [browser.commands.submit_form]
 description = "Submit a form"
@@ -1249,11 +1592,11 @@ risk_tier = "low"
 description = "Get network resource timing data for the current page"
 risk_tier = "low"
 
-[browser.commands.execute_js]
-description = "Evaluate JavaScript in page context"
-risk_tier = "high"
-human_approval = true
-args.expression = { type = "string" }
+# `execute_js` is deliberately absent from this manifest. Evaluating
+# agent-supplied JavaScript in page context removes every structural guarantee
+# browser mode provides, so the default posture is that the command does not
+# exist (see S5). A deployment that genuinely needs it declares it explicitly
+# with risk_tier = "critical" and human_approval = true, and gates every call.
 
 [browser.commands.wait_for]
 description = "Wait for an element to appear"
@@ -1633,6 +1976,132 @@ when {
 
 ---
 
+### Session and Browser Security Requirements (Normative)
+
+Session and browser mode are specified here but **not executable in any
+reference runtime** — the manifests parse and validate, and the executors
+refuse to run them. These requirements bind any runtime that does implement
+them (the Symbiont executor is the first). They exist because a typed contract
+over a PTY or a CDP socket has failure modes that the oneshot rules do not
+cover.
+
+#### S1. Session input is a line, not a blob
+
+A `[session.commands.*].pattern` such as `^set [A-Za-z0-9_]+ .+$` admits every
+C0 and C1 control byte, so `.+` can carry `\x03` (interrupt), `\x04` (EOF),
+`\r` (a second line to the line discipline), or an `\x1b]` OSC sequence that
+rewrites the operator's terminal when the transcript is displayed. A
+Python-style `$` additionally admits a trailing `\n`.
+
+Implementations MUST, before matching the pattern:
+
+- reject any C0 control character (U+0000–U+001F) and U+007F anywhere in the
+  input, including `\r`, `\n`, `\t`, `\x03`, `\x04`, `\x1a`, and `\x1b`;
+- reject C1 control characters (U+0080–U+009F) and the Unicode line/paragraph
+  separators U+2028 and U+2029;
+- anchor the pattern to the whole string (`^(?:pat)$`, or `\Z` in Python so a
+  trailing newline cannot match);
+- append **exactly one** line terminator themselves when writing to the PTY.
+  The manifest never carries the terminator and the agent can never supply one.
+
+#### S2. `ready_pattern` must be sentinel-anchored
+
+`ready_pattern` is matched against bytes the far side controls. A `psql` row, a
+Metasploit module banner, or a file listing can contain `analytics_db=>` and
+convince the executor that the prompt has returned, framing the next command's
+output around attacker-chosen boundaries.
+
+Implementations MUST:
+
+- generate a fresh, unguessable sentinel per interaction (at least 128 bits,
+  rendered as hex), arrange for the remote side to echo it (for example by
+  setting the prompt to include it, or by sending a benign echo command), and
+  treat the interaction as complete only after the sentinel is seen;
+- match `ready_pattern` only at the start of a line **after** the sentinel;
+- never treat a `ready_pattern` match inside captured output as a frame
+  boundary;
+- bound the wait with `output_wait_ms` and the byte budget with
+  `output_max_bytes`, and mark the result truncated rather than resynchronizing
+  on a pattern.
+
+#### S3. `input_sanitize` is replaced by the control-character rule
+
+`input_sanitize = ["injection"]` applies the shell metacharacter blocklist to
+text that is never going to a shell. It is simultaneously too strong for
+legitimate input (`$` in a SQL string, `|` in a regex, `!` in prose) and
+irrelevant to the real risk, which is S1's control characters plus the
+command-pattern allow-list. Implementations MUST apply S1 unconditionally and
+SHOULD treat `input_sanitize` as a no-op kept for manifest compatibility. It is
+deprecated.
+
+#### S4. Selectors are arguments, never concatenated JavaScript
+
+The browser `click` selector pattern in this document
+(`^[a-zA-Z0-9_.#\[\]="' >:()-]+$`) admits `'`, `"`, `(` and `)`. A runtime that
+builds `document.querySelector('<selector>').click()` as a string and evaluates
+it therefore has script injection in the page context.
+
+Implementations MUST:
+
+- never interpolate a selector, text value, or URL into a JavaScript source
+  string;
+- pass every value as an argument — `Runtime.callFunctionOn` with
+  `arguments: [{ value: selector }]`, or the equivalent CDP
+  `DOM.querySelector` / `Input.dispatchKeyEvent` calls that take the value as
+  structured data;
+- reject `'`, `"`, backslash, backtick, `<`, `>` and control characters in the
+  selector grammar, and bound its length.
+
+#### S5. `execute_js` is not a default command
+
+A command that evaluates agent-supplied JavaScript in page context removes
+every structural guarantee browser mode provides: it can read any DOM, exfiltrate
+cookies reachable from script, and reach same-origin internal endpoints. It MUST
+NOT appear in a default or example manifest. Where a deployment genuinely needs
+it, it must be declared explicitly with `risk_tier = "critical"`,
+`human_approval = true`, and a policy gate decision per invocation; the default
+posture is that the command does not exist.
+
+#### S6. URL scope must cover every navigation surface
+
+This document specifies scope enforcement for navigation, redirects, and link
+clicks. That is not the full set of ways a page reaches a URL. A conforming
+implementation MUST apply the domain allow-list and the `block_internal` range
+policy to all of:
+
+| Surface | Requirement |
+|---|---|
+| Top-level navigation | Check before the request is issued |
+| Redirects (3xx, meta refresh, `history.pushState`) | Re-check each hop; no implicit trust from the first check |
+| Subframes and nested iframes | Check per frame, not only the main frame |
+| `fetch` / `XMLHttpRequest` / `EventSource` | Intercept and check, or block entirely |
+| WebSocket and WebRTC | Check the handshake host, or block entirely |
+| Popups, `target=_blank`, and new CDP targets | Inherit the parent's scope; never attach an unscoped target |
+| Service workers and `importScripts` | Check, or disable service workers |
+| `file:`, `data:`, `blob:`, `javascript:`, `about:` | Always refuse as navigation targets |
+| DNS rebinding | Resolve once, pin the address for the connection, and re-check on every new connection |
+| Downloads | Refuse by default; when enabled, confine to the evidence directory with a size cap |
+| `<input type="file">` | Refuse by default; never let a selector-driven command choose a host path |
+| Clipboard read/write | Refuse by default |
+| CDP endpoint | Bind to loopback, require a per-session token, and refuse `connect = "live"` against an endpoint the runtime did not start unless the operator opts in |
+
+#### S7. Child sessions are never registered from tool output
+
+`[session.child_detection]` as described above registers a new tool contract when
+a regex matches the **tool's own output**. Output is attacker-influenced in
+exactly the cases this feature targets (a scanned host chooses what a banner
+says, a compromised host chooses what a shell prints), so a match is not
+evidence that a child context exists. Implementations MUST NOT create, register,
+or route to a child session on the strength of an output match alone. A child
+context may be registered only when the runtime itself observes it through a
+channel the far side does not control (a new PTY file descriptor it opened, a
+CDP `Target.targetCreated` event for a target it attached), and the child's
+contract must come from a manifest resolved at load time, never from a path or
+type named in the matched output. Policy inheritance remains strictly
+narrowing: a child can never hold a capability its parent lacks.
+
+---
+
 ## Symbiont Integration
 
 ### Runtime Discovery
@@ -1723,11 +2192,6 @@ Generates:
         "type": "string",
         "enum": ["ping", "service", "version", "syn"],
         "description": "Type of scan to perform"
-      },
-      "extra_flags": {
-        "type": "string",
-        "description": "Additional nmap flags (must pass Gate approval)",
-        "default": ""
       }
     },
     "required": ["target", "scan_type"]
@@ -1830,9 +2294,50 @@ ProposedAction
 
 ### Scope Enforcement
 
-Any parameter with type `scope_target`, `url` (with `scope_check = true`), `cidr`, or `ip_address` is automatically validated against the project's scope definition (`scope/scope.toml`). This replaces the `source /app/scripts/scope-check.sh; validate_scope` pattern in every wrapper script.
+A parameter of type `scope_target`, `url`, `cidr`, or `ip_address` that sets
+`scope_check = true` is validated against the project's scope definition
+(`scope/scope.toml`). This replaces the
+`source /app/scripts/scope-check.sh; validate_scope` pattern in every wrapper
+script.
 
-The scope check runs in the executor, after Cedar authorization but before command execution. This is the defense-in-depth layer: even if a Cedar policy bug allows an out-of-scope target, the ToolClad type system catches it.
+`scope_check` is the opt-in that turns the type's *shape* check into an
+allow-list check. A bare `scope_target` only asserts "this is shaped like a
+host, IP, or CIDR"; it asserts nothing about whether the target is authorized.
+Manifests that mean "in scope" must say `scope_check = true`.
+
+```toml
+# scope/scope.toml
+[scope]
+allowed_domains = ["example.com", "*.example.com"]
+allowed_cidrs   = ["10.0.1.0/24"]
+blocked_domains = []
+blocked_cidrs   = []
+```
+
+Discovery, in order: the path in `TOOLCLAD_SCOPE_FILE`, then `scope/scope.toml`
+searched upward from the manifest's directory to the filesystem root.
+
+Semantics:
+
+- Enforcement is **fail-closed**. `scope_check = true` with no reachable scope
+  file refuses the call; it does not fall back to allowing the target.
+- Blocked rules are evaluated first and always win.
+- `"example.com"` matches that host exactly. `"*.example.com"` matches a strict
+  subdomain at any depth (`app.example.com`, `deep.sub.example.com`) but not the
+  apex `example.com`, and not a mere suffix such as `evil-example.com`.
+- An IP argument matches when it is contained in an allowed CIDR. A CIDR
+  argument matches only when it is **fully contained** in one.
+- For a `url`, the host is extracted and checked; the scheme and path are not
+  part of the scope decision.
+
+The scope check runs in the executor, after Cedar authorization but before
+command execution. This is the defense-in-depth layer: even if a Cedar policy
+bug allows an out-of-scope target, the ToolClad type system catches it.
+
+Scope is a separate control from the egress policy. `block_internal` refuses
+non-public addresses whether or not they are in scope; `scope_check` refuses
+addresses outside the engagement whether or not they are public. A tool that
+dials the network wants both.
 
 #### Cross-Language Scope Validation Consistency
 
@@ -1840,7 +2345,14 @@ Scope validation involves non-trivial logic: CIDR containment math, IPv4/IPv6 no
 
 To mitigate this:
 
-1. **Normative test vectors**: The `tests/scope_vectors.json` file contains a shared set of test cases (IP-in-CIDR, wildcard matching, edge cases) that all implementations MUST pass. Adding a new scope rule requires adding test vectors first.
+1. **Normative test vectors**: `tests/scope_vectors.json` holds the scope cases
+   (IP-in-CIDR, wildcard matching, edge cases) and
+   `tests/injection_vectors.json` holds the argument and manifest rejection
+   cases (option injection, quote breakout, URL schemes, SSRF literals,
+   obfuscated IPs, unknown manifest keys). Every implementation MUST execute
+   both files in its own test suite. Adding a new rule requires adding vectors
+   first — a rule that only one runtime enforces is the drift this section
+   exists to prevent.
 2. **Centralization path**: For production deployments where four independent validators are unacceptable, the Symbiont runtime provides a single scope validation endpoint (gRPC/HTTP) that client-side executors call. Alternatively, a single Rust-based scope library can be compiled to WebAssembly (Wasm) for use by Python/JS/Go implementations via FFI bindings.
 
 ---
@@ -2129,6 +2641,21 @@ The 80/20 split from symbi-redteam confirms this: ~14 of 19 tools are pure templ
 ---
 
 ## Changelog
+
+### Unreleased
+
+Security hardening of the reference runtimes; the full list, keyed by review
+finding (TC-1 to TC-23), is in `CHANGELOG.md`. Normative changes to this
+document: tokenize-then-substitute as the only legal command construction
+order, deprecation of `template`, argument hygiene (whitespace, quotes,
+control characters, leading dash, anchored patterns), the single `url`
+validator, egress safety (`block_internal` semantics, CIDR overlap, DNS
+resolution, internal names, `network_egress`), refusal of unknown manifest
+keys, fail-closed scope and output-schema validation, the policy gate seam,
+the process environment, the `SIGTERM`-grace-`SIGKILL` timeout sequence, and
+the Session and Browser Security Requirements (S1-S7). The v0.5.2 entry below
+claimed full feature parity across the four runtimes; that was not accurate
+at the time, and the shared vector files in `tests/` now enforce it.
 
 ### v0.5.3 (2026-04-03)
 
