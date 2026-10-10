@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import click
 
-from toolclad.executor import build_command, execute
-from toolclad.manifest import Manifest, load_manifest
-from toolclad.validator import ValidationError
+from toolclad.executor import PolicyDenied, build_command_argv, default_gate, execute
+from toolclad.manifest import LoadOptions, load_manifest_with_options
+from toolclad.scope import manifest_scope
+from toolclad.validator import ValidationError, validate_arg_with_custom_types_mode
 
 
 def _parse_args(arg_pairs: Tuple[str, ...]) -> Dict[str, str]:
@@ -41,15 +43,24 @@ def main() -> None:
 
 @main.command()
 @click.argument("manifest_path", type=click.Path(exists=True))
-def validate(manifest_path: str) -> None:
+@click.option(
+    "--allow-unknown-keys",
+    is_flag=True,
+    help="Report unknown manifest keys as warnings on stderr instead of failing.",
+)
+def validate(manifest_path: str, allow_unknown_keys: bool) -> None:
     """Parse and validate a .clad.toml manifest."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(
+            manifest_path, LoadOptions(allow_unknown_keys=allow_unknown_keys)
+        )
     except (ValueError, FileNotFoundError) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 
     click.echo(f"Manifest:     {manifest.source_path}")
+    if manifest.custom_types:
+        click.echo(f"Custom types: {', '.join(sorted(manifest.custom_types))}")
     click.echo(f"Tool:         {manifest.tool.name} v{manifest.tool.version}")
     click.echo(f"Binary:       {manifest.tool.binary}")
     click.echo(f"Description:  {manifest.tool.description}")
@@ -61,11 +72,16 @@ def validate(manifest_path: str) -> None:
         click.echo(f"  {arg.name}: {arg.type} ({req})")
     if manifest.command.template:
         click.echo(f"Template:     {manifest.command.template}")
-    elif manifest.command.executor:
+    if manifest.command.exec:
+        click.echo(f"Exec:         {json.dumps(manifest.command.exec)}")
+    if manifest.command.end_of_options:
+        click.echo(f"End of opts:  {manifest.command.end_of_options}")
+    if manifest.command.executor:
         click.echo(f"Executor:     {manifest.command.executor}")
     out_format = manifest.output.format if manifest.output else "(none — callback dispatch)"
     click.echo(f"Output:       {out_format}")
     click.echo(f"Dispatch:     {manifest.tool.dispatch}")
+    click.echo(f"Mode:         {manifest.tool.mode}")
     click.echo()
     click.echo("OK")
 
@@ -73,13 +89,19 @@ def validate(manifest_path: str) -> None:
 @main.command()
 @click.argument("manifest_path", type=click.Path(exists=True))
 @click.option("--arg", "-a", "arg_pairs", multiple=True, help="Argument as key=value")
-def run(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
+@click.option(
+    "--approve",
+    is_flag=True,
+    help="Approve this call: run it even when the manifest requires human "
+    "approval or declares a high/critical risk tier.",
+)
+def run(manifest_path: str, arg_pairs: Tuple[str, ...], approve: bool) -> None:
     """Execute a tool through its .clad.toml manifest."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(manifest_path)
         args = _parse_args(arg_pairs)
-        envelope = execute(manifest, args)
-    except (ValueError, FileNotFoundError, ValidationError) as e:
+        envelope = execute(manifest, args, approve=approve)
+    except (ValueError, FileNotFoundError, ValidationError, PolicyDenied) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 
@@ -121,7 +143,7 @@ def _mcp_type_and_constraints(arg) -> Tuple[str, dict]:
 def schema(manifest_path: str) -> None:
     """Output MCP JSON schema for a manifest."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(manifest_path)
     except (ValueError, FileNotFoundError) as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
@@ -188,18 +210,22 @@ def schema(manifest_path: str) -> None:
 def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
     """Dry-run a tool invocation: validate args and show the constructed command."""
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest_with_options(manifest_path)
         args = _parse_args(arg_pairs)
 
-        # Validate each arg individually for nice reporting.
-        from toolclad.validator import validate_arg
+        # Validate each arg individually for nice reporting. allow_whitespace
+        # is honored only when the manifest declared exec directly.
+        exec_mode = manifest.command.exec_was_declared
+        scope = manifest_scope(manifest)
 
         click.echo(f"  Manifest:  {manifest.source_path}")
-        click.echo(f"  Arguments:")
+        click.echo("  Arguments:")
         for arg_name, arg_def in manifest.args.items():
             if arg_name in args:
                 try:
-                    cleaned = validate_arg(arg_def, args[arg_name])
+                    cleaned = validate_arg_with_custom_types_mode(
+                        arg_def, args[arg_name], manifest.custom_types, exec_mode, scope
+                    )
                     click.echo(f"    {arg_name}={cleaned} ({arg_def.type}: OK)")
                 except ValidationError as ve:
                     click.echo(f"    {arg_name}={args[arg_name]} ({arg_def.type}: FAIL - {ve})")
@@ -210,14 +236,22 @@ def test(manifest_path: str, arg_pairs: Tuple[str, ...]) -> None:
                 click.echo(f"    {arg_name}=??? (MISSING - required)")
                 sys.exit(1)
 
-        command = build_command(manifest, args)
-        click.echo(f"  Command:   {command}")
+        argv = build_command_argv(manifest, args)
+        click.echo(f"  Command:   {shlex.join(argv)}")
+        click.echo(f"  Argv:      {json.dumps(argv)}")
         if manifest.tool.cedar.resource:
             click.echo(
                 f"  Cedar:     {manifest.tool.cedar.resource} / "
                 f"{manifest.tool.cedar.action}"
             )
         click.echo(f"  Timeout:   {manifest.tool.timeout_seconds}s")
+        click.echo(f"  Risk tier: {manifest.tool.risk_tier}")
+        # A dry run is not gated; show what the default gate would decide.
+        needs_approval = not default_gate(manifest, {}).allowed
+        click.echo(
+            "  Approval:  "
+            + ("required (run with --approve)" if needs_approval else "not required")
+        )
         click.echo()
         click.echo("  [dry run -- command not executed]")
 

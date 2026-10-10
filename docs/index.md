@@ -4,7 +4,7 @@
 
 ToolClad is the tool execution layer of the [ThirdKey](https://thirdkey.ai) trust stack: [SchemaPin](https://schemapin.org) (tool integrity) / [AgentPin](https://agentpin.org) (agent identity) / **ToolClad** (tool contracts) / [Symbiont](https://symbiont.dev) (runtime).
 
-**Version**: 0.5.3 | **Status**: Release Candidate | **License**: MIT (spec), Apache 2.0 (Symbiont integration)
+**Version**: 0.6.2 | **Status**: Release Candidate | **License**: MIT (spec), Apache 2.0 (Symbiont integration)
 
 ---
 
@@ -15,32 +15,35 @@ ToolClad is a manifest format (`.clad.toml`) that replaces wrapper scripts, MCP 
 A ToolClad manifest answers four questions:
 
 1. **What can this tool accept?** Typed parameters with validation constraints (enums, ranges, regex, scope checks, injection sanitization).
-2. **How do you invoke it?** A command template, HTTP request, MCP server call, PTY session, or browser engine action. The LLM never generates raw invocation details.
+2. **How do you invoke it?** An `exec` argv array or an HTTP request (executed by the reference runtimes), or an MCP server call, PTY session, or browser engine action (parsed and validated here, executed by a hosting runtime). The LLM never generates raw invocation details.
 3. **What does it produce?** Output format, parsing rules, and a mandatory output schema that normalizes raw output into structured JSON.
-4. **What is the interaction model?** Three execution modes with five backends share a common governance layer.
+4. **What is the interaction model?** Two executing backends plus three parsed-only contracts share a common governance layer.
 
 ## Key Features
 
-- **14 built-in type validators** -- all with shell injection sanitization, plus custom types via `toolclad.toml`
-- **Five execution backends** -- Shell command, HTTP API, MCP proxy, PTY session, CDP browser
-- **Command construction** -- `exec` array (preferred) or `template` string with mappings, conditionals, defaults; no `sh -c`
+- **15 built-in type validators** -- all with shell injection sanitization, NUL/control-character/quote/whitespace/leading-dash rejection and a host/IP policy (`block_internal`), plus custom types via `toolclad.toml`
+- **Two executing backends** -- Shell command (`[command]`) and HTTP API (`[http]`). MCP proxy, PTY session and CDP browser manifests are parsed and validated but are not executable by the reference runtimes
+- **Command construction** -- `exec` array (canonical) with mappings, conditionals, defaults, brace escapes and `end_of_options`; the deprecated `template` string is compiled to `exec` at load; no `sh -c`
+- **Strict loading** -- unknown manifest keys are refused at load
+- **Policy gate** -- deny-by-default for `human_approval = true` and `risk_tier` `high`/`critical`; Cedar evaluation is external
 - **MCP schema generation** -- Auto-generate `inputSchema` + `outputSchema` from manifest declarations
 - **Evidence envelopes** -- Structured JSON with scan_id, timestamps, exit_code, output_hash (SHA-256)
 - **Cedar policy integration** -- Manifests declare Cedar resource/action for policy evaluation
 - **SchemaPin signing** -- `.clad.toml` files are signed directly as first-class artifacts
-- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
-- **Session mode** -- Per-interaction ORGA gating on interactive CLIs (psql, msfconsole, redis-cli)
-- **Browser mode** -- Governed headless or live browser sessions via CDP with URL scope enforcement
+- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text; fail-closed schema validation; custom parser scripts are refused at load
+- **Session mode** -- Per-interaction ORGA gating contract for interactive CLIs (psql, msfconsole, redis-cli); parsed and validated by the reference runtimes, executed by a hosting runtime
+- **Browser mode** -- Governed headless or live browser session contract via CDP with URL scope enforcement; parsed and validated by the reference runtimes, executed by a hosting runtime
 
-## Three Execution Modes
+## Execution Modes
 
-| Mode | Backend | Use Case |
-|------|---------|----------|
-| **Oneshot** | Shell (`[command]`), HTTP (`[http]`), MCP proxy (`[mcp]`) | Single command/request, get result |
-| **Session** | PTY (pseudo-terminal) | Interactive CLIs: psql, msfconsole, redis-cli, gdb |
-| **Browser** | CDP (Chrome DevTools Protocol) | Headless or live browser automation |
+| Mode | Backend | Reference runtimes | Use Case |
+|------|---------|--------------------|----------|
+| **Oneshot** | Shell (`[command]`), HTTP (`[http]`) | Executed | Single command/request, get result |
+| **Oneshot** | MCP proxy (`[mcp]`) | Parsed and validated; `execute` returns a `delegation_preview` envelope, no upstream call | Govern a third-party MCP tool |
+| **Session** | PTY (pseudo-terminal) | Parsed and validated only; `execute` is refused | Interactive CLIs: psql, msfconsole, redis-cli, gdb |
+| **Browser** | CDP (Chrome DevTools Protocol) | Parsed and validated only; `execute` is refused | Headless or live browser automation |
 
-All three modes share a common governance layer: typed parameters, argument validation, Cedar policy evaluation, scope enforcement, output schema validation, evidence capture, and audit trail.
+All modes share a common governance layer: typed parameters, argument validation, policy gating, scope enforcement, output schema validation, evidence capture, and audit trail. Session and browser execution is provided by a hosting runtime such as Symbiont, not by the reference CLIs or libraries in this repository.
 
 ## Quick Example
 
@@ -65,7 +68,7 @@ type = "scope_target"
 description = "Domain name or IP address to query"
 
 [command]
-template = "whois {target}"
+exec = ["whois", "{target}"]
 
 [output]
 format = "text"
@@ -79,7 +82,7 @@ type = "string"
 description = "Raw WHOIS registration data"
 ```
 
-The agent fills typed parameters. The executor validates, constructs the command, executes with timeout, and returns structured JSON. The agent never sees or generates a shell command.
+The agent fills typed parameters. The executor validates, constructs the argv, executes with timeout, and returns structured JSON. The agent never generates a shell command; the evidence envelope reports the declared command with placeholders intact, so executor-injected paths and expanded secrets never reach the agent (the human-facing `toolclad test` dry run shows the resolved argv).
 
 ## Why ToolClad?
 
@@ -112,10 +115,15 @@ All four implementations parse the same `.clad.toml` format, validate arguments 
 |-------|-------------|
 | [Getting Started](getting-started.md) | Install, create, validate, and run your first manifest |
 | [Manifest Format](manifest-format.md) | Complete `.clad.toml` reference for every section |
-| [Type System](type-system.md) | All 14 built-in types with validation rules and examples |
+| [Type System](type-system.md) | All 15 built-in types with validation rules and examples |
 | [Command Construction](command-construction.md) | Templates, mappings, conditionals, array-based execution |
 | [HTTP and MCP Backends](http-mcp-backends.md) | HTTP API tools and governed MCP proxy passthrough |
-| [Session Mode](session-mode.md) | PTY sessions with per-interaction governance |
+| [Session Mode](session-mode.md) | PTY session contract with per-interaction governance (parsed, not executed, by the reference runtimes) |
+| [Browser Mode](browser-mode.md) | CDP browser session contract (parsed, not executed, by the reference runtimes) |
+| [Security Model](security-model.md) | Value hygiene, spawn hardening, policy gate, scope enforcement, output caps |
+| [Output & Evidence](output-evidence.md) | Parsers, fail-closed schema validation, evidence envelopes |
+| [CLI Reference](cli-reference.md) | `validate`, `run`, `test`, `schema` and their flags |
+| [API Reference](api-reference.md) | Library entry points in Rust, Python, JavaScript, and Go |
 | [SchemaPin v1.4 Features](schemapin-v1.4-features.md) | Sign with TTL, schema-version + previous-hash lineage, and `_schemapin.{domain}` DNS TXT cross-verification |
 
 ## Links

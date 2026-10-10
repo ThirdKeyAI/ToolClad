@@ -32,51 +32,49 @@ func main() {
 }
 
 func validateCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowUnknownKeys bool
+
+	cmd := &cobra.Command{
 		Use:   "validate <manifest>",
 		Short: "Validate a .clad.toml manifest file",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{
+				AllowUnknownKeys: allowUnknownKeys,
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s  ERROR: %v\n", path, err)
 				return err
 			}
 
-			// Validate that all arg types are known.
-			supported := validator.SupportedTypes()
-			supportedSet := make(map[string]bool)
-			for _, t := range supported {
-				supportedSet[t] = true
-			}
-
-			for name, arg := range m.Args {
-				if !supportedSet[arg.Type] {
-					fmt.Fprintf(os.Stderr, "%s  ERROR: arg %q has unknown type %q\n", path, name, arg.Type)
-					return fmt.Errorf("unknown type %q for arg %q", arg.Type, name)
-				}
-			}
-
-			// Validate command has template or executor.
-			if m.Command.Template == "" && m.Command.Executor == "" {
-				fmt.Fprintf(os.Stderr, "%s  ERROR: no command template or executor\n", path)
-				return fmt.Errorf("no command template or executor")
-			}
-
+			// LoadManifest has already compiled [command] into its canonical
+			// exec form (or accepted another backend), so an exec-only
+			// manifest is valid here.
 			fmt.Printf("%s  OK\n", path)
 			fmt.Printf("  Tool:    %s v%s\n", m.Tool.Name, m.Tool.Version)
 			fmt.Printf("  Binary:  %s\n", m.Tool.Binary)
 			fmt.Printf("  Risk:    %s\n", m.Tool.RiskTier)
 			fmt.Printf("  Args:    %d (%d required)\n", len(m.Args), len(m.RequiredArgs()))
 			fmt.Printf("  Timeout: %ds\n", m.Tool.TimeoutSeconds)
+			switch {
+			case m.Command.Executor != "":
+				fmt.Printf("  Command: executor %s\n", m.Command.Executor)
+			case len(m.Command.Exec) > 0:
+				fmt.Printf("  Command: %s\n", executor.FormatArgv(m.Command.Exec))
+			}
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&allowUnknownKeys, "allow-unknown-keys", false,
+		"Report unknown manifest keys as warnings instead of refusing to load")
+	return cmd
 }
 
 func runCmd() *cobra.Command {
 	var argFlags []string
+	var approve bool
 
 	cmd := &cobra.Command{
 		Use:   "run <manifest> [--arg key=value ...]",
@@ -84,7 +82,7 @@ func runCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{})
 			if err != nil {
 				return err
 			}
@@ -94,10 +92,21 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
-			envelope, err := executor.Execute(m, toolArgs)
+			// Without --approve the default policy gate decides: a
+			// manifest with human_approval = true or a high/critical
+			// risk_tier is refused before anything runs.
+			gate := executor.Gate(executor.DefaultGate)
+			if approve {
+				gate = executor.ApproveGate
+			}
+			cmd.SilenceUsage = true
+			envelope, err := executor.ExecuteWithGate(m, toolArgs, gate)
 			if err != nil {
-				// Still print the envelope for diagnostics.
-				printJSON(envelope)
+				// Still print the envelope for diagnostics. A gate
+				// denial has none: nothing was executed.
+				if envelope != nil {
+					printJSON(envelope)
+				}
 				return err
 			}
 
@@ -107,6 +116,8 @@ func runCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringArrayVar(&argFlags, "arg", nil, "Tool argument in key=value format (repeatable)")
+	cmd.Flags().BoolVar(&approve, "approve", false,
+		"Approve this run explicitly, bypassing the default policy gate (human_approval, high/critical risk_tier)")
 	return cmd
 }
 
@@ -117,7 +128,7 @@ func schemaCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{})
 			if err != nil {
 				return err
 			}
@@ -138,7 +149,7 @@ func testCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
-			m, err := manifest.LoadManifest(path)
+			m, err := loadManifest(path, manifest.LoadOptions{})
 			if err != nil {
 				return err
 			}
@@ -172,7 +183,9 @@ func testCmd() *cobra.Command {
 					}
 				}
 
-				validated, vErr := validator.ValidateArg(argDef, val)
+				// allow_whitespace is honored only when the manifest
+				// declared exec = [...] itself.
+				validated, vErr := validator.ValidateArgWithCustomTypesIn(argDef, val, m.CustomTypes, m.Command.ExecWasDeclared, m.Scope)
 				status := "OK"
 				if vErr != nil {
 					status = fmt.Sprintf("FAIL: %v", vErr)
@@ -191,15 +204,17 @@ func testCmd() *cobra.Command {
 				fmt.Println("(none)")
 			}
 
-			// Build command.
-			cmdStr, buildErr := executor.BuildCommand(m, toolArgs)
+			// Build argv from the canonical exec form.
+			argv, buildErr := executor.BuildCommandArgv(m, toolArgs)
 			if buildErr != nil {
 				fmt.Printf("  Command:   ERROR: %v\n", buildErr)
 				if firstFailure == nil {
 					firstFailure = buildErr
 				}
 			} else {
-				fmt.Printf("  Command:   %s\n", cmdStr)
+				fmt.Printf("  Command:   %s\n", executor.FormatArgv(argv))
+				argvJSON, _ := json.Marshal(argv)
+				fmt.Printf("  Argv:      %s\n", argvJSON)
 			}
 
 			if m.Tool.Cedar != nil {
@@ -207,6 +222,11 @@ func testCmd() *cobra.Command {
 			}
 			fmt.Printf("  Timeout:   %ds\n", m.Tool.TimeoutSeconds)
 			fmt.Printf("  Risk:      %s\n", m.Tool.RiskTier)
+			approval := "not required"
+			if d := executor.DefaultGate(m, nil); !d.Allowed {
+				approval = "required (" + d.Reason + "); pass --approve to run"
+			}
+			fmt.Printf("  Approval:  %s\n", approval)
 			fmt.Println()
 			fmt.Println("  [dry run -- command not executed]")
 			return firstFailure
@@ -215,6 +235,22 @@ func testCmd() *cobra.Command {
 
 	cmd.Flags().StringArrayVar(&argFlags, "arg", nil, "Tool argument in key=value format (repeatable)")
 	return cmd
+}
+
+// loadManifest is the one load path every subcommand uses: the library's
+// LoadManifestWithOptions discovers toolclad.toml upward from the manifest
+// (or TOOLCLAD_CONFIG_FILE) and type-checks every argument against the
+// built-in and custom types; ValidateManifestWithCustomTypes then re-checks
+// custom-type defaults and the egress lint with the custom types in hand.
+func loadManifest(path string, opts manifest.LoadOptions) (*manifest.Manifest, error) {
+	m, err := manifest.LoadManifestWithOptions(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := validator.ValidateManifestWithCustomTypes(m, m.CustomTypes); err != nil {
+		return nil, fmt.Errorf("manifest %s: %w", path, err)
+	}
+	return m, nil
 }
 
 // parseArgFlags parses --arg key=value flags into a map.

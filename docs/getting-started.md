@@ -52,7 +52,7 @@ type = "scope_target"
 description = "Domain name or IP address to query"
 
 [command]
-template = "whois {target}"
+exec = ["whois", "{target}"]
 
 [output]
 format = "text"
@@ -69,9 +69,9 @@ description = "Raw WHOIS registration data"
 What this manifest declares:
 
 - **`[tool]`**: Name, binary, timeout, risk tier. Identifies the tool for MCP registration and policy evaluation.
-- **`[tool.cedar]`**: Cedar resource and action for authorization.
-- **`[args.target]`**: Required `scope_target` -- validates the value is a valid IP, CIDR, or hostname and blocks shell injection characters.
-- **`[command]`**: Template string. The executor interpolates validated args and dispatches via `execve` -- no shell interpretation.
+- **`[tool.cedar]`**: Cedar resource and action for an external policy engine.
+- **`[args.target]`**: Required `scope_target` -- validates the value is a valid IP, CIDR, or hostname and blocks shell injection characters, whitespace, quotes, and a leading dash.
+- **`[command]`**: `exec` argv array. Each element is one argument; the executor substitutes validated values into their tokens (never re-splitting them) and dispatches via `execve` -- no shell interpretation. The older `template = "whois {target}"` form still loads but is deprecated and prints a warning.
 - **`[output]`**: Text format, wrapped in a structured evidence envelope with SHA-256 hash.
 
 ## Validate
@@ -91,7 +91,7 @@ tools/whois_lookup.clad.toml is valid
   Command: whois {target}
 ```
 
-Validation checks required fields, type definitions, template references, and output schema structure.
+Validation checks required fields, type definitions, placeholder references, and output schema structure. Any key the format does not define is refused (`unknown key 'tool.foo' in manifest`); pass `--allow-unknown-keys` to downgrade that to a warning while migrating an old manifest. If a `toolclad.toml` with custom types exists in the manifest's directory or any parent, it is loaded automatically.
 
 ## Dry Run
 
@@ -148,6 +148,12 @@ Output (evidence envelope):
 
 Every execution returns a structured JSON envelope with timing, exit code, output hash, and parsed results.
 
+Tools that declare `human_approval = true` or a `risk_tier` of `high` or `critical` are refused by the default policy gate (`policy gate denied: ...`). Pass `--approve` to run them:
+
+```bash
+toolclad run tools/nikto_scan.clad.toml --approve --arg target=example.com
+```
+
 ## Generate MCP Schema
 
 Export the manifest as an MCP tool definition for LLM consumption:
@@ -197,7 +203,7 @@ Error: Argument validation failed
   target: injection characters detected (;) in scope_target value
 ```
 
-Shell metacharacters (`` ; | & $ ` ( ) { } [ ] < > ! \n \r ``) are rejected by default on all string-based types. The command is never constructed, let alone executed.
+Shell metacharacters (`` ; | & $ ` ( ) { } [ ] < > ! ``) are rejected by default on all string-derived types, along with NUL bytes, control characters (including `\n` and `\r`), quotes and backslashes, whitespace, and a leading `-` or `+`. The command is never constructed, let alone executed.
 
 ## A More Complex Example
 
@@ -230,8 +236,10 @@ allowed = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "PTR", "SRV", "ANY"]
 default = "A"
 description = "DNS record type"
 
+# `+short` is a literal argv element declared by the manifest. A `scope_target`
+# value can never begin with `+` or `-`, so an argument cannot become an option.
 [command]
-template = "dig +short {target} {record_type}"
+exec = ["dig", "+short", "{target}", "{record_type}"]
 
 [output]
 format = "text"
@@ -268,15 +276,16 @@ The `record_type` enum constrains the agent to only the 10 declared values. Prov
 
 | Command | Description |
 |---------|-------------|
-| `toolclad validate <manifest>` | Parse and validate a `.clad.toml` manifest |
-| `toolclad run <manifest> --arg k=v` | Execute a tool with validated arguments |
+| `toolclad validate <manifest> [--allow-unknown-keys]` | Parse and validate a `.clad.toml` manifest |
+| `toolclad run <manifest> --arg k=v [--approve]` | Execute a tool with validated arguments |
 | `toolclad test <manifest> --arg k=v` | Dry-run: validate and show command without executing |
 | `toolclad schema <manifest>` | Output MCP-compatible JSON Schema |
 
 ## Next Steps
 
 - [Manifest Format](manifest-format.md) -- full reference for every section
-- [Type System](type-system.md) -- all 14 types with validation rules
-- [Command Construction](command-construction.md) -- templates, mappings, conditionals
-- [HTTP and MCP Backends](http-mcp-backends.md) -- wrap HTTP APIs and MCP server tools
-- [Session Mode](session-mode.md) -- govern interactive CLI tools
+- [Type System](type-system.md) -- all 15 types with validation rules
+- [Command Construction](command-construction.md) -- `exec` arrays, mappings, conditionals
+- [HTTP and MCP Backends](http-mcp-backends.md) -- wrap HTTP APIs (executed) and MCP server tools (parsed, `delegation_preview`)
+- [Session Mode](session-mode.md) -- the interactive CLI contract (parsed and validated; execution by a hosting runtime)
+- [Security Model](security-model.md) -- value hygiene, spawn hardening, policy gate, scope enforcement

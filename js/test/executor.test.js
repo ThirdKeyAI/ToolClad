@@ -50,6 +50,7 @@ describe("buildCommand - basic interpolation", () => {
         target: { position: 1, required: true, type: "scope_target", description: "t" },
         rate: { position: 2, required: false, type: "integer", default: 100, description: "r" },
       },
+      tool: { binary: "scan" },
       command: { template: "scan --rate {rate} {target}" },
     });
     const result = buildCommand(manifest, { target: "10.0.1.1" });
@@ -61,15 +62,16 @@ describe("buildCommand - command.defaults", () => {
   it("uses command.defaults for unset context variables", () => {
     const manifest = makeManifest({
       args: {
-        target: { position: 1, required: true, type: "scope_target", description: "t" },
+        target: { position: 1, required: true, type: "scope_target", description: "t", block_internal: true },
       },
+      tool: { binary: "nmap" },
       command: {
         template: "nmap --max-rate {max_rate} {target}",
         defaults: { max_rate: 1000 },
       },
     });
-    const result = buildCommand(manifest, { target: "10.0.1.0/24" });
-    assert.equal(result.command, "nmap --max-rate 1000 10.0.1.0/24");
+    const result = buildCommand(manifest, { target: "93.184.216.0/24" });
+    assert.equal(result.command, "nmap --max-rate 1000 93.184.216.0/24");
   });
 });
 
@@ -77,7 +79,7 @@ describe("buildCommand - mappings", () => {
   it("resolves enum value to mapped flags", () => {
     const manifest = makeManifest({
       args: {
-        target: { position: 1, required: true, type: "scope_target", description: "t" },
+        target: { position: 1, required: true, type: "scope_target", description: "t", block_internal: true },
         scan_type: {
           position: 2,
           required: true,
@@ -86,8 +88,9 @@ describe("buildCommand - mappings", () => {
           description: "s",
         },
       },
+      tool: { binary: "nmap" },
       command: {
-        template: "nmap {_scan_flags} {target}",
+        template: "nmap {_scan_type_flags} {target}",
         mappings: {
           scan_type: {
             ping: "-sn -PE",
@@ -99,10 +102,10 @@ describe("buildCommand - mappings", () => {
     });
 
     const result = buildCommand(manifest, {
-      target: "10.0.1.0/24",
+      target: "93.184.216.0/24",
       scan_type: "service",
     });
-    assert.equal(result.command, "nmap -sT -sV 10.0.1.0/24");
+    assert.equal(result.command, "nmap -sT -sV 93.184.216.0/24");
   });
 });
 
@@ -137,6 +140,7 @@ describe("buildCommand - validation rejects bad args", () => {
           description: "m",
         },
       },
+      tool: { binary: "tool" },
       command: { template: "tool --mode {mode}" },
     });
     assert.throws(

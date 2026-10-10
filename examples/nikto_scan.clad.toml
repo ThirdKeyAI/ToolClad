@@ -1,7 +1,17 @@
 # nikto_scan.clad.toml — Web server vulnerability scanner
 #
 # Demonstrates custom types from the project-level toolclad.toml:
-#   hostname, port_range, severity_level, scan_rate
+#   port_range, service_protocol, scan_rate
+#
+# The CLIs discover toolclad.toml by walking up from this file's directory, so
+# the custom types resolve both from the library and from `toolclad validate`.
+#
+# `target` is a built-in `scope_target` rather than the custom `hostname` type:
+# a custom type cannot carry `block_internal`, so an egress tool whose target is
+# a custom type has no SSRF defense. Keep network targets on the built-in types.
+#
+# `human_approval = true` is enforced: the default policy gate refuses this tool
+# unless the caller supplies an approving gate (`--approve` on the CLIs).
 
 [tool]
 name = "nikto_scan"
@@ -11,6 +21,7 @@ description = "Scan a web server for known vulnerabilities and misconfigurations
 timeout_seconds = 600
 risk_tier = "medium"
 human_approval = true
+network_egress = true
 
 [tool.cedar]
 resource = "PenTest::ScanTarget"
@@ -19,7 +30,8 @@ action = "execute_tool"
 [args.target]
 position = 1
 required = true
-type = "hostname"
+type = "scope_target"
+block_internal = true
 description = "Target hostname to scan"
 
 [args.port]
@@ -52,10 +64,16 @@ default = "json"
 description = "Output format"
 
 [command]
-template = "nikto -h {protocol}://{target}:{port} -maxtime {_timeout} -Format {output_format} {_rate_flag}"
+exec = [
+    "nikto",
+    "-h", "{protocol}://{target}:{port}",
+    "-maxtime", "{maxtime}",
+    "-Format", "{output_format}",
+    "{_rate_flag}",
+]
 
 [command.defaults]
-_timeout = "600s"
+maxtime = "600s"
 
 [command.conditionals.rate_flag]
 when = "max_rate != '100'"
@@ -65,6 +83,7 @@ template = "-Plugins @@ALL -maxrate {max_rate}"
 format = "json"
 parser = "builtin:json"
 envelope = true
+max_bytes = 8388608
 
 [output.schema]
 type = "object"

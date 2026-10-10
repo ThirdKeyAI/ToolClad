@@ -5,6 +5,15 @@
 #
 # Each custom type inherits validation from a base type and adds
 # constraints (allowed values, patterns, min/max ranges).
+#
+# Custom types cannot carry the per-argument egress policy (`block_internal`)
+# or scope enforcement (`scope_check`). An argument that names a network target
+# must therefore use the built-in `scope_target`, `url`, `ip_address`, or
+# `cidr` type — a manifest that dispatches a network-egress binary with a
+# custom-typed target is refused at load.
+#
+# `pattern` is anchored: the value must match the whole string, so `[a-z]+`
+# means `^(?:[a-z]+)$` and not a substring search.
 
 [types.severity_level]
 base = "enum"
@@ -19,6 +28,8 @@ base = "integer"
 min = 1
 max = 10000
 
+# Shape-only hostname check. Prefer the built-in `scope_target` type for
+# anything that is actually dialed: this type carries no egress or scope policy.
 [types.hostname]
 base = "string"
 pattern = "^[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?)*$"

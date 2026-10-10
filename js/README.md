@@ -63,6 +63,9 @@ The dangerous action cannot be expressed because the interface doesn't permit it
 - **Absolute path blocking**: `path` type rejects `/etc/shadow`, `C:\...` style paths
 - **Newline injection blocking**: `\n` and `\r` rejected in all string-based types
 - **No eval**: Conditional evaluators use closed-vocabulary parsers, never dynamic code execution
+- **Host policy**: a `scope_target` or `url` host is refused when it names an internal namespace (`localhost`, `*.localhost`, `*.local`, `*.internal`, `*.home.arpa`, `*.lan`, `*.intranet`, `*.corp`, `*.private`, `metadata.google.internal`) or spells an address in the name (`127.0.0.1.nip.io`, `10-0-0-1.nip.io`); a CIDR target is tested for overlap with every blocked range, so `8.0.0.0/5` is refused under `block_internal` because it contains `10.0.0.0/8`
+- **`block_internal` resolves hostnames**: under `block_internal = true` a hostname is resolved and every A/AAAA answer is held to the range policy; a name that cannot be resolved is refused (fail closed). Node has no synchronous resolver, so the synchronous `validateArg`, `validateArgMode` and `validateArgWithCustomTypes` refuse a hostname under `block_internal` with `hostname cannot be verified without DNS resolution; pass an IP literal or use validateArgAsync`, and `validateArgAsync` / `validateArgWithCustomTypesAsync` perform the lookup (`dns.promises.lookup`, 2 s bound). The JavaScript runtime is therefore stricter than the Rust, Go and Python runtimes: the synchronous build and execute paths accept only IP literals and CIDRs for a `block_internal` target
+- **Egress lint**: a manifest that reaches the network — `tool.network_egress = true`, an `[http]` or `[browser]` backend, or a binary in the egress list (`curl`, `wget`, `nmap`, `nc`, `ncat`, `netcat`, `masscan`, `telnet`, `ssh`, `ping`, `fping`, `httpie`, `http`, `wfuzz`, `ffuf`, `hydra`, `nikto`, matched by basename in `tool.binary`, `exec[0]` or the template's first token) — must set `block_internal = true` on every `scope_target`, `url`, `ip_address` and `cidr` argument or it is refused at load. The loaders extend the lint to custom types from `toolclad.toml`: a custom type cannot carry `block_internal`, so a custom-typed network target in an egress manifest is refused at load (`validateManifestWithCustomTypes(manifest, customTypes)` runs the same check on an in-memory manifest). An `executor`-only manifest is only an egress manifest when it declares `network_egress = true`
 
 ## Packages
 
@@ -89,7 +92,7 @@ Each implementation provides:
 - **14 type validators** -- 10 core + 4 extended, all with injection sanitization
 - **Command construction** -- template interpolation with mappings, conditionals, defaults
 - **Execution** -- direct argv dispatch, process group kill on timeout, SHA-256 evidence hashing
-- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
+- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text (custom parser scripts are refused at load)
 - **Output schema validation** -- validates parsed results against `[output.schema]`
 - **MCP schema generation** -- auto-generate inputSchema + outputSchema for LLM tool use
 - **Evidence envelopes** -- structured JSON with scan_id, timestamps, exit_code, stderr, output_hash
@@ -153,6 +156,8 @@ allowed = ["info", "low", "medium", "high", "critical"]
 
 Reference in manifests: `type = "service_protocol"`
 
+`loadManifest` (and therefore `toolclad validate`, `run`, `test` and `schema`) discovers `toolclad.toml` the same way it discovers `scope/scope.toml`: `TOOLCLAD_CONFIG_FILE` if set (an unreadable path is an error), else `toolclad.toml` searched upward from the manifest's directory. No file means no custom types. Every argument type is checked at load: a type that is neither built in nor defined in `toolclad.toml` is refused with `unknown type '<t>' for argument '<n>'`. The file is strict: unknown keys are refused, a custom type's `base` must be a built-in type, and a custom type may not shadow a built-in name. Embedders that already hold the types pass them as `loadManifestWithOptions(path, { customTypes })`; `loadManifestFromString(source, { baseDir })` loads from TOML text.
+
 ## Output Handling
 
 ### Built-in Parsers
@@ -165,14 +170,13 @@ Reference in manifests: `type = "service_protocol"`
 | `builtin:jsonl` | Nuclei, streaming tools |
 | `builtin:text` | Simple unstructured output (default) |
 
-### Custom Parsers
+### Custom Parsers (Not Supported)
 
-```toml
-[output]
-parser = "scripts/parse-outputs/parse-nmap-xml.py"
-```
-
-Custom parsers receive the raw output file path as `argv[1]` and emit JSON to stdout.
+A `parser` value other than the `builtin:*` names is refused at manifest load
+(`custom output parsers are not supported by the reference runtimes`). Earlier
+releases accepted and silently ignored it. Have the tool emit JSON, JSONL, CSV
+or XML and describe the result with `[output.schema]`, which is validated
+fail-closed.
 
 ### Evidence Envelope
 

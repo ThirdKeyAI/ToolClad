@@ -1,8 +1,14 @@
 """ToolClad: Declarative Tool Interface Contracts for Agentic Runtimes."""
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from toolclad.manifest import (
+    MANIFEST_KEYS,
+    CustomTypeDef,
+    discover_custom_types,
+    load_custom_types,
+    load_manifest_from_str,
+    LoadOptions,
     Manifest,
     HttpDef,
     McpProxyDef,
@@ -13,12 +19,49 @@ from toolclad.manifest import (
     BrowserCommandDef,
     BrowserScopeDef,
     BrowserStateDef,
+    find_unknown_keys,
     load_manifest,
+    load_manifest_with_options,
+    validate_manifest_with_custom_types,
 )
-from toolclad.validator import validate_arg
-from toolclad.executor import build_command, execute, inject_template_vars
+from toolclad.validator import (
+    ValidationError,
+    validate_arg,
+    validate_arg_in,
+    validate_arg_mode,
+    validate_arg_with_custom_types,
+    validate_arg_with_custom_types_mode,
+)
+from toolclad.scope import (
+    ScopeDef,
+    ScopeError,
+    check_scope,
+    discover_scope,
+    host_matches_rule,
+    ip_in_cidr,
+    load_scope_file,
+    url_host_in_scope,
+)
+from toolclad.executor import (
+    GateDecision,
+    PolicyDenied,
+    approve_gate,
+    default_gate,
+    build_command,
+    build_command_argv,
+    compile_command,
+    execute,
+    inject_template_vars,
+    tokenize_template,
+)
 
 __all__ = [
+    "MANIFEST_KEYS",
+    "CustomTypeDef",
+    "discover_custom_types",
+    "load_custom_types",
+    "load_manifest_from_str",
+    "LoadOptions",
     "Manifest",
     "HttpDef",
     "McpProxyDef",
@@ -29,9 +72,32 @@ __all__ = [
     "BrowserCommandDef",
     "BrowserScopeDef",
     "BrowserStateDef",
+    "find_unknown_keys",
     "load_manifest",
+    "load_manifest_with_options",
+    "validate_manifest_with_custom_types",
+    "ValidationError",
     "validate_arg",
+    "validate_arg_in",
+    "ScopeDef",
+    "ScopeError",
+    "check_scope",
+    "discover_scope",
+    "host_matches_rule",
+    "ip_in_cidr",
+    "load_scope_file",
+    "url_host_in_scope",
+    "validate_arg_mode",
+    "validate_arg_with_custom_types",
+    "validate_arg_with_custom_types_mode",
+    "GateDecision",
+    "PolicyDenied",
+    "approve_gate",
+    "default_gate",
     "build_command",
+    "build_command_argv",
+    "compile_command",
     "execute",
     "inject_template_vars",
+    "tokenize_template",
 ]

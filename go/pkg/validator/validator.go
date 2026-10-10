@@ -4,22 +4,77 @@ package validator
 import (
 	"fmt"
 	"math"
-	"net"
-	"net/url"
+	"net/netip"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/thirdkeyai/toolclad/pkg/manifest"
+	"github.com/thirdkeyai/toolclad/pkg/scope"
+)
+
+// init registers the strict entry point as the manifest loader's validator
+// for per-argument defaults, so a default that fails its own type (built-in
+// or custom) is a load error rather than a confusing refusal at run time.
+func init() {
+	manifest.HostPolicy = CheckLiteralHost
+	manifest.DefaultValidator = func(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, s *scope.ScopeDef) error {
+		d := *def
+		if d.Type == "" {
+			d.Type = "string"
+		}
+		_, err := ValidateArgWithCustomTypesIn(&d, value, customTypes, false, s)
+		return err
+	}
+}
+
+// Strict string forms for the numeric and duration types, checked before
+// any parsing so lenient parser behavior (whitespace, underscores, hex,
+// NaN, infinity) can never admit a value.
+var (
+	integerRe  = regexp.MustCompile(`^[+-]?[0-9]+$`)
+	portRe     = regexp.MustCompile(`^[0-9]+$`)
+	numberRe   = regexp.MustCompile(`^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
+	secondsRe  = regexp.MustCompile(`^[0-9]+$`)
+	durationRe = regexp.MustCompile(`^(?:[0-9]+h)?(?:[0-9]+m)?(?:[0-9]+s)?(?:[0-9]+ms)?$`)
 )
 
 // shellMetacharacters contains characters that indicate injection attempts.
 const shellMetacharacters = ";|&$`(){}[]<>!\n\r"
 
+// hostnameRe is the structural hostname check: dot-separated LDH labels of
+// 1-63 characters that neither start nor end with a hyphen. No trailing dot
+// is admitted, so the rightmost label is always the TLD that
+// tldNotAllNumeric inspects.
 var hostnameRe = regexp.MustCompile(
-	`^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.)*(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.?$`,
+	`^(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.)*(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)$`,
 )
+
+// defaultURLSchemes is the scheme allowlist used when an arg sets none.
+var defaultURLSchemes = []string{"http", "https"}
+
+// deniedURLSchemes are never permitted, even when a manifest lists one in
+// `schemes`: each either executes content, reads local files, or speaks a
+// protocol that can be driven at an internal service by a crafted URL.
+var deniedURLSchemes = map[string]bool{
+	"javascript": true,
+	"data":       true,
+	"file":       true,
+	"blob":       true,
+	"about":      true,
+	"gopher":     true,
+	"dict":       true,
+	"ftp":        true,
+	"ldap":       true,
+	"jar":        true,
+	"netdoc":     true,
+	"mailto":     true,
+	"ws":         true,
+	"wss":        true,
+}
 
 // ValidationError represents a failed argument validation.
 type ValidationError struct {
@@ -50,13 +105,181 @@ func CheckInjection(value string) error {
 	return nil
 }
 
-// ValidateArg validates a value against an argument definition and returns the cleaned value.
+// stringDerived lists the types whose value is passed to the tool as text and
+// therefore gets the value-hygiene rules (control characters, quotes and
+// backslashes, whitespace, leading dash) before type-specific parsing.
+var stringDerived = map[string]bool{
+	"string":          true,
+	"path":            true,
+	"credential_file": true,
+	"regex_match":     true,
+	"url":             true,
+	"scope_target":    true,
+	"duration":        true,
+	"msf_options":     true,
+}
+
+// numericTypes get the leading-dash rule applied to their output value, after
+// range checks and clamping.
+var numericTypes = map[string]bool{
+	"integer": true,
+	"number":  true,
+	"port":    true,
+}
+
+// ValidateArg validates a value against an argument definition in template
+// mode (the strict default: whitespace is always rejected) and returns the
+// cleaned value.
 func ValidateArg(def *manifest.ArgDef, value string) (string, error) {
+	return ValidateArgMode(def, value, false)
+}
+
+// ValidateArgMode validates a value against an argument definition. execMode
+// must be true only when the manifest declared `exec = [...]` directly; it is
+// the sole condition under which `allow_whitespace = true` is honored, because
+// only the exec form guarantees that a value stays one argv element.
+func ValidateArgMode(def *manifest.ArgDef, value string, execMode bool) (string, error) {
+	return ValidateArgIn(def, value, execMode, nil)
+}
+
+// ValidateArgIn is the full entry point: ValidateArgMode plus the project
+// scope consulted when the argument sets scope_check = true. A nil scope
+// with scope_check set is a fail-closed refusal. Order: hygiene, type
+// parse, host/IP policy (block_internal), then scope.
+func ValidateArgIn(def *manifest.ArgDef, value string, execMode bool, sc *scope.ScopeDef) (string, error) {
 	handler, ok := typeHandlers[def.Type]
 	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("unknown type: %q", def.Type))
 	}
-	return handler(def, value)
+	// NUL is rejected for every type, enum and numerics included.
+	if strings.ContainsRune(value, 0) {
+		return "", newErr(def.Name, "must not contain NUL bytes")
+	}
+	if stringDerived[def.Type] {
+		if err := checkHygiene(def, value, execMode); err != nil {
+			return "", err
+		}
+	}
+	out, err := handler(def, value)
+	if err != nil {
+		return "", err
+	}
+	if numericTypes[def.Type] {
+		if err := checkLeadingDash(def, out); err != nil {
+			return "", err
+		}
+	}
+	if def.ScopeCheck {
+		if err := checkScope(def, out, sc); err != nil {
+			return "", err
+		}
+	}
+	return out, nil
+}
+
+// checkScope applies scope_check to a validated value: the host for a url,
+// the value itself for scope_target, ip_address and cidr.
+func checkScope(def *manifest.ArgDef, value string, sc *scope.ScopeDef) error {
+	if !manifest.ScopeCheckSupported(def.Type) {
+		return newErr(def.Name, fmt.Sprintf("scope_check is not supported for type '%s'", def.Type))
+	}
+	subject := value
+	if def.Type == "url" {
+		host, err := urlHost(value)
+		if err != nil {
+			return newErr(def.Name, err.Error())
+		}
+		subject = host
+	}
+	if err := scope.Check(sc, subject); err != nil {
+		return newErr(def.Name, err.Error())
+	}
+	return nil
+}
+
+// urlHost extracts the host of a url value that validateURL has accepted,
+// with any IPv6 brackets and port removed.
+func urlHost(value string) (string, error) {
+	_, rest, found := strings.Cut(value, "://")
+	if !found {
+		return "", fmt.Errorf("invalid URL: %q (expected scheme://host)", value)
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	host, _, err := splitURLHostPort(rest)
+	return host, err
+}
+
+// checkHygiene applies the string-derived value rules in order: control
+// characters, quotes and backslashes, whitespace, leading dash.
+func checkHygiene(def *manifest.ArgDef, value string, execMode bool) error {
+	// Control characters are rejected unconditionally: every C0 character
+	// (tab, newline and carriage return included), DEL, and the C1 range. A
+	// tool argument never needs a control byte, and CR/LF are the
+	// line-injection characters.
+	for _, r := range value {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return newErr(def.Name, "must not contain control characters")
+		}
+	}
+	if strings.ContainsAny(value, `'"\`) {
+		if def.Type == "scope_target" && strings.Contains(value, `\`) {
+			return newErr(def.Name, fmt.Sprintf("scope_target must not contain backslash escape sequences: %q", value))
+		}
+		return newErr(def.Name, "must not contain quote or backslash characters")
+	}
+	// Whitespace: msf_options uses a space as its KEY VALUE separator, and an
+	// arg may opt in with allow_whitespace when the manifest declared exec.
+	// Either way only the ASCII space U+0020 is permitted; a non-breaking or
+	// exotic space is a homoglyph, never a separator. url never permits any.
+	spaceAllowed := def.Type == "msf_options" ||
+		(def.AllowWhitespace && execMode && def.Type != "url")
+	for _, r := range value {
+		if unicode.IsSpace(r) && !(spaceAllowed && r == ' ') {
+			return newErr(def.Name, "must not contain whitespace")
+		}
+	}
+	return checkLeadingDash(def, value)
+}
+
+// checkLeadingDash rejects a value that would be read as an option by the tool.
+func checkLeadingDash(def *manifest.ArgDef, value string) error {
+	if def.AllowLeadingDash {
+		return nil
+	}
+	if strings.HasPrefix(value, "-") || strings.HasPrefix(value, "+") {
+		return newErr(def.Name, "must not start with '-' or '+' (set allow_leading_dash = true to permit)")
+	}
+	return nil
+}
+
+// AnchorPattern rewrites a manifest `pattern` so it must match the whole
+// value: one leading `^` and one trailing unescaped `$` are stripped, then
+// the pattern is wrapped as `^(?:<pat>)$`.
+func AnchorPattern(pat string) string {
+	pat = strings.TrimPrefix(pat, "^")
+	if strings.HasSuffix(pat, "$") {
+		// Count the backslashes immediately before the final `$`; an odd
+		// count means the `$` is escaped and is a literal, not an anchor.
+		n := 0
+		for i := len(pat) - 2; i >= 0 && pat[i] == '\\'; i-- {
+			n++
+		}
+		if n%2 == 0 {
+			pat = pat[:len(pat)-1]
+		}
+	}
+	return "^(?:" + pat + ")$"
+}
+
+// compilePattern compiles an anchored manifest pattern.
+func compilePattern(def *manifest.ArgDef) (*regexp.Regexp, error) {
+	re, err := regexp.Compile(AnchorPattern(def.Pattern))
+	if err != nil {
+		return nil, newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+	}
+	return re, nil
 }
 
 // typeHandler is a function that validates a value for a specific type.
@@ -102,9 +325,9 @@ func validateString(def *manifest.ArgDef, value string) (string, error) {
 		return "", newErr(def.Name, err.Error())
 	}
 	if def.Pattern != "" {
-		re, err := regexp.Compile(def.Pattern)
+		re, err := compilePattern(def)
 		if err != nil {
-			return "", newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+			return "", err
 		}
 		if !re.MatchString(value) {
 			return "", newErr(def.Name, fmt.Sprintf("value %q does not match pattern: %s", value, def.Pattern))
@@ -114,40 +337,37 @@ func validateString(def *manifest.ArgDef, value string) (string, error) {
 }
 
 func validateInteger(def *manifest.ArgDef, value string) (string, error) {
+	if !integerRe.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("expected integer, got: %q", value))
+	}
 	num, err := strconv.Atoi(value)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected integer, got: %q", value))
 	}
 
-	if def.Min != nil || def.Max != nil {
-		lo := num
-		hi := num
-		if def.Min != nil {
-			lo = *def.Min
+	// Only a declared bound participates in clamping or range checking.
+	if def.Clamp {
+		if def.Min != nil && num < *def.Min {
+			num = *def.Min
 		}
-		if def.Max != nil {
-			hi = *def.Max
+		if def.Max != nil && num > *def.Max {
+			num = *def.Max
 		}
-		if def.Clamp {
-			if num < lo {
-				num = lo
-			}
-			if num > hi {
-				num = hi
-			}
-		} else {
-			if def.Min != nil && num < lo {
-				return "", newErr(def.Name, fmt.Sprintf("value %d is below minimum %d", num, lo))
-			}
-			if def.Max != nil && num > hi {
-				return "", newErr(def.Name, fmt.Sprintf("value %d is above maximum %d", num, hi))
-			}
+	} else {
+		if def.Min != nil && num < *def.Min {
+			return "", newErr(def.Name, fmt.Sprintf("value %d is below minimum %d", num, *def.Min))
+		}
+		if def.Max != nil && num > *def.Max {
+			return "", newErr(def.Name, fmt.Sprintf("value %d is above maximum %d", num, *def.Max))
 		}
 	}
 	return strconv.Itoa(num), nil
 }
 
 func validateNumber(def *manifest.ArgDef, value string) (string, error) {
+	if !numberRe.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("expected number, got: %q", value))
+	}
 	num, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected number, got: %q", value))
@@ -185,10 +405,22 @@ func validateNumber(def *manifest.ArgDef, value string) (string, error) {
 			return "", newErr(def.Name, fmt.Sprintf("value %g is above maximum %g", num, *hi))
 		}
 	}
-	return strconv.FormatFloat(num, 'g', -1, 64), nil
+	return formatNumber(num), nil
+}
+
+// formatNumber renders the shortest round-trip form of num, with integral
+// values written without an exponent (1e2 becomes 100, 0.50 becomes 0.5).
+func formatNumber(num float64) string {
+	if num == math.Trunc(num) {
+		return strconv.FormatFloat(num, 'f', -1, 64)
+	}
+	return strconv.FormatFloat(num, 'g', -1, 64)
 }
 
 func validatePort(def *manifest.ArgDef, value string) (string, error) {
+	if !portRe.MatchString(value) {
+		return "", newErr(def.Name, fmt.Sprintf("expected port number, got: %q", value))
+	}
 	port, err := strconv.Atoi(value)
 	if err != nil {
 		return "", newErr(def.Name, fmt.Sprintf("expected port number, got: %q", value))
@@ -219,31 +451,34 @@ func validateEnum(def *manifest.ArgDef, value string) (string, error) {
 	return "", newErr(def.Name, fmt.Sprintf("value %q not in allowed values: %v", value, def.Allowed))
 }
 
+// isValidHostname is the structural hostname check plus the rule that the
+// rightmost label is not all digits — no valid TLD is numeric (RFC 3696
+// §2), which also stops dotted-decimal IP forms from passing as names.
 func isValidHostname(value string) bool {
-	return hostnameRe.MatchString(value) && len(value) <= 253
+	return len(value) <= 253 && hostnameRe.MatchString(value) && tldNotAllNumeric(value)
 }
 
 func isValidIP(value string) bool {
-	return net.ParseIP(value) != nil
+	_, ok := parseCanonicalIP(value)
+	return ok
+}
+
+// parseCanonicalCIDR parses only canonical CIDR text: a canonical address
+// (see parseCanonicalIP) followed by a decimal prefix length in range.
+func parseCanonicalCIDR(value string) (netip.Prefix, bool) {
+	if !strings.Contains(value, "/") {
+		return netip.Prefix{}, false
+	}
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil || prefix.Addr().Zone() != "" {
+		return netip.Prefix{}, false
+	}
+	return prefix, true
 }
 
 func isValidCIDR(value string) bool {
-	if !strings.Contains(value, "/") {
-		return false
-	}
-	_, _, err := net.ParseCIDR(value)
-	return err == nil
-}
-
-// hasPunycodeLabel returns true if any DNS label in `host` is an A-label
-// (xn-- prefix, case-insensitive). Used to defend against IDN homoglyph bypass.
-func hasPunycodeLabel(host string) bool {
-	for _, label := range strings.Split(host, ".") {
-		if len(label) >= 4 && strings.EqualFold(label[:4], "xn--") {
-			return true
-		}
-	}
-	return false
+	_, ok := parseCanonicalCIDR(value)
+	return ok
 }
 
 func isASCII(s string) bool {
@@ -305,33 +540,201 @@ func validateScopeTarget(def *manifest.ArgDef, value string) (string, error) {
 		return "", newErr(def.Name, fmt.Sprintf("scope_target must not contain punycode (xn--) labels — IDN/IDNA hostnames are rejected to prevent homoglyph bypass; gate IDN registration upstream if needed: %q", value))
 	}
 
-	if !isValidIP(value) && !isValidCIDR(value) && !isValidHostname(value) {
+	// Canonical IP literals only (see parseCanonicalIP): the egress policy
+	// is applied to the literal address.
+	if addr, ok := parseCanonicalIP(value); ok {
+		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+
+	// CIDR ranges: the policy is tested for overlap with every blocked
+	// range, so a supernet cannot carry a blocked range past the check.
+	if prefix, ok := parseCanonicalCIDR(value); ok {
+		if err := enforceCIDRPolicy(def.Name, prefix, def.BlockInternal); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+
+	// Name-side policy, in order: the internal-name denylist (always), an
+	// IP literal embedded in the leading labels (range policy on that
+	// address), the non-canonical literal rule, the structural hostname
+	// check, and finally resolution under block_internal.
+	if err := enforceInternalName(def.Name, value); err != nil {
+		return "", err
+	}
+	if addr, ok := embeddedIPLiteral(value); ok {
+		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+			return "", err
+		}
+	}
+
+	// A non-canonical IP-literal encoding must not slip through as a
+	// "hostname": a downstream resolver would expand it to an address. No
+	// legitimate hostname is all-numeric labels or a 0x-prefixed hex literal.
+	if looksLikeIPLiteral(value) {
+		return "", newErr(def.Name, fmt.Sprintf("scope_target looks like a non-canonical IP literal; use dotted-quad IPv4 or standard IPv6: %q", value))
+	}
+
+	if !isValidHostname(value) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid scope target: %q (must be a valid IP, CIDR, or hostname)", value))
+	}
+	if def.BlockInternal {
+		if err := enforceResolvedPolicy(def.Name, value); err != nil {
+			return "", err
+		}
 	}
 	return value, nil
 }
 
+// validateURL is the structural url validator. The string-derived hygiene
+// rules (NUL, control characters, quotes and backslash, whitespace — never
+// permitted for url — and the leading dash) have already run in
+// ValidateArgMode; the shell-metacharacter blocklist here rejects `{` and
+// `}` so a url value can never carry a {_secret:…} reference. The rest is a
+// deliberate hand parse rather than net/url, which accepts any scheme,
+// spaces in the path and other forms a fetcher would happily act on.
 func validateURL(def *manifest.ArgDef, value string) (string, error) {
 	if err := CheckInjection(value); err != nil {
 		return "", newErr(def.Name, err.Error())
 	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", newErr(def.Name, fmt.Sprintf("invalid URL: %q", value))
+
+	// scheme://rest — a value without "://" is not a URL.
+	scheme, rest, found := strings.Cut(value, "://")
+	if !found {
+		return "", newErr(def.Name, fmt.Sprintf("invalid URL: %q (expected scheme://host)", value))
 	}
-	if len(def.Schemes) > 0 {
-		found := false
-		for _, s := range def.Schemes {
-			if s == parsed.Scheme {
-				found = true
-				break
+	scheme = strings.ToLower(scheme)
+
+	// Scheme allowlist: def.Schemes when non-empty, else http and https.
+	allowed := def.Schemes
+	if len(allowed) == 0 {
+		allowed = defaultURLSchemes
+	}
+	schemeAllowed := false
+	for _, s := range allowed {
+		if strings.ToLower(s) == scheme {
+			schemeAllowed = true
+			break
+		}
+	}
+	if !schemeAllowed {
+		return "", newErr(def.Name, fmt.Sprintf("URL scheme %q not in allowed schemes: %v", scheme, allowed))
+	}
+
+	// Explicit denial, even when a manifest lists the scheme in `schemes`.
+	if deniedURLSchemes[scheme] {
+		return "", newErr(def.Name, fmt.Sprintf("URL scheme %q is never permitted", scheme))
+	}
+
+	// Userinfo: an "@" before the first "/" of the authority hides the real
+	// host from a human reviewer and is a classic SSRF decoy.
+	authority := rest
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		authority = rest[:i]
+	}
+	if strings.Contains(authority, "@") {
+		return "", newErr(def.Name, "URL must not contain userinfo (user:password@host)")
+	}
+
+	// Host: everything between "://" and the first "/", "?" or "#".
+	hostport := rest
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		hostport = rest[:i]
+	}
+	host, port, err := splitURLHostPort(hostport)
+	if err != nil {
+		return "", newErr(def.Name, err.Error())
+	}
+	if port != "" {
+		n, convErr := strconv.Atoi(port)
+		if convErr != nil || !allASCIIDigits(port) {
+			return "", newErr(def.Name, fmt.Sprintf("invalid URL port: %q", port))
+		}
+		if n < 1 || n > 65535 {
+			return "", newErr(def.Name, fmt.Sprintf("URL port %d out of range 1-65535", n))
+		}
+	}
+
+	// Host policy: punycode, then a literal goes through the range table
+	// directly; a name goes through the internal-name denylist, the
+	// embedded-literal rule, the non-canonical literal rule, the structural
+	// check and, under block_internal, resolution of every answer.
+	if hasPunycodeLabel(host) {
+		return "", newErr(def.Name, "URL host must not contain punycode (xn--) labels")
+	}
+	if addr, ok := parseCanonicalIP(host); ok {
+		if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+			return "", err
+		}
+	} else {
+		if err := enforceInternalName(def.Name, host); err != nil {
+			return "", err
+		}
+		if addr, ok := embeddedIPLiteral(host); ok {
+			if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+				return "", err
 			}
 		}
-		if !found {
-			return "", newErr(def.Name, fmt.Sprintf("URL scheme %q not in allowed schemes: %v", parsed.Scheme, def.Schemes))
+		if looksLikeIPLiteral(host) {
+			return "", newErr(def.Name, fmt.Sprintf("URL host looks like a non-canonical IP literal; use dotted-quad IPv4 or a hostname: %q", host))
+		}
+		if !isValidHostname(host) {
+			return "", newErr(def.Name, fmt.Sprintf("URL host is not a valid hostname or IP literal: %q", host))
+		}
+		if def.BlockInternal {
+			if err := enforceResolvedPolicy(def.Name, host); err != nil {
+				return "", err
+			}
 		}
 	}
+
+	// scope_check, when set, is applied to the host by ValidateArgIn.
 	return value, nil
+}
+
+// splitURLHostPort separates the authority (already stripped of any path,
+// query or fragment) into host and optional port. A bracketed IPv6 literal
+// is unwrapped and must be a canonical IPv6 address; an unbracketed value
+// splits at its last ":" so an unbracketed IPv6 form can never pass as a
+// host. An empty host is an error, as is a ":" with nothing after it; the
+// port, when present, is returned unparsed for the caller to range-check.
+func splitURLHostPort(hostport string) (host, port string, err error) {
+	if hostport == "" {
+		return "", "", fmt.Errorf("URL host must not be empty")
+	}
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.IndexByte(hostport, ']')
+		if end < 0 {
+			return "", "", fmt.Errorf("URL host has an unterminated IPv6 bracket: %q", hostport)
+		}
+		host = hostport[1:end]
+		addr, ok := parseCanonicalIP(host)
+		if !ok || !addr.Is6() {
+			return "", "", fmt.Errorf("URL host is not a valid IPv6 literal: %q", host)
+		}
+		tail := hostport[end+1:]
+		if tail == "" {
+			return host, "", nil
+		}
+		if !strings.HasPrefix(tail, ":") {
+			return "", "", fmt.Errorf("unexpected characters after IPv6 literal: %q", tail)
+		}
+		port = tail[1:]
+	} else if i := strings.LastIndexByte(hostport, ':'); i >= 0 {
+		host, port = hostport[:i], hostport[i+1:]
+	} else {
+		return hostport, "", nil
+	}
+	if host == "" {
+		return "", "", fmt.Errorf("URL host must not be empty")
+	}
+	if port == "" {
+		return "", "", fmt.Errorf("URL port must not be empty after ':' in %q", hostport)
+	}
+	return host, port, nil
 }
 
 func validatePath(def *manifest.ArgDef, value string) (string, error) {
@@ -342,22 +745,30 @@ func validatePath(def *manifest.ArgDef, value string) (string, error) {
 	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
 		return "", newErr(def.Name, "path must be relative, not absolute")
 	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
-		}
-	}
-	for _, part := range strings.Split(value, "\\") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
-		}
+	if hasDotDotComponent(value) {
+		return "", newErr(def.Name, fmt.Sprintf("path traversal detected in: %q", value))
 	}
 	return value, nil
 }
 
+// hasDotDotComponent reports whether any path component, splitting on both
+// '/' and '\', is exactly "..".
+func hasDotDotComponent(value string) bool {
+	for _, part := range strings.FieldsFunc(value, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func validateIPAddress(def *manifest.ArgDef, value string) (string, error) {
-	if net.ParseIP(value) == nil {
+	addr, ok := parseCanonicalIP(value)
+	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("invalid IP address: %q", value))
+	}
+	if err := enforceIPPolicy(def.Name, addr, def.BlockInternal); err != nil {
+		return "", err
 	}
 	return value, nil
 }
@@ -366,8 +777,12 @@ func validateCIDR(def *manifest.ArgDef, value string) (string, error) {
 	if !strings.Contains(value, "/") {
 		return "", newErr(def.Name, fmt.Sprintf("CIDR notation requires '/': %q", value))
 	}
-	if _, _, err := net.ParseCIDR(value); err != nil {
+	prefix, ok := parseCanonicalCIDR(value)
+	if !ok {
 		return "", newErr(def.Name, fmt.Sprintf("invalid CIDR: %q", value))
+	}
+	if err := enforceCIDRPolicy(def.Name, prefix, def.BlockInternal); err != nil {
+		return "", err
 	}
 	return value, nil
 }
@@ -403,10 +818,8 @@ func validateCredentialFile(def *manifest.ArgDef, value string) (string, error) 
 	if strings.HasPrefix(value, "/") || (len(value) >= 2 && value[1] == ':') {
 		return "", newErr(def.Name, "credential file must be a relative path")
 	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", newErr(def.Name, fmt.Sprintf("path traversal detected: %q", value))
-		}
+	if hasDotDotComponent(value) {
+		return "", newErr(def.Name, fmt.Sprintf("path traversal detected: %q", value))
 	}
 	info, err := os.Stat(value)
 	if err != nil {
@@ -419,13 +832,12 @@ func validateCredentialFile(def *manifest.ArgDef, value string) (string, error) 
 }
 
 func validateDuration(def *manifest.ArgDef, value string) (string, error) {
-	// Plain integer seconds
-	if _, err := strconv.Atoi(value); err == nil {
+	// Plain integer seconds, or h/m/s/ms components in that order. Go's
+	// `$` matches only at the end of the text, so a trailing newline fails.
+	if secondsRe.MatchString(value) {
 		return value, nil
 	}
-	// Duration with suffix
-	durationRe := regexp.MustCompile(`^(?:\d+h)?(?:\d+m)?(?:\d+s)?(?:\d+ms)?$`)
-	if !durationRe.MatchString(value) || value == "" {
+	if value == "" || !durationRe.MatchString(value) {
 		return "", newErr(def.Name, fmt.Sprintf("invalid duration: %q (e.g. '30', '5m', '2h', '1h30m', '500ms')", value))
 	}
 	return value, nil
@@ -438,9 +850,9 @@ func validateRegexMatch(def *manifest.ArgDef, value string) (string, error) {
 	if def.Pattern == "" {
 		return "", newErr(def.Name, "regex_match type requires a 'pattern' field")
 	}
-	re, err := regexp.Compile(def.Pattern)
+	re, err := compilePattern(def)
 	if err != nil {
-		return "", newErr(def.Name, fmt.Sprintf("invalid pattern %q: %v", def.Pattern, err))
+		return "", err
 	}
 	if !re.MatchString(value) {
 		return "", newErr(def.Name, fmt.Sprintf("value %q does not match required pattern: %s", value, def.Pattern))
@@ -448,35 +860,91 @@ func validateRegexMatch(def *manifest.ArgDef, value string) (string, error) {
 	return value, nil
 }
 
-// ValidateArgWithCustomTypes validates using custom type definitions.
+// ValidateArgWithCustomTypes validates using custom type definitions in
+// template mode.
 func ValidateArgWithCustomTypes(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef) (string, error) {
-	if ct, ok := customTypes[def.Type]; ok {
-		handler, ok := typeHandlers[ct.Base]
-		if !ok {
-			return "", newErr(def.Name, fmt.Sprintf("custom type '%s' has invalid base type '%s'", def.Type, ct.Base))
-		}
-		// Create synthetic def with merged constraints
-		synthetic := *def
-		synthetic.Type = ct.Base
-		if len(ct.Allowed) > 0 {
-			synthetic.Allowed = ct.Allowed
-		}
-		if ct.Pattern != "" {
-			synthetic.Pattern = ct.Pattern
-		}
-		if ct.Min != nil {
-			synthetic.Min = ct.Min
-		}
-		if ct.Max != nil {
-			synthetic.Max = ct.Max
-		}
-		if ct.MinFloat != nil {
-			synthetic.MinFloat = ct.MinFloat
-		}
-		if ct.MaxFloat != nil {
-			synthetic.MaxFloat = ct.MaxFloat
-		}
-		return handler(&synthetic, value)
+	return ValidateArgWithCustomTypesMode(def, value, customTypes, false)
+}
+
+// ValidateArgWithCustomTypesMode validates using custom type definitions.
+// A custom type is resolved to a synthetic definition with its base type and
+// merged constraints, then validated exactly like a built-in type, so value
+// hygiene and pattern anchoring apply to custom types too.
+func ValidateArgWithCustomTypesMode(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, execMode bool) (string, error) {
+	return ValidateArgWithCustomTypesIn(def, value, customTypes, execMode, nil)
+}
+
+// ValidateArgWithCustomTypesIn is ValidateArgWithCustomTypesMode with the
+// project scope for scope_check (see ValidateArgIn).
+func ValidateArgWithCustomTypesIn(def *manifest.ArgDef, value string, customTypes map[string]*manifest.CustomTypeDef, execMode bool, sc *scope.ScopeDef) (string, error) {
+	ct, ok := customTypes[def.Type]
+	if !ok {
+		return ValidateArgIn(def, value, execMode, sc)
 	}
-	return ValidateArg(def, value)
+	if _, ok := typeHandlers[ct.Base]; !ok {
+		return "", newErr(def.Name, fmt.Sprintf("custom type '%s' has invalid base type '%s'", def.Type, ct.Base))
+	}
+	// Create synthetic def with merged constraints
+	synthetic := *def
+	synthetic.Type = ct.Base
+	if len(ct.Allowed) > 0 {
+		synthetic.Allowed = ct.Allowed
+	}
+	if ct.Pattern != "" {
+		synthetic.Pattern = ct.Pattern
+	}
+	if ct.Min != nil {
+		synthetic.Min = ct.Min
+	}
+	if ct.Max != nil {
+		synthetic.Max = ct.Max
+	}
+	if ct.MinFloat != nil {
+		synthetic.MinFloat = ct.MinFloat
+	}
+	if ct.MaxFloat != nil {
+		synthetic.MaxFloat = ct.MaxFloat
+	}
+	return ValidateArgIn(&synthetic, value, execMode, sc)
+}
+
+// ValidateManifestWithCustomTypes checks a loaded manifest against the
+// custom type table the CLI will read from toolclad.toml: every argument
+// type must be a built-in or a custom type with a built-in base, and the
+// egress lint is run with the custom types visible, so a custom type whose
+// base is a network target is refused in an egress manifest (a custom type
+// cannot carry block_internal). LoadManifest already runs the lint for the
+// built-in types; this is the entry point to call once custom types are
+// available.
+func ValidateManifestWithCustomTypes(m *manifest.Manifest, customTypes map[string]*manifest.CustomTypeDef) error {
+	names := make([]string, 0, len(m.Args))
+	for name := range m.Args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		def := m.Args[name]
+		if _, ok := typeHandlers[def.Type]; ok {
+			continue
+		}
+		ct, ok := customTypes[def.Type]
+		if !ok {
+			return fmt.Errorf("argument '%s' has unknown type '%s'", name, def.Type)
+		}
+		if _, ok := typeHandlers[ct.Base]; !ok {
+			return fmt.Errorf("argument '%s': custom type '%s' has invalid base type '%s'", name, def.Type, ct.Base)
+		}
+		if def.ScopeCheck && !manifest.ScopeCheckSupported(ct.Base) {
+			return fmt.Errorf("argument '%s': scope_check is not supported for type '%s'", name, ct.Base)
+		}
+		if def.Default != nil {
+			val := fmt.Sprintf("%v", def.Default)
+			if !(val == "" && ct.Base == "string") {
+				if _, err := ValidateArgWithCustomTypesIn(def, val, customTypes, false, m.Scope); err != nil {
+					return fmt.Errorf("argument '%s': invalid default %q: %w", name, val, err)
+				}
+			}
+		}
+	}
+	return m.LintEgress(customTypes)
 }

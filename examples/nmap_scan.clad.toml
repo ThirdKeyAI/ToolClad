@@ -1,5 +1,11 @@
 # ToolClad manifest: nmap network scanner
 # Demonstrates: enum types, command mappings, XML output parsing, evidence capture
+#
+# There is deliberately no free-form flag parameter. An argument whose value is
+# interpolated as nmap options is an option-injection channel: `-iL /etc/passwd`
+# reads arbitrary files into stderr and `--script=<path>` executes attacker Lua
+# inside a process that usually holds CAP_NET_RAW. Every supported invocation is
+# an entry in [command.mappings.scan_type] instead.
 
 [tool]
 name = "nmap_scan"
@@ -8,6 +14,7 @@ binary = "nmap"
 description = "Network port scanning and service detection"
 timeout_seconds = 600
 risk_tier = "low"
+network_egress = true
 
 [tool.cedar]
 resource = "Tool::NmapScan"
@@ -24,6 +31,10 @@ hash = "sha256"
 position = 1
 required = true
 type = "scope_target"
+# nmap connects to this target — default-deny internal/SSRF ranges (loopback,
+# private, cloud metadata). Under block_internal a hostname must resolve to a
+# public address, and a CIDR must not overlap a blocked range.
+block_internal = true
 description = "Target CIDR, IP, or hostname"
 
 [args.scan_type]
@@ -33,18 +44,22 @@ type = "enum"
 allowed = ["ping", "service", "version", "syn", "os_detect", "aggressive", "vuln_script"]
 description = "Type of scan to perform"
 
-[args.extra_flags]
-position = 3
-required = false
-type = "string"
-sanitize = ["injection"]
-default = ""
-description = "Additional nmap flags (must pass Gate approval)"
-
 # --- Command Construction ---
+#
+# Array form: every element is one argv entry, dispatched straight to execve.
+# `{_scan_type_flags}` is the only multi-token placeholder — its value comes
+# from the mapping table below, which is manifest-controlled, not agent-supplied.
 
 [command]
-template = "nmap {_scan_flags} --max-rate {max_rate} -oX {_output_file} --no-stylesheet -v {extra_flags} {target}"
+exec = [
+    "nmap",
+    "{_scan_type_flags}",
+    "--max-rate", "{max_rate}",
+    "-oX", "{_output_file}",
+    "--no-stylesheet",
+    "-v",
+    "{target}",
+]
 
 [command.defaults]
 max_rate = 1000
@@ -64,6 +79,7 @@ vuln_script = "-sV --script=vuln --script-timeout 60s"
 format = "xml"
 parser = "builtin:xml"
 envelope = true
+max_bytes = 8388608
 
 [output.schema]
 type = "object"

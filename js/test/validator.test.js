@@ -25,7 +25,7 @@ describe("validateArg - string", () => {
   });
 
   it("rejects injection in strings", () => {
-    assert.throws(() => validateArg({ type: "string" }, "foo;rm -rf /"), /Injection/);
+    assert.throws(() => validateArg({ type: "string" }, "foo;whoami"), /Injection/);
   });
 
   it("validates pattern constraint", () => {
@@ -128,9 +128,11 @@ describe("validateArg - scope_target", () => {
       () => validateArg({ type: "scope_target" }, " example.com"),
       /whitespace/
     );
+    // A tab is a control character (rule 2), which is checked before the
+    // whitespace rule.
     assert.throws(
       () => validateArg({ type: "scope_target" }, "\texample.com"),
-      /whitespace/
+      /control characters/
     );
   });
 
@@ -198,7 +200,15 @@ describe("validateArg - ip_address", () => {
 
   it("accepts valid IPv6", () => {
     assert.equal(validateArg({ type: "ip_address" }, "::1"), "::1");
-    assert.equal(validateArg({ type: "ip_address" }, "fe80::1"), "fe80::1");
+    assert.equal(
+      validateArg({ type: "ip_address" }, "2001:4860:4860::8888"),
+      "2001:4860:4860::8888"
+    );
+  });
+
+  it("refuses link-local even without block_internal", () => {
+    assert.throws(() => validateArg({ type: "ip_address" }, "fe80::1"), /always blocked/);
+    assert.throws(() => validateArg({ type: "ip_address" }, "169.254.169.254"), /always blocked/);
   });
 
   it("rejects invalid IPs", () => {
@@ -222,7 +232,17 @@ describe("validateArg - cidr", () => {
 describe("validateArg - number (float)", () => {
   it("accepts valid floats", () => {
     assert.equal(validateArg({ type: "number" }, "0.5"), 0.5);
-    assert.equal(validateArg({ type: "number" }, "-3.14"), -3.14);
+    assert.equal(
+      validateArg({ type: "number", allow_leading_dash: true }, "-3.14"),
+      -3.14
+    );
+  });
+
+  it("rejects a negative result unless allow_leading_dash is set", () => {
+    assert.throws(
+      () => validateArg({ type: "number" }, "-3.14"),
+      /must not start with '-' or '\+'/
+    );
   });
 
   it("rejects NaN and infinity", () => {

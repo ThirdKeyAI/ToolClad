@@ -89,7 +89,7 @@ Each implementation provides:
 - **14 type validators** -- 10 core + 4 extended, all with injection sanitization
 - **Command construction** -- template interpolation with mappings, conditionals, defaults
 - **Execution** -- direct argv dispatch, process group kill on timeout, SHA-256 evidence hashing
-- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text, custom scripts
+- **Output parsers** -- builtin:json, builtin:xml, builtin:csv, builtin:jsonl, builtin:text (custom parser scripts are refused at load)
 - **Output schema validation** -- validates parsed results against `[output.schema]`
 - **MCP schema generation** -- auto-generate inputSchema + outputSchema for LLM tool use
 - **Evidence envelopes** -- structured JSON with scan_id, timestamps, exit_code, stderr, output_hash
@@ -122,11 +122,11 @@ cd go && go run ./cmd/toolclad test ../examples/whois_lookup.clad.toml --arg tar
 | `port` | 1-65535 | Network ports |
 | `boolean` | Exactly `"true"` or `"false"` | Feature flags |
 | `enum` | Value in declared `allowed` list | Scan types |
-| `scope_target` | Injection-safe, no wildcards, valid IP/CIDR/hostname | Targets |
-| `url` | Valid URL, optional `schemes` restriction, `scope_check` | Web targets |
+| `scope_target` | Injection-safe, no wildcards, canonical IP/CIDR/hostname; link-local always blocked, `block_internal` blocks loopback/private/reserved ranges | Targets |
+| `url` | `scheme://host[:port]`; `schemes` allowlist (default `http`/`https`), dangerous schemes and userinfo refused, same host policy as `scope_target`, `scope_check` | Web targets |
 | `path` | No traversal (`../`), no absolute paths | File paths |
-| `ip_address` | Valid IPv4 or IPv6 | Addresses |
-| `cidr` | Valid CIDR notation (IPv4 + IPv6) | Network ranges |
+| `ip_address` | Canonical IPv4 or IPv6, same host policy as `scope_target` | Addresses |
+| `cidr` | Canonical CIDR notation (IPv4 + IPv6), host policy on the base address | Network ranges |
 
 ### Extended Types
 
@@ -165,14 +165,13 @@ Reference in manifests: `type = "service_protocol"`
 | `builtin:jsonl` | Nuclei, streaming tools |
 | `builtin:text` | Simple unstructured output (default) |
 
-### Custom Parsers
+### Custom Parsers (Not Supported)
 
-```toml
-[output]
-parser = "scripts/parse-outputs/parse-nmap-xml.py"
-```
-
-Custom parsers receive the raw output file path as `argv[1]` and emit JSON to stdout.
+A `parser` value other than the `builtin:*` names is refused at manifest load
+(`custom output parsers are not supported by the reference runtimes`). Earlier
+releases accepted and silently ignored it. Have the tool emit JSON, JSONL, CSV
+or XML and describe the result with `[output.schema]`, which is validated
+fail-closed.
 
 ### Evidence Envelope
 

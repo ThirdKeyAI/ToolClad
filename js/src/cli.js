@@ -1,22 +1,33 @@
 #!/usr/bin/env node
 
+import { createRequire } from "node:module";
 import { Command } from "commander";
-import { loadManifest } from "./manifest.js";
-import { buildCommand, execute, generateMcpSchema } from "./executor.js";
+import { loadManifest, loadManifestWithOptions } from "./manifest.js";
+// loadManifest discovers toolclad.toml (custom types) and checks every
+// argument type at load, so validate/run/test/schema all share one path.
+import { defaultGate, execute, generateMcpSchema } from "./executor.js";
+
+const { version } = createRequire(import.meta.url)("../package.json");
 
 const program = new Command();
 
 program
   .name("toolclad")
   .description("ToolClad manifest executor")
-  .version("0.1.0");
+  .version(version);
 
 program
   .command("validate <manifest>")
   .description("Validate a .clad.toml manifest file")
-  .action((manifestPath) => {
+  .option(
+    "--allow-unknown-keys",
+    "Downgrade unknown manifest keys from an error to a warning on stderr"
+  )
+  .action((manifestPath, opts) => {
     try {
-      const manifest = loadManifest(manifestPath);
+      const manifest = loadManifestWithOptions(manifestPath, {
+        allowUnknownKeys: opts.allowUnknownKeys === true,
+      });
       console.log(`${manifestPath}  OK  (tool: ${manifest.tool.name})`);
     } catch (err) {
       console.error(`${manifestPath}  ERROR: ${err.message}`);
@@ -28,11 +39,15 @@ program
   .command("run <manifest>")
   .description("Execute a tool using its manifest")
   .option("--arg <args...>", "Arguments as key=value pairs")
-  .action((manifestPath, opts) => {
+  .option(
+    "--approve",
+    "Approve this call: use the allow-all policy gate instead of the default gate"
+  )
+  .action(async (manifestPath, opts) => {
     try {
       const manifest = loadManifest(manifestPath);
       const args = parseArgs(opts.arg);
-      const result = execute(manifest, args);
+      const result = await execute(manifest, args, { approve: opts.approve === true });
       console.log(JSON.stringify(result, null, 2));
     } catch (err) {
       console.error(`Error: ${err.message}`);
@@ -58,22 +73,30 @@ program
   .command("test <manifest>")
   .description("Dry run: validate args and show constructed command")
   .option("--arg <args...>", "Arguments as key=value pairs")
-  .action((manifestPath, opts) => {
+  .action(async (manifestPath, opts) => {
     try {
       const manifest = loadManifest(manifestPath);
       const args = parseArgs(opts.arg);
-      const result = execute(manifest, args, { dryRun: true });
+      const result = await execute(manifest, args, { dryRun: true });
       console.log();
       console.log(`  Manifest:  ${manifestPath}`);
       console.log(`  Tool:      ${manifest.tool.name}`);
       console.log(`  Arguments: ${formatArgs(result.resolvedArgs)}`);
       console.log(`  Command:   ${result.command}`);
+      if (result.argv) {
+        console.log(`  Argv:      ${JSON.stringify(result.argv)}`);
+      }
       if (manifest.tool.cedar) {
         console.log(
           `  Cedar:     ${manifest.tool.cedar.resource} / ${manifest.tool.cedar.action}`
         );
       }
-      console.log(`  Timeout:   ${manifest.tool.timeout_seconds || 30}s`);
+      console.log(`  Timeout:   ${manifest.tool.timeout_seconds || 60}s`);
+      const gate = defaultGate(manifest, result.resolvedArgs || {});
+      console.log(`  Risk tier: ${manifest.tool.risk_tier || "(none)"}`);
+      console.log(
+        `  Approval:  ${gate.allowed ? "not required" : `required (${gate.reason}); pass --approve to run`}`
+      );
       console.log();
       console.log("  [dry run -- command not executed]");
       console.log();
@@ -102,4 +125,4 @@ function formatArgs(args) {
     .join(", ");
 }
 
-program.parse();
+await program.parseAsync();

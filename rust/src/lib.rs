@@ -16,7 +16,26 @@
 //! because the interface doesn't permit it.
 //!
 //! All string-based types reject shell metacharacters (`;|&$\`(){}[]<>!`)
-//! by default.
+//! by default. String-derived values (`string`, `path`, `credential_file`,
+//! `regex_match`, `url`, `scope_target`, `duration`, `msf_options`) are also
+//! refused if they contain NUL or control characters, quotes or backslashes,
+//! whitespace, or start with `-`/`+`, so a value can never be re-split into
+//! extra arguments or parsed by the target binary as an option. An arg opts
+//! out per rule with `allow_leading_dash = true` or (declared `exec` only)
+//! `allow_whitespace = true`.
+//!
+//! Commands are built from an argv array. A legacy `[command] template` is
+//! tokenized once at load, on manifest text only; substituted values are
+//! never re-split and `end_of_options = "--"` can fence user values off from
+//! option parsing entirely.
+//!
+//! A manifest key the runtime does not know is a load error
+//! (`unknown key 'tool.tiemout_seconds' in manifest`), never a silently
+//! ignored control. The only escape hatch is
+//! `toolclad validate --allow-unknown-keys`, which [`load_manifest_with`]
+//! exposes through [`LoadOptions`]; [`load_manifest`] and [`parse_manifest`]
+//! are always strict. At call time an argument name the manifest does not
+//! declare is refused the same way.
 //!
 //! ## Core Types
 //!
@@ -26,11 +45,11 @@
 //! | `integer` | Numeric with optional min/max and clamping |
 //! | `number` | Float with optional `min_float`/`max_float` and clamping |
 //! | `port` | 1-65535 |
-//! | `boolean` | Exactly `"true"` or `"false"` |
+//! | `boolean` | `"true"` or `"false"`, case-insensitive, normalized to lowercase |
 //! | `enum` | Value in declared `allowed` list |
 //! | `scope_target` | Injection-safe, no wildcards, valid IP/CIDR/hostname |
 //! | `url` | Valid URL with optional scheme restriction |
-//! | `path` | No traversal (`../`) |
+//! | `path` | Relative, no `..` path component |
 //! | `ip_address` | Valid IPv4 or IPv6 |
 //! | `cidr` | Valid CIDR notation |
 //!
@@ -78,38 +97,730 @@
 //! println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
 //! ```
 //!
+//! `execute` consults [`default_gate`] after validation and before anything
+//! runs: a manifest with `human_approval = true` or `risk_tier` `high` /
+//! `critical` fails with `policy gate denied: ...`. Pass your own gate to
+//! [`executor::execute_with_gate`] (for example one that asks a human or a
+//! Cedar evaluator), or call [`executor::execute_approved`] once approval
+//! exists.
+//!
 //! ## Manifest Format
 //!
 //! See the [ToolClad Design Spec](https://github.com/ThirdKeyAI/ToolClad/blob/main/TOOLCLAD_DESIGN_SPEC.md)
 //! for the full `.clad.toml` format specification.
 
 pub mod executor;
+pub mod hostpolicy;
+pub mod schema;
+pub mod scope;
 pub mod types;
 pub mod validator;
 
-use std::collections::HashMap;
+pub use executor::{default_gate, GateDecision};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use types::{CustomTypeDef, Manifest, ToolCladError};
+use types::{CustomTypeDef, Manifest, ToolCladError, MODES};
+
+/// Loader options. The default is strict; see [`load_manifest_with`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LoadOptions {
+    /// Downgrade unknown manifest keys from a load error to a warning on
+    /// stderr (`warning: unknown key '<section>.<key>' in manifest`) and drop
+    /// them. An authoring aid for `toolclad validate --allow-unknown-keys`;
+    /// the plain loaders never set it.
+    pub allow_unknown_keys: bool,
+    /// Custom types to use instead of discovering `toolclad.toml` (for an
+    /// embedder that already has them). Each is checked as a discovered one
+    /// would be. `None` (the default) runs discovery; see
+    /// [`discover_custom_types`].
+    pub custom_types: Option<HashMap<String, CustomTypeDef>>,
+}
+
+/// Environment variable naming the project `toolclad.toml` explicitly.
+pub const CONFIG_FILE_ENV: &str = "TOOLCLAD_CONFIG_FILE";
+
+/// Keys a `[types.<name>]` table in `toolclad.toml` accepts.
+const CUSTOM_TYPE_KEYS: &[&str] = &[
+    "base",
+    "allowed",
+    "pattern",
+    "min",
+    "max",
+    "min_float",
+    "max_float",
+];
 
 /// Load and parse a `.clad.toml` manifest from the given path.
+///
+/// Strict: an unknown key anywhere in the manifest is a load error.
 pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, ToolCladError> {
+    load_manifest_with(path, LoadOptions::default())
+}
+
+/// [`load_manifest`] with explicit [`LoadOptions`].
+pub fn load_manifest_with<P: AsRef<Path>>(
+    path: P,
+    options: LoadOptions,
+) -> Result<Manifest, ToolCladError> {
     let path = path.as_ref();
     let content = std::fs::read_to_string(path).map_err(|e| {
         ToolCladError::ManifestError(format!("failed to read '{}': {e}", path.display()))
     })?;
-    parse_manifest(&content)
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    parse_manifest_impl(&content, options, Some(dir))
 }
 
 /// Parse a manifest from a TOML string.
+///
+/// Strict: an unknown key anywhere in the manifest is a load error.
 pub fn parse_manifest(toml_str: &str) -> Result<Manifest, ToolCladError> {
-    let manifest: Manifest = toml::from_str(toml_str)
-        .map_err(|e| ToolCladError::ManifestError(format!("TOML parse error: {e}")))?;
-    validate_manifest(&manifest)?;
+    parse_manifest_with(toml_str, LoadOptions::default())
+}
+
+/// [`parse_manifest`] with explicit [`LoadOptions`].
+///
+/// The scope file for `scope_check` arguments is discovered upward from the
+/// process cwd (or taken from `TOOLCLAD_SCOPE_FILE`).
+pub fn parse_manifest_with(
+    toml_str: &str,
+    options: LoadOptions,
+) -> Result<Manifest, ToolCladError> {
+    parse_manifest_impl(toml_str, options, None)
+}
+
+/// Shared loader body. `source_dir` is the manifest's directory when it came
+/// from a file.
+fn parse_manifest_impl(
+    toml_str: &str,
+    options: LoadOptions,
+    source_dir: Option<&Path>,
+) -> Result<Manifest, ToolCladError> {
+    let parse_err =
+        |e: toml::de::Error| ToolCladError::ManifestError(format!("TOML parse error: {e}"));
+
+    // Walk the raw document against the key allowlist first so every unknown
+    // key is reported by its full path. `deny_unknown_fields` on the types is
+    // the second layer and catches anything the table and the structs disagree
+    // on.
+    let mut doc: toml::Table = toml::from_str(toml_str).map_err(parse_err)?;
+    let unknown = prune_unknown_keys(&mut doc);
+
+    let mut manifest: Manifest = if unknown.is_empty() {
+        // Deserialize from the text so a structural error keeps its position.
+        toml::from_str(toml_str).map_err(parse_err)?
+    } else if options.allow_unknown_keys {
+        for key in &unknown {
+            eprintln!("warning: unknown key '{key}' in manifest");
+        }
+        toml::Value::Table(doc).try_into().map_err(parse_err)?
+    } else {
+        return Err(ToolCladError::ManifestError(unknown_keys_message(&unknown)));
+    };
+
+    let custom_types = match options.custom_types {
+        Some(types) => {
+            for (name, def) in &types {
+                check_custom_type(name, def)?;
+            }
+            types
+        }
+        None => discover_custom_types(source_dir)?,
+    };
+
+    compile_command(&mut manifest)?;
+    validate_manifest_with_custom_types(&manifest, &custom_types)?;
+    manifest.custom_types = custom_types;
+
+    // Load the scope once, here, when any argument asks for it. No file is
+    // not an error at load: every `scope_check` argument then fails closed.
+    manifest.source_dir = source_dir.map(Path::to_path_buf);
+    if all_arg_defs(&manifest).iter().any(|(_, d)| d.scope_check) {
+        manifest.scope = scope::discover_scope(source_dir)?;
+    }
     Ok(manifest)
 }
 
-/// Validate internal consistency of a parsed manifest.
-fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
+/// Keys every argument table accepts (`[args.<n>]`, `[session.commands.<n>.args.<n>]`,
+/// `[browser.commands.<n>.args.<n>]`).
+const ARG_KEYS: &[&str] = &[
+    "position",
+    "required",
+    "type",
+    "description",
+    "default",
+    "allowed",
+    "pattern",
+    "sanitize",
+    "min",
+    "max",
+    "min_float",
+    "max_float",
+    "clamp",
+    "schemes",
+    "scope_check",
+    "block_internal",
+    "allow_leading_dash",
+    "allow_whitespace",
+];
+
+/// The manifest key allowlist, one entry per section: `(section, keys)`.
+///
+/// This is the Rust copy of the cross-runtime allowlist and is meant to be
+/// diffed against it line by line. A `*` segment stands for a user-chosen
+/// name (`[args.<n>]`, `[command.conditionals.<n>]`, ...). A table that is not
+/// listed here is an open map whose keys are user data (`command.defaults`,
+/// `command.mappings`, `output.schema`, `http.headers`, `mcp.field_map`) and
+/// is not walked.
+const KNOWN_KEYS: &[(&str, &[&str])] = &[
+    (
+        "",
+        &[
+            "tool", "args", "command", "output", "http", "mcp", "session", "browser",
+        ],
+    ),
+    (
+        "tool",
+        &[
+            "name",
+            "version",
+            "binary",
+            "description",
+            "timeout_seconds",
+            "risk_tier",
+            "human_approval",
+            "dispatch",
+            "mode",
+            "network_egress",
+            "allow_interpreter",
+            "cedar",
+            "evidence",
+            "limits",
+        ],
+    ),
+    ("tool.cedar", &["resource", "action"]),
+    (
+        "tool.evidence",
+        &["output_dir", "capture", "hash", "screenshots"],
+    ),
+    (
+        "tool.limits",
+        &[
+            "nproc",
+            "nofile",
+            "fsize_bytes",
+            "address_space_bytes",
+            "cpu_seconds",
+        ],
+    ),
+    ("args.*", ARG_KEYS),
+    (
+        "command",
+        &[
+            "template",
+            "exec",
+            "executor",
+            "defaults",
+            "mappings",
+            "conditionals",
+            "end_of_options",
+        ],
+    ),
+    ("command.conditionals.*", &["when", "template"]),
+    (
+        "output",
+        &["format", "parser", "envelope", "schema", "max_bytes"],
+    ),
+    (
+        "http",
+        &[
+            "method",
+            "url",
+            "headers",
+            "body_template",
+            "success_status",
+            "error_status",
+        ],
+    ),
+    ("mcp", &["server", "tool", "field_map"]),
+    (
+        "session",
+        &[
+            "startup_command",
+            "ready_pattern",
+            "startup_timeout_seconds",
+            "idle_timeout_seconds",
+            "session_timeout_seconds",
+            "max_interactions",
+            "interaction",
+            "commands",
+            "child_detection",
+        ],
+    ),
+    (
+        "session.interaction",
+        &["input_sanitize", "output_max_bytes", "output_wait_ms"],
+    ),
+    (
+        "session.commands.*",
+        &[
+            "pattern",
+            "description",
+            "risk_tier",
+            "human_approval",
+            "extract_target",
+            "args",
+        ],
+    ),
+    ("session.commands.*.args.*", ARG_KEYS),
+    ("session.child_detection", &["pattern", "type", "manifest"]),
+    (
+        "browser",
+        &[
+            "engine",
+            "headless",
+            "connect",
+            "extract_mode",
+            "startup_timeout_seconds",
+            "session_timeout_seconds",
+            "idle_timeout_seconds",
+            "max_interactions",
+            "scope",
+            "commands",
+            "state",
+            "defaults",
+        ],
+    ),
+    ("browser.defaults", &["extract_mode"]),
+    (
+        "browser.scope",
+        &["allowed_domains", "blocked_domains", "allow_external"],
+    ),
+    (
+        "browser.commands.*",
+        &["description", "risk_tier", "human_approval", "args"],
+    ),
+    ("browser.commands.*.args.*", ARG_KEYS),
+    ("browser.state", &["fields"]),
+];
+
+fn known_keys(section: &str) -> Option<&'static [&'static str]> {
+    KNOWN_KEYS
+        .iter()
+        .find(|(name, _)| *name == section)
+        .map(|(_, keys)| *keys)
+}
+
+fn join_path(base: &str, key: &str) -> String {
+    if base.is_empty() {
+        key.to_string()
+    } else {
+        format!("{base}.{key}")
+    }
+}
+
+/// Remove every key [`KNOWN_KEYS`] does not list from the document and return
+/// the concrete dotted path of each removed key, sorted.
+fn prune_unknown_keys(doc: &mut toml::Table) -> Vec<String> {
+    let mut unknown = Vec::new();
+    prune_section(doc, "", "", &mut unknown);
+    unknown.sort();
+    unknown
+}
+
+/// `section` is the allowlist pattern (`session.commands.*`), `path` the
+/// concrete location in this document (`session.commands.select`).
+fn prune_section(table: &mut toml::Table, section: &str, path: &str, unknown: &mut Vec<String>) {
+    let Some(allowed) = known_keys(section) else {
+        return;
+    };
+    let keys: Vec<String> = table.keys().cloned().collect();
+    for key in keys {
+        let key_path = join_path(path, &key);
+        if !allowed.contains(&key.as_str()) {
+            table.remove(&key);
+            unknown.push(key_path);
+            continue;
+        }
+        let Some(toml::Value::Table(child)) = table.get_mut(&key) else {
+            continue;
+        };
+        let child_section = join_path(section, &key);
+        if known_keys(&child_section).is_some() {
+            prune_section(child, &child_section, &key_path, unknown);
+            continue;
+        }
+        let named_section = join_path(&child_section, "*");
+        if known_keys(&named_section).is_some() {
+            for (name, entry) in child.iter_mut() {
+                if let toml::Value::Table(sub) = entry {
+                    prune_section(sub, &named_section, &join_path(&key_path, name), unknown);
+                }
+            }
+        }
+    }
+}
+
+fn unknown_keys_message(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| format!("unknown key '{k}' in manifest"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Compile the `[command]` section into its canonical exec form.
+///
+/// A `template` with no `exec` is tokenized here, once, on trusted manifest
+/// text; every conditional template is tokenized the same way. The result is
+/// what the executor substitutes into — values are never re-split.
+fn compile_command(manifest: &mut Manifest) -> Result<(), ToolCladError> {
+    let cmd = &mut manifest.command;
+    cmd.exec_was_declared = cmd.exec.is_some();
+
+    if cmd.exec.is_none() {
+        if let Some(ref template) = cmd.template {
+            cmd.exec = Some(executor::tokenize_template(template)?);
+            eprintln!(
+                "warning: [command] template is deprecated and will be removed in the next minor release; use exec = [...]"
+            );
+        }
+    }
+
+    if let Some(ref mut conditionals) = cmd.conditionals {
+        for (name, cond) in conditionals.iter_mut() {
+            cond.tokens = executor::tokenize_template(&cond.template).map_err(|e| {
+                let msg = match e {
+                    ToolCladError::ManifestError(m) => m,
+                    other => other.to_string(),
+                };
+                ToolCladError::ManifestError(format!("conditional '{name}': {msg}"))
+            })?;
+        }
+    }
+
+    if let Some(ref eoo) = cmd.end_of_options {
+        if eoo != "--" {
+            return Err(ToolCladError::ManifestError(format!(
+                "end_of_options must be exactly \"--\" (got '{eoo}')"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Load-time placeholder check: every `{name}` in the compiled exec form and
+/// in every conditional must name a declared arg, a `[command.defaults]` key,
+/// `_<arg>_flags` for a mapped arg, `_<cond>` for a declared conditional, or
+/// an executor-injected variable. A trusted multi-token variable must stand
+/// alone as a whole token.
+fn check_placeholders(manifest: &Manifest) -> Result<(), ToolCladError> {
+    let cmd = &manifest.command;
+
+    let mut single: HashSet<String> = manifest.args.keys().cloned().collect();
+    if let Some(ref defaults) = cmd.defaults {
+        single.extend(defaults.keys().cloned());
+    }
+    single.extend(executor::INJECTED_VARS.iter().map(|s| s.to_string()));
+
+    let mut trusted: HashSet<String> = HashSet::new();
+    if let Some(ref mappings) = cmd.mappings {
+        trusted.extend(mappings.keys().map(|k| format!("_{k}_flags")));
+    }
+    if let Some(ref conditionals) = cmd.conditionals {
+        trusted.extend(conditionals.keys().map(|k| format!("_{k}")));
+    }
+
+    let check = |tokens: &[String], context: &str| -> Result<(), ToolCladError> {
+        for token in tokens {
+            for name in executor::placeholder_names(token) {
+                if trusted.contains(&name) {
+                    if token != &format!("{{{name}}}") {
+                        return Err(ToolCladError::ManifestError(format!(
+                            "placeholder '{{{name}}}' expands to multiple tokens and must be a whole token in {context}"
+                        )));
+                    }
+                } else if !single.contains(&name) {
+                    return Err(ToolCladError::ManifestError(format!(
+                        "unresolved placeholder '{{{name}}}' in {context}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(ref exec) = cmd.exec {
+        check(exec, "command")?;
+    }
+    if let Some(ref conditionals) = cmd.conditionals {
+        for (name, cond) in conditionals {
+            check(&cond.tokens, &format!("conditional '{name}'"))?;
+        }
+    }
+    if let Some(ref mappings) = cmd.mappings {
+        for (arg, table) in mappings {
+            for value in table.values() {
+                executor::tokenize_template(value).map_err(|e| {
+                    let msg = match e {
+                        ToolCladError::ManifestError(m) => m,
+                        other => other.to_string(),
+                    };
+                    ToolCladError::ManifestError(format!("mapping for '{arg}': {msg}"))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binaries that connect to a network destination derived from their arguments
+/// — the ones for which an unconstrained `scope_target`/`url` is an SSRF surface.
+const EGRESS_BINARIES: &[&str] = &[
+    "curl", "wget", "nmap", "nc", "ncat", "netcat", "masscan", "telnet", "ssh", "ping", "fping",
+    "httpie", "http", "wfuzz", "ffuf", "hydra", "nikto",
+];
+
+/// Argument types that name a network destination. In an egress manifest each
+/// must set `block_internal = true`.
+const NETWORK_TARGET_TYPES: &[&str] = &["scope_target", "url", "ip_address", "cidr"];
+
+fn command_basename(s: &str) -> String {
+    s.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase()
+}
+
+/// Basenames refused as `argv[0]` unless `[tool] allow_interpreter = true`:
+/// an interpreter turns an argument into code.
+const INTERPRETERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "ash", "busybox", "env", "eval",
+    "xargs", "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "lua", "php",
+    "awk",
+];
+
+/// Load-time checks on the command's `argv[0]` (the compiled `exec` form, so
+/// a `template` is covered too): it may not be an interpreter without
+/// `allow_interpreter`, and when `tool.binary` is declared their basenames
+/// must agree, so the binary a reviewer reads is the binary that runs.
+/// Manifests without a command (`[http]`, `[mcp]`, `[session]`,
+/// `[browser]`-only) have nothing to check.
+fn check_argv0(manifest: &Manifest) -> Result<(), ToolCladError> {
+    // The executor escape hatch is exempt from the basename rule (it is a
+    // wrapper by definition) but not from the interpreter denylist:
+    // `executor = "/bin/sh"` turns argument values into shell input.
+    if let Some(ref exe) = manifest.command.executor {
+        if !manifest.tool.allow_interpreter
+            && INTERPRETERS.contains(&command_basename(exe).as_str())
+        {
+            return Err(ToolCladError::ManifestError(format!(
+                "command argv[0] '{exe}' is an interpreter; set allow_interpreter = true to permit it"
+            )));
+        }
+        return Ok(());
+    }
+    let Some(argv0) = manifest.command.exec.as_ref().and_then(|e| e.first()) else {
+        return Ok(());
+    };
+    let base = argv0.rsplit('/').next().unwrap_or(argv0);
+    if !manifest.tool.allow_interpreter && INTERPRETERS.contains(&command_basename(argv0).as_str())
+    {
+        return Err(ToolCladError::ManifestError(format!(
+            "command argv[0] '{argv0}' is an interpreter; set allow_interpreter = true to permit it"
+        )));
+    }
+    let binary = &manifest.tool.binary;
+    if !binary.is_empty() && base != binary.rsplit('/').next().unwrap_or(binary) {
+        return Err(ToolCladError::ManifestError(format!(
+            "command argv[0] '{argv0}' does not match tool.binary '{binary}'"
+        )));
+    }
+    Ok(())
+}
+
+/// True if the manifest's command dispatches one of the known egress binaries
+/// (checked across `tool.binary`, `command.exec[0]`, and `command.template`).
+///
+/// An `executor`-only manifest runs whatever its executor script decides:
+/// `tool.binary` is still checked, but a script that reaches the network
+/// through some other program is invisible here. Such a manifest is an egress
+/// manifest only when its author declares it — `network_egress = true`,
+/// `[http]` or `[browser]` — so the escape hatch is the author's
+/// responsibility.
+fn command_invokes_egress_binary(m: &Manifest) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    if !m.tool.binary.is_empty() {
+        names.push(command_basename(&m.tool.binary));
+    }
+    if let Some(first) = m.command.exec.as_ref().and_then(|e| e.first()) {
+        names.push(command_basename(first));
+    }
+    if let Some(first) = m
+        .command
+        .template
+        .as_ref()
+        .and_then(|t| t.split_whitespace().next())
+    {
+        names.push(command_basename(first));
+    }
+    names.iter().any(|n| EGRESS_BINARIES.contains(&n.as_str()))
+}
+
+/// True if the manifest reaches the network from its arguments: the author
+/// declared `network_egress = true`, the backend is `[http]` or `[browser]`,
+/// or the command dispatches a known egress binary.
+fn is_egress_manifest(m: &Manifest) -> bool {
+    m.tool.network_egress
+        || m.http.is_some()
+        || m.browser.is_some()
+        || command_invokes_egress_binary(m)
+}
+
+/// Every argument definition in the manifest with the name used to report
+/// it: top-level args by name, session and browser command args by their key
+/// path. Sorted so a refusal names the same argument on every load.
+fn all_arg_defs(m: &Manifest) -> Vec<(String, &types::ArgDef)> {
+    let mut out: Vec<(String, &types::ArgDef)> =
+        m.args.iter().map(|(n, d)| (n.clone(), d)).collect();
+    if let Some(session) = &m.session {
+        for (cmd, def) in &session.commands {
+            for (n, d) in &def.args {
+                out.push((format!("session.commands.{cmd}.args.{n}"), d));
+            }
+        }
+    }
+    if let Some(browser) = &m.browser {
+        for (cmd, def) in &browser.commands {
+            for (n, d) in &def.args {
+                out.push((format!("browser.commands.{cmd}.args.{n}"), d));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Egress safety (TC-15): a tool that connects to a network target must
+/// default-deny internal/SSRF addresses. In an egress manifest every
+/// `scope_target`, `url`, `ip_address` or `cidr` argument must set
+/// `block_internal = true`. A custom type over one of those bases is refused
+/// outright: the custom type cannot carry `block_internal`, and the author
+/// should use the built-in type.
+fn egress_lint(
+    manifest: &Manifest,
+    custom_types: &HashMap<String, CustomTypeDef>,
+) -> Result<(), ToolCladError> {
+    if !is_egress_manifest(manifest) {
+        return Ok(());
+    }
+    for (name, def) in all_arg_defs(manifest) {
+        let type_name = def.type_name.as_str();
+        if NETWORK_TARGET_TYPES.contains(&type_name) {
+            if !def.block_internal {
+                return Err(ToolCladError::ManifestError(format!(
+                    "argument '{name}' is a network target for an egress binary but block_internal is not set; \
+                     set block_internal = true to default-deny internal/SSRF targets"
+                )));
+            }
+        } else if let Some(custom) = custom_types.get(type_name) {
+            if NETWORK_TARGET_TYPES.contains(&custom.base.as_str()) {
+                return Err(ToolCladError::ManifestError(format!(
+                    "argument '{name}' uses custom type '{type_name}' as a network target; \
+                     custom types cannot carry block_internal — use the built-in {} type",
+                    custom.base
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The output parsers the reference runtimes implement.
+pub const BUILTIN_PARSERS: &[&str] = &[
+    "builtin:json",
+    "builtin:jsonl",
+    "builtin:csv",
+    "builtin:xml",
+    "builtin:text",
+];
+
+/// Largest accepted `[output] max_bytes` (1 GiB).
+pub const MAX_OUTPUT_BYTES: u64 = 1_073_741_824;
+
+/// `[output]`: a custom parser is refused (it would otherwise be silently
+/// ignored), and `max_bytes` must be 1..=1 GiB. A non-integer `max_bytes`
+/// already fails to deserialize.
+fn check_output(manifest: &Manifest) -> Result<(), ToolCladError> {
+    let Some(ref output) = manifest.output else {
+        return Ok(());
+    };
+    if let Some(ref p) = output.parser {
+        if !BUILTIN_PARSERS.contains(&p.as_str()) {
+            return Err(ToolCladError::ManifestError(format!(
+                "custom output parsers are not supported by the reference runtimes (parser = \"{p}\")"
+            )));
+        }
+    }
+    if output.max_bytes == 0 || output.max_bytes > MAX_OUTPUT_BYTES {
+        return Err(ToolCladError::ManifestError(format!(
+            "output.max_bytes must be an integer from 1 to {MAX_OUTPUT_BYTES} (got {})",
+            output.max_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// `[http]`: the scheme and host of `http.url` must be literal (the host is
+/// the SSRF boundary and stays manifest-controlled), header names must be
+/// tokens, and the literal host passes the IP policy — link-local is always
+/// refused, and when any argument sets `block_internal` the remaining
+/// non-public ranges and internal names are refused too.
+fn check_http(manifest: &Manifest) -> Result<(), ToolCladError> {
+    let Some(ref http) = manifest.http else {
+        return Ok(());
+    };
+    let host = executor::http_url_literal_host(&http.url)?;
+    for name in http.headers.keys() {
+        executor::check_header_name(name)?;
+    }
+    let block_internal = all_arg_defs(manifest).iter().any(|(_, d)| d.block_internal);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    let as_manifest_err = |e: ToolCladError| match e {
+        ToolCladError::ValidationError(m) => ToolCladError::ManifestError(m),
+        other => other,
+    };
+    if let Some(ip) = hostpolicy::parse_canonical_ip(bare) {
+        hostpolicy::enforce_ip_policy("http.url", &ip, block_internal).map_err(as_manifest_err)?;
+    } else if block_internal {
+        if hostpolicy::is_internal_name(bare) {
+            return Err(ToolCladError::ManifestError(format!(
+                "http.url host '{bare}' is an internal name (blocked by block_internal policy)"
+            )));
+        }
+        if let Some(ip) = hostpolicy::embedded_ip_literal(bare) {
+            hostpolicy::enforce_ip_policy("http.url", &std::net::IpAddr::V4(ip), true)
+                .map_err(as_manifest_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate internal consistency of a parsed manifest with the custom types
+/// of a `toolclad.toml` in scope (see [`load_custom_types`]). A custom type
+/// name is accepted wherever a built-in type is, with its base type checked;
+/// the egress lint then also refuses a custom type over a network-target base
+/// in an egress manifest. The loaders call this with the discovered custom
+/// types.
+pub fn validate_manifest_with_custom_types(
+    manifest: &Manifest,
+    custom_types: &HashMap<String, CustomTypeDef>,
+) -> Result<(), ToolCladError> {
     // Validate dispatch mode.
     let valid_dispatch = ["exec", "callback"];
     if !valid_dispatch.contains(&manifest.tool.dispatch.as_str()) {
@@ -120,7 +831,32 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
         )));
     }
 
+    // Validate the advisory mode when declared.
+    if let Some(ref mode) = manifest.tool.mode {
+        if !MODES.contains(&mode.as_str()) {
+            return Err(ToolCladError::ManifestError(format!(
+                "invalid mode '{mode}', must be one of: {}",
+                MODES.join(", ")
+            )));
+        }
+    }
+
+    // A zero timeout used to mean "no deadline"; it is refused so every
+    // spawned tool has one.
+    if manifest.tool.timeout_seconds == 0 {
+        return Err(ToolCladError::ManifestError(
+            "timeout_seconds must be greater than zero".to_string(),
+        ));
+    }
+
     let is_callback = manifest.tool.dispatch == "callback";
+
+    if !is_callback {
+        check_argv0(manifest)?;
+    }
+
+    check_output(manifest)?;
+    check_http(manifest)?;
 
     // exec dispatch requires a backend and an [output] block.
     if !is_callback {
@@ -145,31 +881,100 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
         }
     }
 
-    // Validate argument types and constraints.
-    for (name, def) in &manifest.args {
-        if !validator::SUPPORTED_TYPES.contains(&def.type_name.as_str()) {
-            return Err(ToolCladError::ManifestError(format!(
-                "unknown type '{}' for argument '{}'",
-                def.type_name, name
-            )));
+    // Validate argument types and constraints. A custom type stands in for
+    // its base type.
+    for (name, def) in all_arg_defs(manifest) {
+        let custom = custom_types.get(&def.type_name);
+        let base = custom.map_or(def.type_name.as_str(), |c| c.base.as_str());
+        if !validator::SUPPORTED_TYPES.contains(&base) {
+            return Err(ToolCladError::ManifestError(match custom {
+                Some(c) => format!(
+                    "custom type '{}' has invalid base type '{}'",
+                    def.type_name, c.base
+                ),
+                None => format!("unknown type '{}' for argument '{}'", def.type_name, name),
+            }));
         }
-        if def.type_name == "enum" && def.allowed.is_none() {
+        let has_allowed = def.allowed.is_some() || custom.is_some_and(|c| c.allowed.is_some());
+        if base == "enum" && !has_allowed {
             return Err(ToolCladError::ManifestError(format!(
                 "argument '{name}' is type 'enum' but has no 'allowed' list"
             )));
         }
     }
 
-    // Validate that mapping keys reference existing args.
+    // `scope_check` is honored only on network-target types; anywhere else
+    // it would be a control that silently does nothing.
+    for (name, def) in all_arg_defs(manifest) {
+        let base = custom_types
+            .get(&def.type_name)
+            .map_or(def.type_name.as_str(), |c| c.base.as_str());
+        if def.scope_check && !scope::SCOPE_CHECK_TYPES.contains(&base) {
+            return Err(ToolCladError::ManifestError(format!(
+                "argument '{name}' scope_check is not supported for type '{}'",
+                def.type_name
+            )));
+        }
+    }
+
+    egress_lint(manifest, custom_types)?;
+
+    // A per-argument default is manifest-controlled and must pass its own
+    // type through the strict entry point. The scope is checked at call time
+    // (defaults are validated again there), not here.
+    for (name, def) in all_arg_defs(manifest) {
+        let Some(ref default) = def.default else {
+            continue;
+        };
+        let value = executor::toml_value_to_string(default);
+        let mut strict = def.clone();
+        strict.scope_check = false;
+        validator::validate_arg_with_custom_types(&name, &strict, &value, custom_types).map_err(
+            |e| {
+                let msg = match e {
+                    ToolCladError::ManifestError(m) | ToolCladError::ValidationError(m) => m,
+                    other => other.to_string(),
+                };
+                ToolCladError::ManifestError(format!(
+                    "argument '{name}' has an invalid default '{value}': {msg}"
+                ))
+            },
+        )?;
+    }
+
+    // Validate that mapping keys reference existing args, and that a mapping
+    // over an enum covers every allowed value: a missing case must be a load
+    // failure, not a silently flag-less invocation. Map a value to "" to say
+    // "no flags".
     if let Some(ref mappings) = manifest.command.mappings {
-        for arg_name in mappings.keys() {
-            if !manifest.args.contains_key(arg_name) {
+        for (arg_name, table) in mappings {
+            let Some(def) = manifest.args.get(arg_name) else {
                 return Err(ToolCladError::ManifestError(format!(
                     "mapping references unknown argument '{arg_name}'"
                 )));
+            };
+            if def.type_name == "enum" {
+                if let Some(ref allowed) = def.allowed {
+                    let mut missing: Vec<&str> = allowed
+                        .iter()
+                        .filter(|v| !table.contains_key(*v))
+                        .map(String::as_str)
+                        .collect();
+                    missing.sort_unstable();
+                    if !missing.is_empty() {
+                        return Err(ToolCladError::ManifestError(format!(
+                            "mapping for enum argument '{arg_name}' does not cover allowed values: [{}] (map a value to \"\" for no flags)",
+                            missing.join(", ")
+                        )));
+                    }
+                }
             }
         }
     }
+
+    // Every placeholder in the compiled command must resolve to something the
+    // manifest declares; a typo must not survive to build time.
+    check_placeholders(manifest)?;
 
     // Validate risk_tier values.
     let valid_tiers = ["info", "low", "medium", "high", "critical"];
@@ -184,43 +989,122 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ToolCladError> {
     Ok(())
 }
 
-/// Load custom type definitions from a toolclad.toml file.
+/// Load custom type definitions from a `toolclad.toml` file.
+///
+/// Strict: the only top-level key is `types`, each `[types.<name>]` accepts
+/// only `base allowed pattern min max min_float max_float`, `base` must be a
+/// built-in type, a custom type may not reuse a built-in type name, and a
+/// `pattern` must compile.
 pub fn load_custom_types<P: AsRef<Path>>(
     path: P,
 ) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
-    let content = std::fs::read_to_string(path.as_ref())
-        .map_err(|e| ToolCladError::ManifestError(format!("failed to read toolclad.toml: {e}")))?;
-    let config: toml::Value = toml::from_str(&content).map_err(|e| {
-        ToolCladError::ManifestError(format!("TOML parse error in toolclad.toml: {e}"))
+    let path = path.as_ref();
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        ToolCladError::ManifestError(format!("failed to read '{}': {e}", path.display()))
     })?;
+    parse_custom_types(&content)
+}
+
+/// [`load_custom_types`] from a TOML string.
+pub fn parse_custom_types(content: &str) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    let err = |m: String| ToolCladError::ManifestError(format!("toolclad.toml: {m}"));
+    let config: toml::Table =
+        toml::from_str(content).map_err(|e| err(format!("TOML parse error: {e}")))?;
 
     let mut types = HashMap::new();
-    if let Some(types_table) = config.get("types").and_then(|t| t.as_table()) {
-        for (name, def) in types_table {
-            let base = def.get("base").and_then(|b| b.as_str()).ok_or_else(|| {
-                ToolCladError::ManifestError(format!("custom type '{name}' missing 'base' field"))
-            })?;
-
-            let custom = CustomTypeDef {
-                base: base.to_string(),
-                allowed: def.get("allowed").and_then(|a| a.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                }),
-                pattern: def
-                    .get("pattern")
-                    .and_then(|p| p.as_str())
-                    .map(String::from),
-                min: def.get("min").and_then(|m| m.as_integer()),
-                max: def.get("max").and_then(|m| m.as_integer()),
-                min_float: def.get("min_float").and_then(|m| m.as_float()),
-                max_float: def.get("max_float").and_then(|m| m.as_float()),
+    for (key, value) in config {
+        if key != "types" {
+            return Err(err(format!("unknown key '{key}'")));
+        }
+        let toml::Value::Table(table) = value else {
+            return Err(err("'types' must be a table".to_string()));
+        };
+        for (name, def) in table {
+            let toml::Value::Table(fields) = def else {
+                return Err(err(format!("'types.{name}' must be a table")));
             };
-            types.insert(name.clone(), custom);
+            if let Some(bad) = fields
+                .keys()
+                .find(|k| !CUSTOM_TYPE_KEYS.contains(&k.as_str()))
+            {
+                return Err(err(format!("unknown key 'types.{name}.{bad}'")));
+            }
+            if !fields.contains_key("base") {
+                return Err(err(format!("custom type '{name}' missing 'base' field")));
+            }
+            let custom: CustomTypeDef = toml::Value::Table(fields)
+                .try_into()
+                .map_err(|e| err(format!("custom type '{name}': {e}")))?;
+            check_custom_type(&name, &custom)?;
+            types.insert(name, custom);
         }
     }
     Ok(types)
+}
+
+/// Check one custom type: a built-in base, no shadowing of a built-in type
+/// name, and a pattern that compiles once anchored.
+fn check_custom_type(name: &str, def: &CustomTypeDef) -> Result<(), ToolCladError> {
+    if validator::SUPPORTED_TYPES.contains(&name) {
+        return Err(ToolCladError::ManifestError(format!(
+            "custom type '{name}' shadows a built-in type"
+        )));
+    }
+    if !validator::SUPPORTED_TYPES.contains(&def.base.as_str()) {
+        return Err(ToolCladError::ManifestError(format!(
+            "custom type '{name}' has invalid base type '{}' (the base must be a built-in type)",
+            def.base
+        )));
+    }
+    if let Some(ref pat) = def.pattern {
+        regex::Regex::new(&validator::anchor_pattern(pat)).map_err(|e| {
+            ToolCladError::ManifestError(format!(
+                "custom type '{name}' has an invalid pattern: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Locate and load the project `toolclad.toml` for a manifest in
+/// `manifest_dir` (`None` for a manifest parsed from a string: the search
+/// starts at the cwd).
+///
+/// `TOOLCLAD_CONFIG_FILE`, when set and non-empty, names the file (unreadable
+/// is an error). Otherwise `toolclad.toml` is searched upward from the
+/// manifest's directory to the filesystem root. No file means no custom
+/// types.
+pub fn discover_custom_types(
+    manifest_dir: Option<&Path>,
+) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    let env = std::env::var_os(CONFIG_FILE_ENV);
+    discover_custom_types_with(env.as_deref(), manifest_dir)
+}
+
+/// [`discover_custom_types`] with the `TOOLCLAD_CONFIG_FILE` value passed
+/// explicitly (an empty value counts as unset).
+pub fn discover_custom_types_with(
+    env_file: Option<&std::ffi::OsStr>,
+    manifest_dir: Option<&Path>,
+) -> Result<HashMap<String, CustomTypeDef>, ToolCladError> {
+    if let Some(file) = env_file.filter(|f| !f.is_empty()) {
+        return load_custom_types(Path::new(file));
+    }
+    let cwd = std::env::current_dir().map_err(|e| {
+        ToolCladError::ManifestError(format!("cannot determine current directory: {e}"))
+    })?;
+    let start = match manifest_dir {
+        Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+        Some(dir) => cwd.join(dir),
+        None => cwd,
+    };
+    for dir in start.ancestors() {
+        let candidate = dir.join("toolclad.toml");
+        if candidate.is_file() {
+            return load_custom_types(&candidate);
+        }
+    }
+    Ok(HashMap::new())
 }
 
 /// Generate an MCP-compatible JSON schema from a manifest.
@@ -233,6 +1117,10 @@ pub fn generate_mcp_schema(manifest: &Manifest) -> serde_json::Value {
     args.sort_by_key(|(_, def)| def.position);
 
     for (name, def) in &args {
+        // A custom type is described by its base type and merged constraints.
+        let resolved =
+            validator::resolve_custom_type(def, &manifest.custom_types).and_then(Result::ok);
+        let def = resolved.as_ref().unwrap_or(def);
         let mut prop = serde_json::Map::new();
 
         // Map ToolClad types to JSON Schema types with constraints.
@@ -438,6 +1326,7 @@ risk_tier = "low"
 position = 1
 required = true
 type = "scope_target"
+block_internal = true
 description = "Target"
 
 [args.scan_type]
@@ -474,6 +1363,306 @@ type = "object"
         assert!(m.command.mappings.is_some());
         let mappings = m.command.mappings.as_ref().unwrap();
         assert_eq!(mappings["scan_type"]["ping"], "-sn -PE");
+    }
+
+    #[test]
+    fn test_egress_binary_requires_block_internal() {
+        // curl on a url arg WITHOUT block_internal must be refused at load.
+        let bad = r#"
+[tool]
+name = "fetch"
+version = "1.0.0"
+binary = "curl"
+description = "x"
+[args.url]
+position = 1
+required = true
+type = "url"
+[command]
+template = "curl {url}"
+[output]
+format = "text"
+"#;
+        let err = parse_manifest(bad).unwrap_err().to_string();
+        assert!(err.contains("block_internal"), "unexpected: {err}");
+
+        // Same manifest WITH block_internal loads fine.
+        let good = bad.replace("type = \"url\"", "type = \"url\"\nblock_internal = true");
+        assert!(parse_manifest(&good).is_ok());
+
+        // Non-egress binary (whois) does not require the flag.
+        let whois = r#"
+[tool]
+name = "whois"
+version = "1.0.0"
+binary = "whois"
+description = "x"
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+[command]
+template = "whois {target}"
+[output]
+format = "text"
+"#;
+        assert!(parse_manifest(whois).is_ok());
+    }
+
+    /// A oneshot manifest with one argument, for the egress lint tests.
+    fn egress_manifest(
+        binary: &str,
+        tool_extra: &str,
+        arg_type: &str,
+        arg_extra: &str,
+        backend: &str,
+    ) -> String {
+        format!(
+            r#"
+[tool]
+name = "t"
+version = "1.0.0"
+binary = "{binary}"
+description = "x"
+{tool_extra}
+
+[args.target]
+position = 1
+required = true
+type = "{arg_type}"
+{arg_extra}
+
+{backend}
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    const LINT: &str = "is a network target for an egress binary but block_internal is not set";
+
+    #[test]
+    fn test_egress_lint_trigger_set() {
+        let cmd = |bin: &str| format!("[command]\nexec = [\"{bin}\", \"{{target}}\"]");
+        // nmap, like curl, is on the binary list.
+        let err = parse_manifest(&egress_manifest(
+            "nmap",
+            "",
+            "scope_target",
+            "",
+            &cmd("nmap"),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&egress_manifest(
+            "nmap",
+            "",
+            "scope_target",
+            "block_internal = true",
+            &cmd("nmap")
+        ))
+        .is_ok());
+        // A binary off the list needs the flag once the manifest declares
+        // egress — and not before.
+        assert!(parse_manifest(&egress_manifest(
+            "mytool",
+            "",
+            "scope_target",
+            "",
+            &cmd("mytool")
+        ))
+        .is_ok());
+        let err = parse_manifest(&egress_manifest(
+            "mytool",
+            "network_egress = true",
+            "scope_target",
+            "",
+            &cmd("mytool"),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&egress_manifest(
+            "mytool",
+            "network_egress = true",
+            "scope_target",
+            "block_internal = true",
+            &cmd("mytool")
+        ))
+        .is_ok());
+        // [http] is an egress backend.
+        let http = "[http]\nmethod = \"GET\"\nurl = \"https://api.example.com/\"";
+        let err = parse_manifest(&egress_manifest("none", "", "url", "", http))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&egress_manifest(
+            "none",
+            "",
+            "url",
+            "block_internal = true",
+            http
+        ))
+        .is_ok());
+        // A non-egress binary does not require the flag.
+        assert!(parse_manifest(&egress_manifest(
+            "whois",
+            "",
+            "scope_target",
+            "",
+            &cmd("whois")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn test_egress_lint_covers_every_network_type() {
+        let cmd = "[command]\nexec = [\"curl\", \"{target}\"]";
+        for ty in ["scope_target", "url", "ip_address", "cidr"] {
+            let err = parse_manifest(&egress_manifest("curl", "", ty, "", cmd))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(LINT), "{ty}: {err}");
+            assert!(
+                parse_manifest(&egress_manifest(
+                    "curl",
+                    "",
+                    ty,
+                    "block_internal = true",
+                    cmd
+                ))
+                .is_ok(),
+                "{ty}"
+            );
+        }
+        // A non-network type never needs the flag.
+        assert!(parse_manifest(&egress_manifest("curl", "", "string", "", cmd)).is_ok());
+    }
+
+    #[test]
+    fn test_browser_manifest_is_egress_for_command_args() {
+        let browser = |arg_extra: &str| {
+            format!(
+                r#"
+[tool]
+name = "web"
+version = "1.0.0"
+binary = "chrome"
+description = "x"
+
+[command]
+
+[browser]
+engine = "cdp"
+
+[browser.commands.navigate]
+description = "Navigate"
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+{arg_extra}
+
+[output]
+format = "text"
+"#
+            )
+        };
+        let err = parse_manifest(&browser("")).unwrap_err().to_string();
+        assert!(
+            err.contains("argument 'browser.commands.navigate.args.url' is a network target"),
+            "{err}"
+        );
+        assert!(err.contains(LINT), "{err}");
+        assert!(parse_manifest(&browser("block_internal = true")).is_ok());
+    }
+
+    #[test]
+    fn test_executor_only_manifest_is_egress_only_by_declaration() {
+        // Nothing can inspect what the executor runs, so the lint has no
+        // binary to key on; the author must declare egress.
+        let exec_only = |tool_extra: &str| {
+            egress_manifest(
+                "runner",
+                tool_extra,
+                "scope_target",
+                "",
+                "[command]\nexecutor = \"/opt/runner.sh\"",
+            )
+        };
+        assert!(parse_manifest(&exec_only("")).is_ok());
+        let err = parse_manifest(&exec_only("network_egress = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LINT), "{err}");
+    }
+
+    #[test]
+    fn test_custom_network_type_refused_in_egress_manifest() {
+        let custom = |base: &str| {
+            HashMap::from([(
+                "api_host".to_string(),
+                CustomTypeDef {
+                    base: base.to_string(),
+                    allowed: None,
+                    pattern: None,
+                    min: None,
+                    max: None,
+                    min_float: None,
+                    max_float: None,
+                },
+            )])
+        };
+        let cmd = "[command]\nexec = [\"curl\", \"{target}\"]";
+        let mut m = parse_manifest(&egress_manifest(
+            "curl",
+            "",
+            "url",
+            "block_internal = true",
+            cmd,
+        ))
+        .unwrap();
+        m.args.get_mut("target").unwrap().type_name = "api_host".to_string();
+        // Refused for every network base — even though this arg set
+        // block_internal itself; the refusal is unconditional.
+        for base in ["scope_target", "url", "ip_address", "cidr"] {
+            let err = validate_manifest_with_custom_types(&m, &custom(base))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "manifest error: argument 'target' uses custom type 'api_host' as a network target; \
+                     custom types cannot carry block_internal — use the built-in {base} type"
+                )
+            );
+        }
+        // A custom type over a non-network base is fine in an egress manifest.
+        assert!(validate_manifest_with_custom_types(&m, &custom("string")).is_ok());
+        // Without the custom types in scope the name is simply unknown.
+        let err = validate_manifest_with_custom_types(&m, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown type 'api_host'"), "{err}");
+        // A custom type over an unsupported base is refused.
+        let err = validate_manifest_with_custom_types(&m, &custom("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid base type 'nope'"), "{err}");
+        // Not an egress manifest: a custom network type is permitted.
+        let mut w = parse_manifest(&egress_manifest(
+            "whois",
+            "",
+            "scope_target",
+            "",
+            "[command]\nexec = [\"whois\", \"{target}\"]",
+        ))
+        .unwrap();
+        w.args.get_mut("target").unwrap().type_name = "api_host".to_string();
+        assert!(validate_manifest_with_custom_types(&w, &custom("scope_target")).is_ok());
     }
 
     #[test]
@@ -715,6 +1904,7 @@ type = "object"
 name = "psql_session"
 version = "1.0.0"
 binary = "psql"
+mode = "session"
 description = "Interactive PostgreSQL session"
 timeout_seconds = 300
 risk_tier = "medium"
@@ -754,6 +1944,8 @@ type = "object"
 "#;
         let m = parse_manifest(toml_str).unwrap();
         assert_eq!(m.tool.name, "psql_session");
+        assert_eq!(m.tool.mode.as_deref(), Some("session"));
+        assert_eq!(m.mode(), "session");
         assert!(m.session.is_some());
         let session = m.session.as_ref().unwrap();
         assert_eq!(
@@ -782,6 +1974,7 @@ type = "object"
 name = "web_scraper"
 version = "1.0.0"
 binary = "chrome"
+mode = "browser"
 description = "Browser-based web scraper"
 timeout_seconds = 120
 risk_tier = "medium"
@@ -811,6 +2004,7 @@ risk_tier = "low"
 position = 1
 required = true
 type = "url"
+block_internal = true
 description = "URL to navigate to"
 
 [browser.commands.click]
@@ -830,6 +2024,7 @@ type = "object"
 "#;
         let m = parse_manifest(toml_str).unwrap();
         assert_eq!(m.tool.name, "web_scraper");
+        assert_eq!(m.mode(), "browser");
         assert!(m.browser.is_some());
         let browser = m.browser.as_ref().unwrap();
         assert_eq!(browser.engine, "cdp");
@@ -987,5 +2182,1534 @@ type = "object"
         assert!(m.http.is_some());
         assert!(m.command.template.is_none());
         assert!(m.command.executor.is_none());
+    }
+
+    // ---- W1: compile-to-exec at load ------------------------------------
+
+    /// A non-egress manifest skeleton; `$COMMAND` is replaced per test.
+    fn echo_manifest(command: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "echo_tool"
+version = "1.0.0"
+binary = "echo"
+description = "x"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+
+[args.label]
+position = 2
+required = false
+type = "string"
+default = ""
+allow_whitespace = true
+
+{command}
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    #[test]
+    fn test_template_is_compiled_to_exec_at_load() {
+        let m = parse_manifest(WHOIS_MANIFEST).unwrap();
+        assert_eq!(
+            m.command.exec.as_deref(),
+            Some(&["whois".to_string(), "{target}".to_string()][..])
+        );
+        // The template is kept for display; it did not declare exec.
+        assert_eq!(m.command.template.as_deref(), Some("whois {target}"));
+        assert!(!m.command.exec_was_declared);
+
+        let declared =
+            parse_manifest(&echo_manifest("[command]\nexec = [\"echo\", \"{target}\"]")).unwrap();
+        assert!(declared.command.exec_was_declared);
+
+        // Both present: exec wins and counts as declared.
+        let both = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {target}\"\nexec = [\"echo\", \"{target}\"]",
+        ))
+        .unwrap();
+        assert!(both.command.exec_was_declared);
+    }
+
+    #[test]
+    fn test_template_placeholder_inside_quotes_refused_at_load() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo '{label}' {target}\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("inside quotes"), "unexpected: {err}");
+
+        // Same rule for a conditional template.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_lbl} {target}\"\n\n[command.conditionals.lbl]\nwhen = \"label != ''\"\ntemplate = \"-l \\\"{label}\\\"\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("conditional 'lbl'"), "unexpected: {err}");
+        assert!(err.contains("inside quotes"), "unexpected: {err}");
+
+        // A brace escape inside quotes is fine.
+        let m = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo -w '%{{http_code}}' {target}\"",
+        ))
+        .unwrap();
+        assert_eq!(m.command.exec.as_ref().unwrap()[2], "%{{http_code}}");
+    }
+
+    #[test]
+    fn test_unresolved_placeholder_refused_at_load() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {nope} {target}\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{nope}' in command"),
+            "unexpected: {err}"
+        );
+        let err = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"--x={typo}\", \"{target}\"]",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{typo}'"),
+            "unexpected: {err}"
+        );
+
+        // Inside a conditional.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_lbl} {target}\"\n\n[command.conditionals.lbl]\nwhen = \"label != ''\"\ntemplate = \"-l {labl}\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{labl}'"),
+            "unexpected: {err}"
+        );
+        assert!(err.contains("conditional 'lbl'"), "unexpected: {err}");
+
+        // The legacy `_<arg>` mapping alias is gone; only `_<arg>_flags` exists.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_label} {target}\"\n\n[command.mappings.label]\nx = \"-x\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unresolved placeholder '{_label}'"),
+            "unexpected: {err}"
+        );
+        assert!(parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_label_flags} {target}\"\n\n[command.mappings.label]\nx = \"-x\"",
+        ))
+        .is_ok());
+
+        // Injected vars and [command.defaults] keys resolve.
+        assert!(parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_scan_id} {_output_file} {_evidence_dir} {rate} {target}\"\n\n[command.defaults]\nrate = 10",
+        ))
+        .is_ok());
+
+        // A trusted multi-token var glued to literal text is refused.
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo --f={_label_flags} {target}\"\n\n[command.mappings.label]\nx = \"-x\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("whole token"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_literal_brace_escape_survives_load_and_build() {
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"-w\", \"%{{http_code}}\", \"{target}\"]",
+        ))
+        .unwrap();
+        let args = HashMap::from([("target".to_string(), "10.0.1.1".to_string())]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-w", "%{http_code}", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_end_of_options_validated_at_load_and_applied() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"{target}\"]\nend_of_options = \"-\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("end_of_options"), "unexpected: {err}");
+
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"-n\", \"{target}\", \"{label}\"]\nend_of_options = \"--\"",
+        ))
+        .unwrap();
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("label".to_string(), "x".to_string()),
+        ]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-n", "--", "10.0.1.1", "x"]);
+        let dry = executor::dry_run(&m, &args).unwrap();
+        assert_eq!(dry.command, "echo -n -- 10.0.1.1 x");
+    }
+
+    #[test]
+    fn test_exec_value_with_space_is_one_argv_element() {
+        // Declared exec + allow_whitespace: the value passes validation in
+        // exec mode and lands in argv as exactly one element.
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"--label\", \"{label}\", \"{target}\"]",
+        ))
+        .unwrap();
+        assert!(m.command.exec_was_declared);
+        let label = validator::validate_arg_mode(
+            "label",
+            &m.args["label"],
+            "X: y -d @/etc/passwd",
+            m.command.exec_was_declared,
+        )
+        .unwrap();
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("label".to_string(), label),
+        ]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv.len(), 4, "argv: {argv:?}");
+        assert_eq!(argv[2], "X: y -d @/etc/passwd");
+        let dry = executor::dry_run(&m, &args).unwrap();
+        assert_eq!(dry.command, "echo --label X: y -d @/etc/passwd 10.0.1.1");
+
+        // The same manifest written as a template stays strict: the compiled
+        // exec is not a declared exec, so allow_whitespace is not honored.
+        let t = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo --label {label} {target}\"",
+        ))
+        .unwrap();
+        assert!(!t.command.exec_was_declared);
+        let err = executor::dry_run(&t, &args).unwrap_err().to_string();
+        assert!(
+            err.contains("must not contain whitespace"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_conditional_tokens_populated_at_load() {
+        let m = parse_manifest(&echo_manifest(
+            "[command]\nexec = [\"echo\", \"{_lbl}\", \"{target}\"]\n\n[command.conditionals.lbl]\nwhen = \"label != ''\"\ntemplate = \"-l {label}\"",
+        ))
+        .unwrap();
+        let cond = &m.command.conditionals.as_ref().unwrap()["lbl"];
+        assert_eq!(cond.tokens, vec!["-l", "{label}"]);
+
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("label".to_string(), "X-Trace: abc".to_string()),
+        ]);
+        let argv = executor::build_command_argv(&m, &args).unwrap();
+        assert_eq!(argv, vec!["echo", "-l", "X-Trace: abc", "10.0.1.1"]);
+    }
+
+    #[test]
+    fn test_enum_mapping_must_cover_allowed_values_at_load() {
+        let base = r#"
+[tool]
+name = "echo_tool"
+version = "1.0.0"
+binary = "echo"
+description = "x"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+
+[args.mode]
+position = 2
+required = true
+type = "enum"
+allowed = ["fast", "slow", "none"]
+
+[command]
+exec = ["echo", "{_mode_flags}", "{target}"]
+
+[command.mappings.mode]
+$MAPPING
+
+[output]
+format = "text"
+"#;
+        // Two of three allowed values mapped: refused, naming the gap.
+        let err = parse_manifest(&base.replace("$MAPPING", "fast = \"-T4\"\nslow = \"-T1\""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mapping for enum argument 'mode'"),
+            "unexpected: {err}"
+        );
+        assert!(err.contains("[none]"), "unexpected: {err}");
+
+        // Mapping the remaining value to "" means "no flags" and loads.
+        let m = parse_manifest(
+            &base.replace("$MAPPING", "fast = \"-T4\"\nslow = \"-T1\"\nnone = \"\""),
+        )
+        .unwrap();
+        let args = HashMap::from([
+            ("target".to_string(), "10.0.1.1".to_string()),
+            ("mode".to_string(), "none".to_string()),
+        ]);
+        assert_eq!(
+            executor::build_command_argv(&m, &args).unwrap(),
+            vec!["echo", "10.0.1.1"]
+        );
+    }
+
+    #[test]
+    fn test_unbalanced_mapping_value_refused_at_load() {
+        let err = parse_manifest(&echo_manifest(
+            "[command]\ntemplate = \"echo {_label_flags} {target}\"\n\n[command.mappings.label]\nx = \"-x 'oops\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mapping for 'label'"), "unexpected: {err}");
+        assert!(err.contains("unbalanced quote"), "unexpected: {err}");
+    }
+
+    // ----- unknown manifest keys -----------------------------------------
+
+    /// Smallest valid oneshot manifest with a hole in each section to drop
+    /// extra lines into.
+    fn oneshot(tool: &str, arg: &str, command: &str, output: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "t"
+version = "1.0.0"
+binary = "echo"
+description = "d"
+{tool}
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+{arg}
+
+[command]
+exec = ["echo", "{{target}}"]
+{command}
+
+[output]
+format = "text"
+{output}
+"#
+        )
+    }
+
+    #[test]
+    fn test_unknown_tool_key_refused() {
+        let err = parse_manifest(&oneshot("tiemout_seconds = 5", "", "", ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'tool.tiemout_seconds' in manifest"
+        );
+    }
+
+    #[test]
+    fn test_unknown_arg_key_refused() {
+        let err = parse_manifest(&oneshot("", "block_internal_typo = true", "", ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'args.target.block_internal_typo' in manifest"
+        );
+    }
+
+    #[test]
+    fn test_unknown_command_output_http_conditional_keys_refused() {
+        let err = parse_manifest(&oneshot("", "", "shell = true", ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'command.shell' in manifest"
+        );
+
+        let err = parse_manifest(&oneshot("", "", "", "max_byte = 1"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'output.max_byte' in manifest"
+        );
+
+        let cond = "[command.conditionals.rate_flag]\nwhen = \"target != ''\"\ntemplate = \"-x\"\nwhenn = \"y\"";
+        let err = parse_manifest(&oneshot("", "", cond, ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'command.conditionals.rate_flag.whenn' in manifest"
+        );
+        // Inline-table form of the same conditional.
+        let cond = "[command.conditionals]\nrate_flag = { when = \"target != ''\", template = \"-x\", whenn = \"y\" }";
+        let err = parse_manifest(&oneshot("", "", cond, ""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "manifest error: unknown key 'command.conditionals.rate_flag.whenn' in manifest"
+        );
+
+        let http = oneshot("", "", "", "")
+            + "\n[http]\nmethod = \"GET\"\nurl = \"https://example.com/\"\nverb = \"GET\"\n";
+        let err = parse_manifest(&http).unwrap_err().to_string();
+        assert_eq!(err, "manifest error: unknown key 'http.verb' in manifest");
+    }
+
+    #[test]
+    fn test_several_unknown_keys_reported_together_sorted() {
+        let bad = oneshot(
+            "tiemout_seconds = 5",
+            "block_internal_typo = true",
+            "shell = true",
+            "max_byte = 1",
+        ) + "\n[toolz]\nx = 1\n";
+        let err = parse_manifest(&bad).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "manifest error: \
+             unknown key 'args.target.block_internal_typo' in manifest; \
+             unknown key 'command.shell' in manifest; \
+             unknown key 'output.max_byte' in manifest; \
+             unknown key 'tool.tiemout_seconds' in manifest; \
+             unknown key 'toolz' in manifest"
+        );
+    }
+
+    #[test]
+    fn test_allow_unknown_keys_downgrades_to_warning() {
+        let text = oneshot("tiemout_seconds = 5", "block_internal_typo = true", "", "");
+        let strict = LoadOptions::default();
+        assert!(!strict.allow_unknown_keys);
+        assert!(parse_manifest_with(&text, strict).is_err());
+
+        let lenient = LoadOptions {
+            allow_unknown_keys: true,
+            ..Default::default()
+        };
+        let m = parse_manifest_with(&text, lenient).unwrap();
+        // The unknown keys were dropped, not applied under another name.
+        assert_eq!(m.tool.timeout_seconds, 60);
+        assert!(!m.args["target"].block_internal);
+    }
+
+    #[test]
+    fn test_open_maps_are_not_walked() {
+        // Keys inside these tables are user-chosen names, never unknown keys.
+        let command = "\n[command.defaults]\nrate = 1\nmax_byte = 2\n\n\
+                       [command.mappings.target]\nanything = \"-x\"\n";
+        let output = "\n[output.schema]\ntype = \"object\"\nshell = true\n\n\
+                      [output.schema.properties.whenn]\ntype = \"string\"\n";
+        let m = parse_manifest(&oneshot("", "", command, output)).unwrap();
+        assert!(m.command.defaults.unwrap().contains_key("max_byte"));
+
+        // `[http]` makes this an egress manifest, so the target needs the flag.
+        let remote = oneshot("", "block_internal = true", "", "")
+            + "\n[http]\nmethod = \"GET\"\nurl = \"https://example.com/\"\n\
+               [http.headers]\nX-Anything = \"1\"\n\n\
+               [mcp]\nserver = \"s\"\ntool = \"t\"\n[mcp.field_map]\nwhatever = \"x\"\n";
+        let m = parse_manifest(&remote).unwrap();
+        assert!(m.http.unwrap().headers.contains_key("X-Anything"));
+        assert!(m.mcp.unwrap().field_map.contains_key("whatever"));
+    }
+
+    #[test]
+    fn test_serde_is_the_second_layer() {
+        // Even without the allowlist walk, the types refuse unknown fields.
+        let err = toml::from_str::<types::ArgDef>("type = \"string\"\nblock_internal_typo = true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "unexpected: {err}");
+        let err = toml::from_str::<types::ToolMeta>(
+            "name = \"t\"\nversion = \"1\"\nbinary = \"b\"\ndescription = \"d\"\ntiemout_seconds = 5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_tool_mode_validated_and_derived() {
+        for mode in MODES {
+            let m = parse_manifest(&oneshot(&format!("mode = \"{mode}\""), "", "", "")).unwrap();
+            assert_eq!(m.tool.mode.as_deref(), Some(*mode));
+            // Advisory: the declared value wins even without a matching section.
+            assert_eq!(m.mode(), *mode);
+        }
+        let err = parse_manifest(&oneshot("mode = \"sessionz\"", "", "", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid mode 'sessionz', must be one of: oneshot, session, browser"),
+            "unexpected: {err}"
+        );
+
+        // Derived from the backend section when absent.
+        let m = parse_manifest(&oneshot("", "", "", "")).unwrap();
+        assert!(m.tool.mode.is_none());
+        assert_eq!(m.mode(), "oneshot");
+        let m = parse_manifest(
+            ALL_SESSION_BROWSER_KEYS
+                .replace("mode = \"session\"\n", "")
+                .as_str(),
+        )
+        .unwrap();
+        assert!(m.tool.mode.is_none());
+        assert_eq!(m.mode(), "session");
+        let m = parse_manifest(
+            ALL_SESSION_BROWSER_KEYS
+                .replace("mode = \"session\"\n", "")
+                .replace("startup_command", "startup_command_")
+                .as_str(),
+        );
+        assert!(m.is_err()); // sanity: the replacement above hit a real key
+    }
+
+    // Every key in the manifest allowlist, spread over three manifests. These are
+    // the drift guard between this runtime's allowlist and the others'.
+
+    const ALL_ONESHOT_KEYS: &str = r#"
+[tool]
+name = "all_oneshot_keys"
+version = "1.0.0"
+binary = "echo"
+description = "exercises every tool, cedar, evidence, limits, args, command and output key"
+timeout_seconds = 30
+risk_tier = "low"
+human_approval = false
+dispatch = "exec"
+mode = "oneshot"
+network_egress = false
+allow_interpreter = false
+
+[tool.cedar]
+resource = "Tool::AllKeys"
+action = "execute_tool"
+
+[tool.evidence]
+output_dir = "{evidence_dir}/{scan_id}"
+capture = false
+hash = "sha256"
+screenshots = false
+
+[tool.limits]
+nproc = 64
+nofile = 256
+fsize_bytes = 1048576
+address_space_bytes = 268435456
+cpu_seconds = 30
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+description = "host"
+sanitize = ["injection"]
+scope_check = false
+block_internal = true
+allow_leading_dash = false
+allow_whitespace = false
+
+[args.level]
+position = 2
+required = false
+type = "enum"
+allowed = ["low", "high"]
+default = "low"
+description = "level"
+
+[args.count]
+position = 3
+required = false
+type = "integer"
+min = 1
+max = 10
+clamp = true
+default = 5
+description = "count"
+
+[args.ratio]
+position = 4
+required = false
+type = "number"
+min_float = 0.0
+max_float = 1.0
+default = 0.5
+description = "ratio"
+
+[args.site]
+position = 5
+required = false
+type = "url"
+schemes = ["https"]
+pattern = "^https://"
+default = "https://example.com/"
+description = "site"
+
+[command]
+exec = ["echo", "{_level_flags}", "{count}", "{ratio}", "{site}", "{rate}", "{_verbose}", "{target}"]
+template = "echo {target}"
+executor = "/usr/local/bin/all-keys-runner"
+end_of_options = "--"
+
+[command.defaults]
+rate = 100
+
+[command.mappings.level]
+low = "-l"
+high = "-h"
+
+[command.conditionals.verbose]
+when = "count != '5'"
+template = "-v {count}"
+
+[output]
+format = "json"
+parser = "builtin:json"
+envelope = true
+max_bytes = 1048576
+
+[output.schema]
+type = "object"
+"#;
+
+    const ALL_SESSION_BROWSER_KEYS: &str = r#"
+[tool]
+name = "all_session_browser_keys"
+version = "1.0.0"
+binary = "psql"
+mode = "session"
+description = "exercises every session and browser key"
+
+[command]
+
+[session]
+startup_command = "psql"
+ready_pattern = "=>"
+startup_timeout_seconds = 15
+idle_timeout_seconds = 600
+session_timeout_seconds = 3600
+max_interactions = 200
+
+[session.interaction]
+input_sanitize = ["injection"]
+output_max_bytes = 2097152
+output_wait_ms = 3000
+
+[session.commands.select]
+pattern = "^SELECT\\b"
+description = "Run a SELECT query"
+risk_tier = "low"
+human_approval = false
+extract_target = false
+
+[session.commands.select.args.query]
+position = 1
+required = true
+type = "string"
+description = "SQL"
+
+[session.child_detection]
+pattern = "session (\\d+) opened"
+type = "meterpreter"
+manifest = "tools/meterpreter.clad.toml"
+
+[browser]
+engine = "cdp"
+headless = true
+connect = "launch"
+extract_mode = "html"
+startup_timeout_seconds = 10
+session_timeout_seconds = 600
+idle_timeout_seconds = 120
+max_interactions = 200
+
+[browser.defaults]
+extract_mode = "accessibility_tree"
+
+[browser.scope]
+allowed_domains = ["example.com"]
+blocked_domains = ["evil.example"]
+allow_external = false
+
+[browser.commands.navigate]
+description = "Navigate"
+risk_tier = "low"
+human_approval = false
+
+[browser.commands.navigate.args.url]
+position = 1
+required = true
+type = "url"
+block_internal = true
+description = "URL"
+
+[browser.state]
+fields = ["current_url"]
+
+[output]
+format = "text"
+envelope = true
+"#;
+
+    const ALL_HTTP_MCP_KEYS: &str = r#"
+[tool]
+name = "all_http_mcp_keys"
+version = "1.0.0"
+binary = "curl"
+description = "exercises every http and mcp key"
+
+[args.endpoint]
+position = 1
+required = true
+type = "string"
+description = "API endpoint path"
+
+[command]
+exec = ["curl", "{endpoint}"]
+
+[http]
+method = "POST"
+url = "https://api.example.com/{endpoint}"
+headers = { "Accept" = "application/json" }
+body_template = "{\"q\": \"{endpoint}\"}"
+success_status = [200, 201]
+error_status = [500]
+
+[mcp]
+server = "search"
+tool = "query"
+field_map = { endpoint = "q" }
+
+[output]
+format = "json"
+envelope = true
+"#;
+
+    /// Keys present at every concrete location matching `section` in `doc`.
+    fn keys_at(doc: &toml::Table, section: &str) -> HashSet<String> {
+        fn walk(table: &toml::Table, segments: &[&str], out: &mut HashSet<String>) {
+            let Some((head, rest)) = segments.split_first() else {
+                out.extend(table.keys().cloned());
+                return;
+            };
+            if *head == "*" {
+                for value in table.values() {
+                    if let toml::Value::Table(t) = value {
+                        walk(t, rest, out);
+                    }
+                }
+            } else if let Some(toml::Value::Table(t)) = table.get(*head) {
+                walk(t, rest, out);
+            }
+        }
+        let segments: Vec<&str> = section.split('.').filter(|s| !s.is_empty()).collect();
+        let mut out = HashSet::new();
+        walk(doc, &segments, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_every_allowlisted_key_is_accepted() {
+        let docs = [
+            ALL_ONESHOT_KEYS,
+            ALL_SESSION_BROWSER_KEYS,
+            ALL_HTTP_MCP_KEYS,
+        ];
+        for doc in docs {
+            parse_manifest(doc).unwrap_or_else(|e| panic!("{e}\n{doc}"));
+        }
+
+        // Drift guard: every key in KNOWN_KEYS must appear in one of the
+        // manifests above at its own section, so adding a key to the table
+        // forces it into a manifest that the structs then have to accept.
+        // Argument tables share one allowlist, so their coverage is pooled.
+        const ARG_SECTIONS: &[&str] = &[
+            "args.*",
+            "session.commands.*.args.*",
+            "browser.commands.*.args.*",
+        ];
+        let tables: Vec<toml::Table> = docs.iter().map(|d| toml::from_str(d).unwrap()).collect();
+        let mut missing = Vec::new();
+        for (section, keys) in KNOWN_KEYS {
+            let sections: &[&str] = if ARG_SECTIONS.contains(section) {
+                ARG_SECTIONS
+            } else {
+                std::slice::from_ref(section)
+            };
+            let mut seen = HashSet::new();
+            for s in sections {
+                for t in &tables {
+                    seen.extend(keys_at(t, s));
+                }
+            }
+            for key in *keys {
+                if !seen.contains(*key) {
+                    missing.push(join_path(section, key));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "allowlisted keys not exercised by the drift-guard manifests: {missing:?}"
+        );
+
+        // And the new keys land in their fields, not just past the gate.
+        let m = parse_manifest(ALL_ONESHOT_KEYS).unwrap();
+        assert_eq!(m.mode(), "oneshot");
+        assert!(!m.tool.network_egress);
+        assert!(!m.tool.allow_interpreter);
+        let limits = m.tool.limits.as_ref().unwrap();
+        assert_eq!(limits.nproc, Some(64));
+        assert_eq!(limits.nofile, Some(256));
+        assert_eq!(limits.fsize_bytes, Some(1_048_576));
+        assert_eq!(limits.address_space_bytes, Some(268_435_456));
+        assert_eq!(limits.cpu_seconds, Some(30));
+        assert!(!m.tool.evidence.as_ref().unwrap().screenshots);
+        assert_eq!(m.output.as_ref().unwrap().max_bytes, 1_048_576);
+        assert_eq!(m.command.end_of_options.as_deref(), Some("--"));
+
+        let m = parse_manifest(ALL_SESSION_BROWSER_KEYS).unwrap();
+        let child = m
+            .session
+            .as_ref()
+            .unwrap()
+            .child_detection
+            .as_ref()
+            .unwrap();
+        assert_eq!(child.type_name, "meterpreter");
+        assert_eq!(child.manifest, "tools/meterpreter.clad.toml");
+        let defaults = m.browser.as_ref().unwrap().defaults.as_ref().unwrap();
+        assert_eq!(defaults.extract_mode.as_deref(), Some("accessibility_tree"));
+        // Defaults for the registered-but-inert keys.
+        assert_eq!(m.output.as_ref().unwrap().max_bytes, 8_388_608);
+    }
+
+    // ---- W5: scope enforcement wiring ----------------------------------
+
+    fn scope_manifest(target_extra: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "scoped"
+version = "1.0.0"
+binary = "echo"
+description = "scoped echo"
+
+[args.target]
+position = 1
+required = true
+type = "scope_target"
+scope_check = true
+{target_extra}
+
+[command]
+exec = ["echo", "{{target}}"]
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "toolclad-lib-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn scope_env_set() -> bool {
+        std::env::var_os(scope::SCOPE_FILE_ENV).is_some_and(|v| !v.is_empty())
+    }
+
+    #[test]
+    fn scope_check_on_unsupported_type_is_load_error() {
+        let toml = WHOIS_MANIFEST.replace(
+            "type = \"scope_target\"",
+            "type = \"string\"\nscope_check = true",
+        );
+        let err = parse_manifest(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains("argument 'target' scope_check is not supported for type 'string'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn scope_is_loaded_from_manifest_dir_and_enforced() {
+        if scope_env_set() {
+            eprintln!("skipping: TOOLCLAD_SCOPE_FILE is set");
+            return;
+        }
+        let root = scratch_dir("scope");
+        std::fs::create_dir_all(root.join("scope")).unwrap();
+        std::fs::create_dir_all(root.join("tools")).unwrap();
+        std::fs::write(
+            root.join("scope/scope.toml"),
+            "[scope]\nallowed_domains = [\"*.example.com\"]\nblocked_domains = [\"admin.example.com\"]\n",
+        )
+        .unwrap();
+        let path = root.join("tools/scoped.clad.toml");
+        std::fs::write(&path, scope_manifest("")).unwrap();
+
+        let m = load_manifest(&path).unwrap();
+        assert_eq!(m.source_dir.as_deref(), Some(root.join("tools").as_path()));
+        let sc = m.scope.as_ref().expect("scope cached at load");
+        assert_eq!(sc.allowed_domains, vec!["*.example.com"]);
+
+        let run = |v: &str| {
+            let args = HashMap::from([("target".to_string(), v.to_string())]);
+            executor::dry_run(&m, &args).map(|r| r.command)
+        };
+        assert_eq!(run("app.example.com").unwrap(), "echo app.example.com");
+        for refused in [
+            "example.com",
+            "evil-example.com",
+            "admin.example.com",
+            "other.org",
+        ] {
+            let err = run(refused).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("target '{refused}' is not in scope")),
+                "{refused}: {err}"
+            );
+        }
+
+        // A default on a scope_check arg is scope-checked at call time.
+        std::fs::write(
+            &path,
+            scope_manifest("default = \"other.org\"")
+                .replace("required = true", "required = false"),
+        )
+        .unwrap();
+        let m = load_manifest(&path).unwrap();
+        let err = executor::dry_run(&m, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in scope"), "{err}");
+
+        // A malformed scope file is a load error.
+        std::fs::write(root.join("scope/scope.toml"), "[scope]\nallowed = []\n").unwrap();
+        let err = load_manifest(&path).unwrap_err().to_string();
+        assert!(err.contains("unknown key 'scope.allowed'"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scope_check_fails_closed_without_scope_file() {
+        let root = scratch_dir("noscope");
+        if scope_env_set()
+            || root
+                .ancestors()
+                .any(|d| d.join("scope").join("scope.toml").is_file())
+        {
+            eprintln!("skipping: a scope file is reachable from the temp dir");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let path = root.join("scoped.clad.toml");
+        std::fs::write(&path, scope_manifest("")).unwrap();
+        let m = load_manifest(&path).unwrap();
+        assert!(m.scope.is_none());
+        let args = HashMap::from([("target".to_string(), "app.example.com".to_string())]);
+        let err = executor::dry_run(&m, &args).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "argument 'target' scope_check is enabled but no scope/scope.toml was found (set TOOLCLAD_SCOPE_FILE)"
+            ),
+            "{err}"
+        );
+        let err = executor::execute(&m, &args).unwrap_err().to_string();
+        assert!(err.contains("scope_check is enabled"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- W11 K4: per-argument defaults are validated at load ------------
+
+    fn default_manifest(arg: &str) -> String {
+        format!(
+            r#"
+[tool]
+name = "defaults"
+version = "1.0.0"
+binary = "echo"
+description = "defaults"
+
+[args.x]
+position = 1
+{arg}
+
+[command]
+template = "echo {{x}}"
+
+[output]
+format = "text"
+"#
+        )
+    }
+
+    #[test]
+    fn invalid_defaults_are_load_errors() {
+        for arg in [
+            "type = \"port\"\ndefault = 0",
+            "type = \"integer\"\nmin = 1\ndefault = 0",
+            "type = \"string\"\ndefault = \"a b\"",
+            "type = \"boolean\"\ndefault = \"yes\"",
+            "type = \"enum\"\nallowed = [\"a\"]\ndefault = \"b\"",
+            "type = \"path\"\ndefault = \"../etc\"",
+        ] {
+            let err = parse_manifest(&default_manifest(arg))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("argument 'x' has an invalid default"),
+                "{arg}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_defaults_load() {
+        for arg in [
+            "type = \"string\"\ndefault = \"\"",
+            "type = \"port\"\ndefault = 443",
+            "type = \"integer\"\nmin = 1\ndefault = 5",
+            "type = \"boolean\"\ndefault = true",
+            "type = \"number\"\ndefault = 0.5",
+            "type = \"enum\"\nallowed = [\"a\"]\ndefault = \"a\"",
+        ] {
+            parse_manifest(&default_manifest(arg)).unwrap_or_else(|e| panic!("{arg}: {e}"));
+        }
+    }
+
+    // ---- W6 / W8: argv[0] checks and timeout at load ---------------------
+
+    fn argv0_manifest(binary: &str, exec: &str, tool_extra: &str) -> String {
+        format!(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"{binary}\"\ndescription = \"x\"\n{tool_extra}\n\n\
+             [command]\nexec = {exec}\n\n[output]\nformat = \"text\"\n"
+        )
+    }
+
+    #[test]
+    fn interpreter_argv0_needs_allow_interpreter() {
+        for interp in ["bash", "/bin/sh", "python3", "env", "awk", "/usr/bin/perl"] {
+            let exec = format!("[\"{interp}\", \"-c\", \"true\"]");
+            let err = parse_manifest(&argv0_manifest(interp, &exec, ""))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "command argv[0] '{interp}' is an interpreter; set allow_interpreter = true to permit it"
+                )),
+                "{interp}: {err}"
+            );
+            parse_manifest(&argv0_manifest(interp, &exec, "allow_interpreter = true"))
+                .unwrap_or_else(|e| panic!("{interp}: {e}"));
+        }
+        // A template is compiled to exec first, so it is covered too.
+        let err = parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"sh\"\ndescription = \"x\"\n\n\
+             [command]\ntemplate = \"sh -c true\"\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is an interpreter"), "{err}");
+
+        // The executor hatch gets the denylist too, but not the basename rule.
+        let hatch = "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"wrapper\"\ndescription = \"x\"\n\n[command]\nexecutor = \"/bin/sh\"\n\n[output]\nformat = \"text\"\n";
+        let err = parse_manifest(hatch).unwrap_err().to_string();
+        assert!(err.contains("'/bin/sh' is an interpreter"), "{err}");
+        let ok = hatch.replace("/bin/sh", "scripts/wrapper.sh");
+        assert!(parse_manifest(&ok).is_ok());
+    }
+
+    #[test]
+    fn argv0_basename_must_match_binary() {
+        let err = parse_manifest(&argv0_manifest("echo", "[\"cat\", \"/etc/passwd\"]", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("command argv[0] 'cat' does not match tool.binary 'echo'"),
+            "{err}"
+        );
+        // Basenames are compared, so a path on either side is fine.
+        parse_manifest(&argv0_manifest("/usr/bin/echo", "[\"echo\", \"hi\"]", "")).unwrap();
+        parse_manifest(&argv0_manifest("echo", "[\"/bin/echo\", \"hi\"]", "")).unwrap();
+        // An empty binary skips the check.
+        parse_manifest(&argv0_manifest("", "[\"cat\", \"x\"]", "")).unwrap();
+        // A placeholder as argv[0] never matches a declared binary.
+        let err = parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\n\
+             [args.b]\nposition = 1\ntype = \"string\"\ndescription = \"b\"\n\n\
+             [command]\nexec = [\"{b}\"]\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match tool.binary"), "{err}");
+    }
+
+    #[test]
+    fn argv0_checks_skip_callback_and_commandless_manifests() {
+        parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\
+             dispatch = \"callback\"\n\n[command]\nexec = [\"bash\", \"-c\", \"x\"]\n",
+        )
+        .unwrap();
+        parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"curl\"\ndescription = \"x\"\n\n\
+             [http]\nmethod = \"GET\"\nurl = \"https://api.example.com/x\"\n\n[output]\nformat = \"json\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn zero_timeout_is_refused_at_load() {
+        let err = parse_manifest(&argv0_manifest(
+            "echo",
+            "[\"echo\", \"hi\"]",
+            "timeout_seconds = 0",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("timeout_seconds must be greater than zero"),
+            "{err}"
+        );
+        let m = parse_manifest(&argv0_manifest("echo", "[\"echo\", \"hi\"]", "")).unwrap();
+        assert_eq!(m.tool.timeout_seconds, 60);
+    }
+
+    #[test]
+    fn spawn_path_manifest_vectors() {
+        // The `tests/injection_vectors.json` manifest vectors this wave covers.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/injection_vectors.json"
+        );
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not found");
+            return;
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut seen = 0;
+        for v in doc["manifest_vectors"].as_array().unwrap() {
+            let id = v["id"].as_str().unwrap();
+            if ![
+                "zero-timeout",
+                "shell-as-binary",
+                "binary-basename-mismatch",
+                "minimal-valid-exec",
+                "minimal-valid-template",
+                "custom-output-parser",
+            ]
+            .contains(&id)
+            {
+                continue;
+            }
+            seen += 1;
+            let ok = parse_manifest(v["manifest"].as_str().unwrap()).is_ok();
+            assert_eq!(ok, v["expect"] == "accept", "vector {id}");
+        }
+        assert_eq!(seen, 6);
+    }
+
+    // ---- W9 / W10 load-time checks ---------------------------------------
+
+    fn output_manifest(output_extra: &str) -> String {
+        format!(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"echo\"\ndescription = \"x\"\n\n\
+             [command]\nexec = [\"echo\", \"hi\"]\n\n[output]\nformat = \"json\"\n{output_extra}\n"
+        )
+    }
+
+    #[test]
+    fn max_bytes_bounds_checked_at_load() {
+        for bad in [
+            "max_bytes = 0",
+            "max_bytes = 1.5",
+            "max_bytes = -1",
+            "max_bytes = \"10\"",
+            "max_bytes = 1073741825",
+        ] {
+            assert!(
+                parse_manifest(&output_manifest(bad)).is_err(),
+                "{bad} should be refused"
+            );
+        }
+        let err = parse_manifest(&output_manifest("max_bytes = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_bytes"), "{err}");
+        for good in ["max_bytes = 1", "max_bytes = 1073741824"] {
+            parse_manifest(&output_manifest(good)).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_parser_refused_builtins_accepted() {
+        let err = parse_manifest(&output_manifest("parser = \"scripts/x.py\""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "custom output parsers are not supported by the reference runtimes (parser = \"scripts/x.py\")"
+            ),
+            "{err}"
+        );
+        for p in BUILTIN_PARSERS {
+            parse_manifest(&output_manifest(&format!("parser = \"{p}\""))).unwrap();
+        }
+    }
+
+    fn http_load(url: &str, extra: &str) -> Result<Manifest, ToolCladError> {
+        parse_manifest(&format!(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"http\"\ndescription = \"x\"\n\n\
+             {extra}\n\n[http]\nmethod = \"GET\"\nurl = \"{url}\"\n\n[output]\nformat = \"text\"\n"
+        ))
+    }
+
+    #[test]
+    fn http_url_scheme_and_host_must_be_literal() {
+        let arg =
+            "[args.host]\nposition = 1\nrequired = true\ntype = \"string\"\ndescription = \"h\"";
+        for url in [
+            "https://{host}/x",
+            "{host}://example.com/",
+            "https://{host}.example.com/",
+        ] {
+            let err = http_load(url, arg).unwrap_err().to_string();
+            assert!(
+                err.contains("http.url may not interpolate into the scheme or host"),
+                "{url}: {err}"
+            );
+        }
+        http_load("https://api.example.com/{host}?q={host}", arg).unwrap();
+        // A literal loopback URL with no url-typed argument passes the lint.
+        http_load("http://127.0.0.1:8080/x", "").unwrap();
+    }
+
+    #[test]
+    fn http_literal_host_policy_at_load() {
+        // Link-local (metadata) is always refused.
+        let err = http_load("http://169.254.169.254/latest", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http.url"), "{err}");
+        // Loopback is refused once any argument opts into block_internal.
+        let arg =
+            "[args.u]\nposition = 1\nrequired = true\ntype = \"url\"\nblock_internal = true\n\
+                   description = \"u\"";
+        assert!(http_load("http://127.0.0.1/{u}", arg).is_err());
+        assert!(http_load("http://localhost/{u}", arg).is_err());
+        http_load("https://api.example.com/{u}", arg).unwrap();
+    }
+
+    #[test]
+    fn http_header_name_must_be_a_token() {
+        let err = parse_manifest(
+            "[tool]\nname = \"t\"\nversion = \"1.0.0\"\nbinary = \"http\"\ndescription = \"x\"\n\n\
+             [http]\nmethod = \"GET\"\nurl = \"https://api.example.com/\"\n\
+             [http.headers]\n\"Bad Name\" = \"v\"\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a valid token"), "{err}");
+    }
+
+    // ---- toolclad.toml discovery and load-time type checks (TC-23) ----
+
+    fn examples_dir() -> Option<std::path::PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        if dir.is_dir() {
+            Some(dir)
+        } else {
+            eprintln!("skipping: examples directory {} is absent", dir.display());
+            None
+        }
+    }
+
+    fn dry(m: &Manifest, pairs: &[(&str, &str)]) -> Result<executor::DryRunResult, ToolCladError> {
+        let args: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        executor::dry_run(m, &args)
+    }
+
+    #[test]
+    fn test_shipped_examples_load_and_dry_run() {
+        let Some(dir) = examples_dir() else { return };
+        for name in [
+            "curl_fetch",
+            "dig_lookup",
+            "nikto_scan",
+            "nmap_scan",
+            "whois_lookup",
+        ] {
+            let path = dir.join(format!("{name}.clad.toml"));
+            load_manifest(&path).unwrap_or_else(|e| panic!("{name} should load: {e}"));
+        }
+
+        // nikto: custom types from the project toolclad.toml resolve.
+        let nikto = load_manifest(dir.join("nikto_scan.clad.toml")).unwrap();
+        assert_eq!(nikto.custom_types["port_range"].base, "string");
+        let out = dry(
+            &nikto,
+            &[
+                ("target", "93.184.216.34"),
+                ("port", "8080-8090"),
+                ("protocol", "https"),
+                ("max_rate", "250"),
+            ],
+        )
+        .unwrap();
+        let argv: Vec<&str> = out.command.split(' ').collect();
+        for token in [
+            "-h",
+            "https://93.184.216.34:8080-8090",
+            "-Plugins",
+            "@@ALL",
+            "-maxrate",
+            "250",
+        ] {
+            assert!(argv.contains(&token), "missing {token} in {argv:?}");
+        }
+        // The custom port_range pattern is anchored.
+        assert!(dry(&nikto, &[("target", "93.184.216.34"), ("port", "80;id")]).is_err());
+        assert!(dry(&nikto, &[("target", "93.184.216.34"), ("port", "8080x")]).is_err());
+        // The custom scan_rate bounds apply.
+        assert!(dry(&nikto, &[("target", "93.184.216.34"), ("max_rate", "0")]).is_err());
+
+        // curl: the scope is in reach from examples/.
+        let curl = load_manifest(dir.join("curl_fetch.clad.toml")).unwrap();
+        let err = dry(&curl, &[("url", "https://93.184.216.34/")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scope"), "{err}");
+        match dry(&curl, &[("url", "https://example.com/")]) {
+            Ok(out) => assert!(
+                out.command.ends_with("https://example.com/"),
+                "{}",
+                out.command
+            ),
+            Err(e) if e.to_string().contains("could not resolve host") => {
+                eprintln!("skipping the example.com assertion: DNS is unavailable ({e})");
+            }
+            Err(e) => panic!("https://example.com/ should be accepted: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_types_file_is_strict() {
+        let ok = "[types.level]\nbase = \"enum\"\nallowed = [\"a\", \"b\"]\n";
+        assert_eq!(parse_custom_types(ok).unwrap()["level"].base, "enum");
+        for (src, want) in [
+            ("[other]\nx = 1\n", "unknown key 'other'"),
+            (
+                "[types.t]\nbase = \"string\"\nblock_internal = true\n",
+                "unknown key 'types.t.block_internal'",
+            ),
+            ("[types.t]\npattern = \"a\"\n", "missing 'base'"),
+            ("[types.t]\nbase = \"level\"\n", "invalid base type 'level'"),
+            (
+                "[types.url]\nbase = \"string\"\n",
+                "shadows a built-in type",
+            ),
+            (
+                "[types.t]\nbase = \"string\"\npattern = \"(\"\n",
+                "invalid pattern",
+            ),
+            (
+                "[types.t]\nbase = \"integer\"\nmin = \"1\"\n",
+                "custom type 't'",
+            ),
+            ("types = 1\n", "'types' must be a table"),
+        ] {
+            let err = parse_custom_types(src).unwrap_err().to_string();
+            assert!(err.contains(want), "{src:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_custom_types_discovery() {
+        let root = std::env::temp_dir().join(format!("toolclad-ct-{}", std::process::id()));
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("toolclad.toml"),
+            "[types.rate]\nbase = \"integer\"\nmin = 1\nmax = 5\n",
+        )
+        .unwrap();
+        let found = discover_custom_types_with(None, Some(&nested)).unwrap();
+        assert_eq!(found["rate"].max, Some(5));
+        // The env file wins; an unreadable one is an error.
+        let missing = root.join("missing.toml");
+        let err = discover_custom_types_with(Some(missing.as_os_str()), Some(&nested))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to read"), "{err}");
+
+        // A manifest file picks the types up on load and validates with them.
+        let manifest = nested.join("t.clad.toml");
+        std::fs::write(
+            &manifest,
+            "[tool]\nname = \"t\"\nversion = \"1\"\nbinary = \"echo\"\ndescription = \"d\"\n\n\
+             [args.n]\nposition = 1\nrequired = true\ntype = \"rate\"\n\n\
+             [command]\nexec = [\"echo\", \"{n}\"]\n\n[output]\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let m = load_manifest(&manifest).unwrap();
+        assert_eq!(dry(&m, &[("n", "3")]).unwrap().command, "echo 3");
+        assert!(dry(&m, &[("n", "9")]).is_err());
+        let schema = generate_mcp_schema(&m);
+        assert_eq!(schema["inputSchema"]["properties"]["n"]["type"], "integer");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const RATE_MANIFEST: &str = "[tool]\nname = \"t\"\nversion = \"1\"\nbinary = \"echo\"\n\
+        description = \"d\"\n\n[args.n]\nposition = 1\nrequired = true\ntype = \"rate\"\n\n\
+        [command]\nexec = [\"echo\", \"{n}\"]\n\n[output]\nformat = \"text\"\n";
+
+    #[test]
+    fn test_load_options_custom_types_override() {
+        let types = parse_custom_types("[types.rate]\nbase = \"integer\"\nmax = 5\n").unwrap();
+        let opts = LoadOptions {
+            custom_types: Some(types),
+            ..Default::default()
+        };
+        let m = parse_manifest_with(RATE_MANIFEST, opts).unwrap();
+        assert_eq!(dry(&m, &[("n", "5")]).unwrap().command, "echo 5");
+        assert!(dry(&m, &[("n", "6")]).is_err());
+        assert!(executor::execute(&m, &[("n".to_string(), "6".to_string())].into()).is_err());
+
+        // An empty override means no custom types at all.
+        let opts = LoadOptions {
+            custom_types: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let err = parse_manifest_with(RATE_MANIFEST, opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown type 'rate' for argument 'n'"),
+            "{err}"
+        );
+
+        // An override is checked like a discovered file.
+        let mut bad = HashMap::new();
+        bad.insert(
+            "rate".to_string(),
+            CustomTypeDef {
+                base: "rate".to_string(),
+                allowed: None,
+                pattern: None,
+                min: None,
+                max: None,
+                min_float: None,
+                max_float: None,
+            },
+        );
+        let opts = LoadOptions {
+            custom_types: Some(bad),
+            ..Default::default()
+        };
+        assert!(parse_manifest_with(RATE_MANIFEST, opts).is_err());
+    }
+
+    #[test]
+    fn test_session_and_browser_arg_types_checked_at_load() {
+        let session =
+            "[tool]\nname = \"s\"\nversion = \"1\"\nbinary = \"psql\"\ndescription = \"d\"\n\n\
+            [session]\nstartup_command = \"psql\"\nready_pattern = \"=> $\"\n\n\
+            [session.commands.q]\npattern = \"^select\"\ndescription = \"q\"\n\n\
+            [session.commands.q.args.x]\ntype = \"nope\"\n\n[output]\nformat = \"text\"\n";
+        let err = parse_manifest(session).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown type 'nope' for argument 'session.commands.q.args.x'"),
+            "{err}"
+        );
+    }
+
+    // ---- the shared negative suite (tests/injection_vectors.json) ----
+
+    #[test]
+    fn test_shared_injection_vectors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/injection_vectors.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} is absent", path.display());
+            return;
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut executed = 0usize;
+        let mut failures = Vec::new();
+
+        for v in doc["arg_vectors"].as_array().unwrap() {
+            let (id, note, expect) = (&v["id"], &v["note"], v["expect"].as_str().unwrap());
+            let def: types::ArgDef = serde_json::from_value(v["arg"].clone())
+                .unwrap_or_else(|e| panic!("vector {id}: bad arg definition: {e}"));
+            let value = v["value"].as_str().unwrap();
+            let verdict = validator::validate_arg("arg", &def, value);
+            let ok = match expect {
+                "reject" => verdict.is_err(),
+                "accept" => verdict.is_ok(),
+                other => panic!("vector {id}: unknown expect '{other}'"),
+            };
+            if !ok {
+                failures.push(format!(
+                    "arg vector {id} expected {expect}, got {verdict:?} ({note})"
+                ));
+            }
+            executed += 1;
+        }
+
+        for v in doc["manifest_vectors"].as_array().unwrap() {
+            let (id, note, expect) = (&v["id"], &v["note"], v["expect"].as_str().unwrap());
+            let verdict = parse_manifest(v["manifest"].as_str().unwrap());
+            let ok = match expect {
+                "reject" => verdict.is_err(),
+                "accept" => verdict.is_ok(),
+                other => panic!("vector {id}: unknown expect '{other}'"),
+            };
+            if !ok {
+                let got = verdict
+                    .map(|_| "accepted".to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                failures.push(format!(
+                    "manifest vector {id} expected {expect}, got {got} ({note})"
+                ));
+            }
+            executed += 1;
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(executed > 0, "no vectors executed");
+        println!("injection vectors executed: {executed}");
     }
 }

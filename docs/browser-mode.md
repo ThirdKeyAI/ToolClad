@@ -5,11 +5,14 @@ description: CDP browser mode for governed browser automation
 
 # Browser Mode
 
+> **Status: parsed and validated, not executable by the reference runtimes.**
+> The Rust, Go, JavaScript and Python runtimes in this repository load `[browser]` manifests, check every key against the manifest key allowlist, and serve `toolclad validate` and `toolclad schema` for them. They do **not** drive a browser: calling `execute` (or `toolclad run`) on a browser manifest is refused with `browser mode is parsed but not yet executable in the reference implementation`. Everything below describes the contract a hosting runtime such as Symbiont implements on top of the parsed manifest; none of the CDP, redirect-interception, or page-state behavior is enforced by the reference CLIs or libraries. What the reference runtimes *do* enforce at load: `[browser]` manifests are treated as `network_egress = true`, so every `url`/`scope_target`/`ip_address`/`cidr` command argument must set `block_internal = true` or the manifest is refused.
+
 Browser mode manages browser sessions through direct CDP (Chrome DevTools Protocol) WebSocket connections. The governance model is identical to CLI session mode: typed commands, per-interaction Cedar gating, scope enforcement, state-aware policies, output schema validation, evidence capture. The transport is a browser engine instead of a PTY.
 
 ---
 
-## `[tool.browser]` Configuration
+## `[browser]` Configuration
 
 The `[browser]` section controls browser lifecycle and connection behavior.
 
@@ -106,10 +109,10 @@ Each entry in `[browser.commands]` declares a permitted browser operation. Each 
 [browser.commands.navigate]
 description = "Navigate a tab to a URL"
 risk_tier = "medium"
-args.url = { type = "url", schemes = ["https"], scope_check = true }
+args.url = { type = "url", schemes = ["https"], block_internal = true, scope_check = true }
 ```
 
-URLs are scope-checked against `[browser.scope]` before the CDP command fires.
+`block_internal = true` is mandatory here: browser manifests count as network egress, and the manifest is refused at load without it. With `scope_check = true` the URL host is also checked against the project `scope/scope.toml` (fail-closed when no scope file is reachable). A hosting runtime additionally scope-checks URLs against `[browser.scope]` before the CDP command fires.
 
 #### `click` -- Click an element
 
@@ -195,7 +198,7 @@ args.expression = { type = "string" }
 
 | Command | Description | Risk | Arguments |
 |---------|-------------|------|-----------|
-| `navigate` | Navigate a tab to a URL | medium | `url` (url, scope-checked) |
+| `navigate` | Navigate a tab to a URL | medium | `url` (url, `block_internal`, scope-checked) |
 | `click` | Click an element by CSS selector | low | `selector` (string) |
 | `type_text` | Type text into the focused element | low | `text` (string, injection-safe) |
 | `submit_form` | Submit a form | high | `selector` (string) |
